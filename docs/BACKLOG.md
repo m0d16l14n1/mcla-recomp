@@ -1,0 +1,49 @@
+# Backlog: macOS (Apple Silicon) fork
+
+Started 2026-10-31. The plan and how to build and debug: [macos.md](macos.md). Status: `todo`, `doing`, `done`,
+`needs play test` (built, waiting on a gameplay check), `blocked` (reason given), `deferred` (reason given).
+
+Test Mac: Apple M5 (10 cores), 32 GB, macOS 27.2, Xcode with Apple Clang 21; MoltenVK 1.4 (built by the SDK).
+Game: Midnight Club: Los Angeles Complete Edition, Xbox 360 disc image, title `545407F8`, media `5940C9DB`,
+`default.xex` version 8, built 2009-07-17, SHA-1 `03e5e2c6a5666edc79bd3b230ffaa5fcc03ef7e6`.
+
+## Phase 1: build and boot (Vulkan through MoltenVK)
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 1 | Toolchain on the Mac | done | Homebrew CMake 4.4, Ninja, Python 3.13, Xcode's Clang 21, Metal toolchain; added `vulkan-tools` (vulkaninfo) and `ccache`. MoltenVK on the M5: Vulkan 1.4, no geometry shaders, fragment shader interlock present |
+| 2 | Game files out of the disc image | done | 15 files, 6.12 GiB, into `game/`; title id checked |
+| 3 | SDK v0.10.0 with all of the fork's patches on macOS | done | the 4 base patches, the FFmpeg one and the 67 later ones apply unchanged; SDK builds for `mac-arm64` (RelWithDebInfo and Release) with no errors |
+| 4 | Codegen on macOS | done | 16 s, 245 files, no config mismatch with the fork's addresses; 20 "Unexpected float16_4 pack" notes, as on the other platforms |
+| 5 | `scripts/make_mac.sh`, `scripts/play_mac.sh` | done | one command from the disc image to the build; the player with lldb, MoltenVK debug and Metal HUD switches |
+| 6 | The game builds for `mac-arm64` | done | RelWithDebInfo, 151 steps, no errors, no source changes; 49 MB arm64 executable. The GPU plugin is not copied next to it: `play_mac.sh` links it in from the SDK, as `play_linux.sh` does |
+| 7 | First boot: window, title, menus, free roam | done | 2026-10-31: Vulkan 1.3 device on MoltenVK, CAMetalLayer swapchain 2560x1440 (Retina 2x of the 1280x720 window), audio out at 48 kHz 6 ch, the RPF archives read. Logo screen 30 FPS; title scene, map zoom-out, the auto-save dialog and free roam (car, pedestrians, shadows, HUD, minimap) all draw correctly. Driven by the fork's `dev_pad` scripts (`--mcla_pad_script`), which work on macOS unchanged; `launcher/dev/scripts/mac-boot-roam.pad` reaches roam in about 2.5 minutes. Clean exit on SIGTERM and on `quit` |
+| 8 | Guest memory with 16 KB host pages | todo | the SDK reports a 16 KB write-watch unit; check the game's 4 KB-page assumptions (physical heap, GPU write watches) |
+
+## Phase 2: playable on MoltenVK
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 21 | **GPU-bound far below 30 FPS at native 720p** | doing | 2026-10-31. Cause: render pass breaks, which cost a full tile store and reload on Apple's GPUs. Metal System Trace of free roam (6 s): ~9,600 render and ~12,400 compute encoders a second, fragment stage busy 67%. `vulkan_pass_stats` (new): 529 render passes a frame, 476 ended by barriers, 333 of them shared memory uploads the hoist could not move because it tracked reads per 16 KB host page. Fixed in `patches/rexglue-vulkan-render-pass-breaks.patch` (reads tracked in 256-byte units): 265 passes a frame, **15.7 → 19.6 FPS**; with AA off **31.3 FPS** (23.3 before). Free roam benchmark: `sh scripts/mac_bench.sh "" "--option=value" ...`. Not the cause: occlusion queries (`--occlusion_query_async=false`, no change) and the interlock render target path (not in use) |
+| 25 | Remaining render pass breaks (per frame, after #21) | todo | 82–87 uploads that rewrite bytes a draw in the same pass read (a buffer refilled between draws: would need the new bytes put elsewhere and the draw pointed at them), 47 resolve writes, 45 texture-load scratch barriers, 28 back-to-read, 83 image barriers with 84 EDRAM transfer and resolve-clear passes |
+| 26 | MSAA 2x costs a third of the frame on the M5 (19.6 → 31.3 FPS off) | todo, decision | each pass break stores and reloads the multisampled targets. Options: default to AA off on macOS, or fewer breaks first (#25) and measure again. Lowest preset was 36.9 FPS before #21's fix |
+| 22 | Shader pack rejected on MoltenVK: "Pipeline storage filtering kept 0 descriptions (1773 corrupted)" | todo | every pipeline is compiled when first met (284 in the first minute), so the first minutes stutter. Find why the Windows-made pack reads as corrupted here (a Vulkan-device or driver field in its header?) and make a macOS pack |
+| 23 | MoltenVK: "Metal does not support disabling primitive restart" on 3 pipelines | todo | check those draws for missing or stray triangles |
+| 24 | `run.log` is appended to, not started afresh | todo | `play_mac.sh` could rotate it; `crash_trace.cpp` is Windows-only, so a crash on macOS is caught under `MCLA_LLDB=1` only |
+| 9 | Point and rectangle lists without geometry shaders | todo | the SDK falls back to vertex-shader expansion (`kRectangleListAsTriangleStrip`); check particles, HUD, resolves |
+| 10 | Audio (XMA through FFmpeg, SDL3 output) | needs play test | plays (heard 2026-10-31) but lagged. Causes found with `--audio_stats=true`: the fork's audio thread priorities were Windows-only (threads at default QoS: mixer wake-ups up to 2.8 ms, worker up to 13.9 ms), and CoreAudio's 1,024-sample device buffer (21 ms) sat on the 8-frame queue (43 ms), about 64 ms behind the picture. Fixed in `patches/rexglue-macos-audio-threads.patch` + macOS defaults in `src/mcla_app.cpp` (QoS user-interactive, 256-sample device buffer, 4-frame queue): about 27 ms, mixer wake-ups ≤ 47 µs, no underruns in free roam. **Listen for lag and crackle**; if it crackles, `--audio_maxqframes=6` or `8` |
+| 11 | Controller (SDL3: Xbox, DualSense) and keyboard | todo | |
+| 12 | Frame pacing: CAMetalLayer present modes through MoltenVK, 30/60/120 FPS caps, ProMotion | todo | |
+| 13 | Saves and settings location | todo | next to the executable today; `~/Library/Application Support/MCLA` for an app bundle |
+| 15 | Settings that do not apply on a Mac hidden in the pause menu | todo | D3D12, Reflex, Anti-Lag 2, FSR |
+
+## Phase 3: native Metal (shared with other ReXGlue titles)
+| # | Item | Status | Notes |
+|---|---|---|---|
+| 16 | Metal presenter (CAMetalLayer, CAMetalDisplayLink, EDR) | doing | CAMetalLayer, the guest output mailbox and letterboxed bilinear paint done (M0); CAMetalDisplayLink pacing, EDR, captures and the UI overlays to come. Written for the SDK's presenter, with xenia-alloy's (BSD) as the reference, so that it can go upstream |
+| 17 | Metal backend (`docs/metal-backend.md`, `patches/rexglue-metal-backend.patch`) | doing | **M0 done 2026-10-31**: backend `metal` in the xenos plugin (`--mcla_gpu_backend=metal`), the game runs start to free roam without drawing; map zoom-out 7.4 to 9.5 s (92 s on MoltenVK), 30 swaps/s with ~4,900 draws and 54 resolves a frame. **M1 in progress**: every guest shader translates and compiles (346 to 480 a run, 0 failures: SPIR-V, SPIRV-Cross, Metal); guest physical memory is a no-copy Metal buffer, checked (436 shader ranges read by the GPU as the CPU sees them). Next: pipelines, render targets, resolves, textures, the first picture |
+| 18 | Metal pipeline archives in place of the Vulkan pipeline cache | todo | with LibertyRecomp's fix: clear Apple's per-app shader cache before a rebuild |
+| 19 | MetalFX upscaling (in place of FSR 3.1) | todo | |
+| 20 | Offer the Metal backend upstream as SDK patches | todo | useful to every ReXGlue title on macOS |
+
+## Ideas
+- An app bundle (`MCLA.app`) with an icon, made from the build folder, and a SwiftUI or ImGui setup in place of the Windows launcher.
+- The `MCLA/` folder holds the disc image (7.3 GB) and the game is extracted beside it (6.1 GB); once the build works the image can be moved off the internal disk.

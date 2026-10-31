@@ -1,0 +1,12 @@
+# Boot -> title -> Start -> first-run dialogs (A) -> free roam; shots on the way.
+wait 30s
+press_until start left_title every=2s timeout=90s
+mark map_zoom
+press_until a roam every=3s timeout=240s
+mark roam
+wait 10s
+shot roam-10s.png
+wait 15s
+shot roam-25s.png
+mark end
+quit

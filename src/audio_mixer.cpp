@@ -15,8 +15,10 @@
 // thread is found by its entry address, 0x823EC8C8: the override of sub_823EC8C8 below runs on it when it starts. Its
 // handle (F8000534 in most runs, F8000530 in one of 11) is not a way to find it; the entry was the same in all 11.
 // The SDK's patch (rexglue-xma-decoder-fixes.patch) does the host calls and knows nothing of this game.
-// Windows only; elsewhere the option does nothing. The game turns it on by itself with 5 or fewer logical processors
-// (mcla_small_cpu_defaults, src/mcla_app.cpp), where audio_thread_priority is raised too.
+// Windows and macOS (there a QoS class, and at 3 a time-constraint thread: rexglue-macos-audio-threads.patch);
+// elsewhere the option does nothing. The game turns it on by itself with 5 or fewer logical processors
+// (mcla_small_cpu_defaults, src/mcla_app.cpp), where audio_thread_priority is raised too, and on macOS
+// (src/mcla_app.cpp, the PC defaults).
 //
 // With audio_stats the audio statistics line also carries the mixer's round: from its wake-up (0x823EC920, just
 // after its wait returns) to its signal to the pump (0x823EC978): the wall time (busy), its CPU time (a busy that is
@@ -152,7 +154,7 @@ extern "C" REX_FUNC(sub_823EC8C8) {
   g_mixer_starts.fetch_add(1, std::memory_order_relaxed);
   const int32_t level = REXCVAR_GET(audio_mixer_priority);
   if (level > 0) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     rex::audio::RaiseCallingAudioThread(level, "audio mixer thread (guest entry 823EC8C8)");
 #else
     REXLOG_WARN("audio_mixer_priority {} has no effect on this platform", level);

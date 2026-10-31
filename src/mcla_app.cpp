@@ -1058,6 +1058,14 @@ void MclaApp::ApplyPcDefaults() {
   //   own default stays off, for other titles). Not on Linux, where the
   //   display's HDR state isn't read yet, so auto would never turn it on
   //   (on would), nor on the PS5, whose host doesn't apply these.
+  // - on macOS, the audio worker, the XMA decoder and the game's mixer thread in
+  //   QoS user-interactive (audio_thread_priority, audio_mixer_priority 2): left
+  //   at the default QoS, a quarter of the 5.33 ms audio pump's rounds started
+  //   over 8 ms late in free roam on an M5 (docs/BACKLOG.md, item 10); and the
+  //   output closer to the game: CoreAudio asked for 1,024 samples at a time (21 ms)
+  //   on top of an 8-frame queue (43 ms), about 64 ms behind the picture. 256
+  //   samples and 4 frames are about 27 ms, with no underrun after start-up in
+  //   free roam at 17 to 19 FPS (out/bench, 2026-10-31).
   constexpr std::pair<const char*, const char*> kDefaults[] = {
       {"clear_memory_page_state", "false"},
       {"execute_unclipped_draw_vs_on_cpu", "true"},
@@ -1071,6 +1079,12 @@ void MclaApp::ApplyPcDefaults() {
 #if REX_PLATFORM_WIN32
       {"d3d12_hoist_shared_memory_uploads", "true"},
       {"hdr", "auto"},
+#endif
+#if REX_PLATFORM_MAC
+      {"audio_thread_priority", "2"},
+      {"audio_mixer_priority", "2"},
+      {"audio_device_sample_frames", "256"},
+      {"audio_maxqframes", "4"},
 #endif
   };
   for (const auto& [name, value] : kDefaults) {

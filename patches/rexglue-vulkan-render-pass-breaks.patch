@@ -1,0 +1,520 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index b91f605..ba4af10 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -234,10 +234,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // barriers preceding it) instead of ending it. Without this, every vertex or
+   // index upload in a render pass ends it, copies between two barriers and
+   // begins it again.
+-  // Whether an upload of these shared memory pages (first, count) can be
++  // Whether an upload of these shared memory bytes (start, length) can be
+   // hoisted now.
+   bool CanHoistSharedMemoryUpload(
+-      const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const;
++      const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) const;
+   // A new value for every render pass that hoisted commands can go before.
+   uint64_t hoist_render_pass_serial() const { return hoist_render_pass_serial_; }
+   // Between these, the deferred command buffer's commands go before the
+@@ -1140,9 +1140,13 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   // Upload hoisting (CanHoistSharedMemoryUpload): whether the current render
+   // pass takes hoisted commands, its hoist point in the deferred command
+-  // buffer, and the shared memory pages its draws read (a bit per page, in
+-  // 64-page words that only count if their serial is the render pass's, so
+-  // nothing needs clearing between render passes).
++  // buffer, and the shared memory its draws read (a bit per unit of
++  // 2^hoist_read_unit_log2_ bytes, in 64-unit words that only count if their
++  // serial is the render pass's, so nothing needs clearing between render
++  // passes). The unit is vulkan_hoist_read_granularity_log2, not the host page:
++  // with 16 KB pages (Apple Silicon) the per-draw uploads of hot pages, a few
++  // hundred bytes each, mostly share a page with what an earlier draw read.
++  uint32_t hoist_read_unit_log2_ = 12;
+   bool hoist_render_pass_ = false;
+   size_t hoist_point_ = 0;
+   uint64_t hoist_render_pass_serial_ = 0;
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 8a67735..58455ef 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -65,7 +65,7 @@ class VulkanSharedMemory : public SharedMemory {
+   // Upload hoisting: whether an upload of these pages can go before the
+   // current render pass, and if so, starts recording it there with the
+   // barrier before the hoisted copies.
+-  bool BeginHoistedUpload(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges);
++  bool BeginHoistedUpload(const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges);
+   // Ends recording a hoisted upload of these byte ranges with the barrier after
+   // the hoisted copies.
+   void EndHoistedUpload(const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index cbced76..836d1c1 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -52,8 +52,60 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ #include "../shader_storage_progress.h"
++#include "pass_stats.h"
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_BOOL(vulkan_pass_stats, false, "GPU/Vulkan",
++                    "Development: log once a second what began and ended render passes (draws, EDRAM "
++                    "transfers, barriers), for tile-based GPUs where each pass break costs bandwidth");
++
++namespace rex::graphics::vulkan {
++namespace {
++PassStats g_pass_stats;
++std::chrono::steady_clock::time_point g_pass_stats_last{};
++}  // namespace
++
++PassStats& GetPassStats() {
++  return g_pass_stats;
++}
++
++void MaybeLogPassStats() {
++  if (!REXCVAR_GET(vulkan_pass_stats)) {
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  if (g_pass_stats_last == std::chrono::steady_clock::time_point{}) {
++    g_pass_stats_last = now;
++    g_pass_stats = {};
++    return;
++  }
++  const double seconds = std::chrono::duration<double>(now - g_pass_stats_last).count();
++  if (seconds < 1.0) {
++    return;
++  }
++  const PassStats& s = g_pass_stats;
++  const double frames = s.swaps ? double(s.swaps) : 1.0;
++  REXGPU_INFO(
++      "pass stats per frame ({} frames in {:.1f} s): draws {:.0f}, render passes {:.0f} (for draws {:.0f}, for "
++      "EDRAM transfers and resolve clears {:.0f}), ended by barriers {:.0f} (buffer barriers {:.0f}, image "
++      "barriers {:.0f}), transfer targets {:.0f}, resolves {:.0f}, texture loads {:.0f}",
++      s.swaps, seconds, s.draws / frames, (s.passes_for_draws + s.passes_for_transfers) / frames,
++      s.passes_for_draws / frames, s.passes_for_transfers / frames, s.ended_by_barrier / frames,
++      s.barrier_buffers / frames, s.barrier_images / frames, s.transfer_targets / frames, s.resolves / frames,
++      s.texture_loads / frames);
++  std::string sources;
++  for (uint32_t i = 0; i < PassStats::kSourceCount; ++i) {
++    if (s.ended_by_source[i]) {
++      sources += fmt::format(" {} {:.0f};", PassStats::kSourceNames[i], s.ended_by_source[i] / frames);
++    }
++  }
++  REXGPU_INFO("pass stats per frame: render passes ended with buffer barriers from:{}", sources);
++  g_pass_stats = {};
++  g_pass_stats_last = now;
++}
++
++}  // namespace rex::graphics::vulkan
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -78,6 +130,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_UINT32(vulkan_hoist_read_granularity_log2, 8, "GPU/Vulkan",
++                      "log2 of the unit in which upload hoisting tracks the shared memory read in "
++                      "a render pass (8 = 256 bytes); 0 = the host page, as before. Whole-page "
++                      "uploads are checked against the whole page either way. Restart")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ REXCVAR_DEFINE_BOOL(vulkan_hoist_shared_memory_uploads, true, "GPU/Vulkan",
+                     "Record shared memory uploads (vertex and index data the CPU rewrote) before "
+                     "the current render pass when no draw in it has read the uploaded pages, "
+@@ -1009,8 +1066,11 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+   {
++    uint32_t granularity_log2 = REXCVAR_GET(vulkan_hoist_read_granularity_log2);
++    hoist_read_unit_log2_ = granularity_log2 ? std::clamp(granularity_log2, 6u, 16u)
++                                             : shared_memory_->page_size_log2();
+     size_t hoist_page_words =
+-        ((size_t(SharedMemory::kBufferSize) >> shared_memory_->page_size_log2()) + 63) / 64;
++        ((size_t(SharedMemory::kBufferSize) >> hoist_read_unit_log2_) + 63) / 64;
+     hoist_read_pages_.assign(hoist_page_words, 0);
+     hoist_read_pages_serial_.assign(hoist_page_words, 0);
+   }
+@@ -2900,6 +2960,8 @@ bool VulkanCommandProcessor::HdrClearTexture(HdrTexture texture) {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  ++GetPassStats().swaps;
++  MaybeLogPassStats();
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -3776,6 +3838,7 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+     VkPipelineStageFlags dst_stage_mask, VkAccessFlags src_access_mask,
+     VkAccessFlags dst_access_mask, uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
+     bool skip_if_equal) {
++  GetPassStats().NoteBufferBarrier();
+   if (skip_if_equal && src_stage_mask == dst_stage_mask && src_access_mask == dst_access_mask &&
+       src_queue_family_index == dst_queue_family_index) {
+     return false;
+@@ -3902,6 +3965,13 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+     }
+     return false;
+   }
++  if (in_render_pass_) {
++    PassStats& pass_stats = GetPassStats();
++    ++pass_stats.ended_by_barrier;
++    pass_stats.CountEndedBy();
++    pass_stats.barrier_buffers += pending_barriers_buffer_memory_barriers_.size();
++    pass_stats.barrier_images += pending_barriers_image_memory_barriers_.size();
++  }
+   EndRenderPass();
+   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+     auto it_next = std::next(it);
+@@ -3922,6 +3992,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+                  it->image_memory_barriers_offset),
+         pending_barriers_image_memory_barriers_.data() + it->image_memory_barriers_offset);
+   }
++  GetPassStats().pending_sources = 0;
+   pending_barriers_.clear();
+   pending_barriers_buffer_memory_barriers_.clear();
+   pending_barriers_image_memory_barriers_.clear();
+@@ -4009,6 +4080,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
++  GetPassStats().CountPassBegin();
+   in_render_pass_ = true;
+ }
+ 
+@@ -4102,6 +4174,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
++  GetPassStats().CountPassBegin();
+   in_render_pass_ = true;
+ }
+ 
+@@ -4150,16 +4223,16 @@ void VulkanCommandProcessor::EndRenderPass() {
+ //   SOFTWARE.
+ 
+ bool VulkanCommandProcessor::CanHoistSharedMemoryUpload(
+-    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) const {
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) const {
+   if (!hoist_render_pass_ || !in_render_pass_) {
+     return false;
+   }
+-  for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
++  for (const std::pair<uint32_t, uint32_t>& range : upload_byte_ranges) {
+     if (!range.second) {
+       continue;
+     }
+-    uint32_t page_first = range.first;
+-    uint32_t page_last = range.first + range.second - 1;
++    uint32_t page_first = range.first >> hoist_read_unit_log2_;
++    uint32_t page_last = uint32_t((uint64_t(range.first) + range.second - 1) >> hoist_read_unit_log2_);
+     if ((page_last >> 6) >= hoist_read_pages_.size()) {
+       return false;
+     }
+@@ -4187,9 +4260,8 @@ void VulkanCommandProcessor::MarkSharedMemoryReadInRenderPass(uint32_t start, ui
+     return;
+   }
+   length = std::min(length, SharedMemory::kBufferSize - start);
+-  uint32_t page_size_log2 = shared_memory_->page_size_log2();
+-  uint32_t page_first = start >> page_size_log2;
+-  uint32_t page_last = (start + length - 1) >> page_size_log2;
++  uint32_t page_first = start >> hoist_read_unit_log2_;
++  uint32_t page_last = (start + length - 1) >> hoist_read_unit_log2_;
+   for (uint32_t word = page_first >> 6; word <= (page_last >> 6); ++word) {
+     uint64_t mask = ~uint64_t(0);
+     if (word == (page_first >> 6)) {
+@@ -4394,6 +4466,7 @@ VulkanCommandProcessor::ScratchBufferAcquisition VulkanCommandProcessor::Acquire
+ 
+   if (scratch_buffer_ != VK_NULL_HANDLE && size <= scratch_buffer_size_) {
+     // Already used previously - transition.
++    GetPassStats().next_source = PassStats::kScratch;
+     PushBufferMemoryBarrier(scratch_buffer_, 0, VK_WHOLE_SIZE, scratch_buffer_last_stage_mask_,
+                             initial_stage_mask, scratch_buffer_last_access_mask_,
+                             initial_access_mask);
+@@ -4536,6 +4609,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
+   g_draw_counter.fetch_add(1, std::memory_order_relaxed);
++  ++GetPassStats().draws;
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+diff --git a/src/graphics/vulkan/pass_stats.h b/src/graphics/vulkan/pass_stats.h
+new file mode 100644
+index 0000000..c1d28c1
+--- /dev/null
++++ b/src/graphics/vulkan/pass_stats.h
+@@ -0,0 +1,88 @@
++/**
++ * @file        graphics/vulkan/pass_stats.h
++ * @brief       Counts of what begins and ends render passes (vulkan_pass_stats)
++ *
++ * Added by the mcla-recomp fork (patches/rexglue-vulkan-pass-stats.patch), for tile-based GPUs (Apple's,
++ * through MoltenVK), where every render pass ends with its attachments written out of tile memory and the
++ * next one reads them back: what costs a little on a desktop GPU costs a pass's worth of bandwidth there.
++ * Everything is counted on the command processor's thread; the line is logged once a second from IssueSwap.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#pragma once
++
++#include <cstdint>
++
++namespace rex::graphics::vulkan {
++
++struct PassStats {
++  enum class Scope : uint8_t { kDraw, kTransfer };
++  Scope scope = Scope::kDraw;
++
++  uint64_t draws = 0;
++  uint64_t passes_for_draws = 0;      // a render pass begun to draw a guest draw into
++  uint64_t passes_for_transfers = 0;  // begun by the render target cache: EDRAM transfers, resolve clears
++  uint64_t ended_by_barrier = 0;      // a render pass ended because barriers had to go in
++  uint64_t barrier_buffers = 0;       // buffer memory barriers in those
++  uint64_t barrier_images = 0;        // image memory barriers in those
++  uint64_t transfer_targets = 0;      // render targets that had transfers to them
++  uint64_t resolves = 0;
++  uint64_t texture_loads = 0;         // texture load dispatches
++  uint64_t swaps = 0;
++
++  // Where the buffer barriers that ended render passes came from: a call site sets next_source before
++  // PushBufferMemoryBarrier, which adds it to the pending sources; SubmitBarriers counts them.
++  enum Source : uint32_t {
++    kSharedToRead,          // shared memory: back to read after uploads, memexport or resolve writes
++    kSharedToUpload,        // shared memory: CPU-written pages copied in
++    kSharedToComputeWrite,  // shared memory: resolves written by compute
++    kSharedToDrawWrite,     // shared memory: a draw that may memexport
++    kSharedCommit,          // shared memory: committing a write range with the same usage
++    kScratch,
++    kEdram,
++    kTextureScratch,
++    kOther,
++    kSourceCount,
++  };
++  static constexpr const char* kSourceNames[kSourceCount] = {
++      "shared->read", "shared->upload", "shared->compute write", "shared->draw write", "shared commit",
++      "scratch", "edram", "texture scratch", "other"};
++  Source next_source = kOther;
++  uint32_t pending_sources = 0;
++  uint64_t ended_by_source[kSourceCount] = {};
++
++  void NoteBufferBarrier() {
++    pending_sources |= 1u << next_source;
++    next_source = kOther;
++  }
++  void CountEndedBy() {
++    for (uint32_t i = 0; i < kSourceCount; ++i) {
++      if (pending_sources & (1u << i)) {
++        ++ended_by_source[i];
++      }
++    }
++  }
++
++  struct ScopedTransfer {
++    explicit ScopedTransfer(PassStats& s) : stats(s), previous(s.scope) { s.scope = Scope::kTransfer; }
++    ~ScopedTransfer() { stats.scope = previous; }
++    PassStats& stats;
++    Scope previous;
++  };
++
++  void CountPassBegin() {
++    if (scope == Scope::kTransfer) {
++      ++passes_for_transfers;
++    } else {
++      ++passes_for_draws;
++    }
++  }
++};
++
++PassStats& GetPassStats();
++// Logs and clears the counts when a second has passed since the last line (vulkan_pass_stats only).
++void MaybeLogPassStats();
++
++}  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0a03c6b..5b45f3e 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -36,6 +36,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
++#include "pass_stats.h"
+ 
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+@@ -1578,6 +1579,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                       VulkanSharedMemory& shared_memory,
+                                       VulkanTextureCache& texture_cache,
+                                       uint32_t& written_address_out, uint32_t& written_length_out) {
++  ++GetPassStats().resolves;
+   written_address_out = 0;
+   written_length_out = 0;
+ 
+@@ -3024,6 +3026,7 @@ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
+   VkAccessFlags src_access_mask, dst_access_mask;
+   GetEdramBufferUsageMasks(edram_buffer_usage_, src_stage_mask, src_access_mask);
+   GetEdramBufferUsageMasks(new_usage, dst_stage_mask, dst_access_mask);
++  GetPassStats().next_source = PassStats::kEdram;
+   if (command_processor_.PushBufferMemoryBarrier(edram_buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
+                                                  dst_stage_mask, src_access_mask,
+                                                  dst_access_mask)) {
+@@ -3080,6 +3083,7 @@ void VulkanRenderTargetCache::CommitEdramBufferShaderWrites(
+     PixelShaderInterlockFullEdramBarrierPlaced();
+     return;
+   }
++  GetPassStats().next_source = PassStats::kEdram;
+   command_processor_.PushBufferMemoryBarrier(
+       edram_buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask, access_mask, access_mask,
+       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+@@ -5437,6 +5441,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle,
+     const float* color_resolve_clear_host_value) {
++  PassStats::ScopedTransfer pass_stats_scope(GetPassStats());
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -5849,6 +5854,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+       }
+ 
+       // Perform the transfers for the render target.
++      ++GetPassStats().transfer_targets;
+ 
+       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index ebc998e..b6161e4 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -22,6 +22,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
++#include "pass_stats.h"
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+@@ -220,6 +221,25 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
+       size = VK_WHOLE_SIZE;
+       last_usage_ = usage;
+     }
++    PassStats& pass_stats = GetPassStats();
++    if (offset == 0 && size == VK_WHOLE_SIZE) {
++      switch (usage) {
++        case Usage::kRead:
++          pass_stats.next_source = PassStats::kSharedToRead;
++          break;
++        case Usage::kTransferDestination:
++          pass_stats.next_source = PassStats::kSharedToUpload;
++          break;
++        case Usage::kComputeWrite:
++          pass_stats.next_source = PassStats::kSharedToComputeWrite;
++          break;
++        case Usage::kGuestDrawReadWrite:
++          pass_stats.next_source = PassStats::kSharedToDrawWrite;
++          break;
++      }
++    } else {
++      pass_stats.next_source = PassStats::kSharedCommit;
++    }
+     command_processor_.PushBufferMemoryBarrier(
+         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+@@ -275,17 +295,12 @@ bool VulkanSharedMemory::UploadByteRanges(
+   }
+   uint32_t bounds_start = UINT32_MAX;
+   uint32_t bounds_end = 0;
+-  hoist_page_ranges_temp_.clear();
+   for (const std::pair<uint32_t, uint32_t>& range : upload_byte_ranges) {
+     bounds_start = std::min(bounds_start, range.first);
+     bounds_end = std::max(bounds_end, range.first + range.second);
+-    if (range.second) {
+-      uint32_t page_first = range.first >> page_size_log2();
+-      hoist_page_ranges_temp_.emplace_back(
+-          page_first, ((range.first + range.second - 1) >> page_size_log2()) - page_first + 1);
+-    }
+   }
+-  bool hoist = BeginHoistedUpload(hoist_page_ranges_temp_);
++  // Only these bytes are copied, so only a draw that read them stops the hoist.
++  bool hoist = BeginHoistedUpload(upload_byte_ranges);
+   if (!hoist) {
+     Use(Usage::kTransferDestination, std::make_pair(bounds_start, bounds_end - bounds_start));
+     command_processor_.SubmitBarriers(true);
+@@ -342,7 +357,13 @@ bool VulkanSharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
+-  bool hoist = BeginHoistedUpload(upload_page_ranges);
++  // Whole pages are copied: a draw that read any byte of them stops the hoist.
++  hoist_page_ranges_temp_.clear();
++  for (const std::pair<uint32_t, uint32_t>& range : upload_page_ranges) {
++    hoist_page_ranges_temp_.emplace_back(range.first << page_size_log2(),
++                                         range.second << page_size_log2());
++  }
++  bool hoist = BeginHoistedUpload(hoist_page_ranges_temp_);
+   if (!hoist) {
+     // upload_page_ranges are sorted, use them to determine the range for the
+     // ordering barrier.
+@@ -413,13 +434,13 @@ bool VulkanSharedMemory::UploadRanges(
+ }
+ 
+ bool VulkanSharedMemory::BeginHoistedUpload(
+-    const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
++    const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) {
+   // In a render pass whose draws have not read these pages, copy before the
+   // render pass instead of ending it: between a barrier after everything that
+   // read the buffer before the render pass and one before the render pass's
+   // reads, which all the uploads hoisted before the same render pass share.
+   if (last_usage_ != Usage::kRead || last_written_range_.second ||
+-      !command_processor_.CanHoistSharedMemoryUpload(upload_page_ranges)) {
++      !command_processor_.CanHoistSharedMemoryUpload(upload_byte_ranges)) {
+     return false;
+   }
+   command_processor_.BeginHoistedCommands();
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 582b85d..b6843b2 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -34,6 +34,7 @@
+ #include <rex/ui/vulkan/mem_alloc.h>
+ #include <rex/ui/vulkan/ui_samplers.h>
+ #include <rex/ui/vulkan/util.h>
++#include "pass_stats.h"
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+ 
+@@ -1436,6 +1437,7 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+ 
+ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                                bool load_mips) {
++  ++GetPassStats().texture_loads;
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
+ 
+@@ -1920,6 +1922,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     }
+     // Make the normalized intermediate data visible for conversion and keep it
+     // writable for in-place conversion to float16.
++    GetPassStats().next_source = PassStats::kTextureScratch;
+     command_processor_.PushBufferMemoryBarrier(
+         scratch_buffer, 0, VK_WHOLE_SIZE,
+         scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+@@ -2049,6 +2052,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+       write_descriptor_set_storage_image.pTexelBufferView = nullptr;
+       dfn.vkUpdateDescriptorSets(device, 1, &write_descriptor_set_storage_image, 0, nullptr);
+ 
++      GetPassStats().next_source = PassStats::kTextureScratch;
+       command_processor_.PushBufferMemoryBarrier(
+           scratch_buffer, 0, VK_WHOLE_SIZE,
+           scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+@@ -2100,6 +2104,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   }
+ 
+   // Submit copying from the copy buffer to the host texture.
++  GetPassStats().next_source = PassStats::kTextureScratch;
+   command_processor_.PushBufferMemoryBarrier(
+       scratch_buffer, 0, VK_WHOLE_SIZE,
+       scratch_buffer_acquisition.SetStageMask(VK_PIPELINE_STAGE_TRANSFER_BIT),

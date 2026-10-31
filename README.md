@@ -1,5 +1,13 @@
 # MCLA: a fork of mcla-recomp
 
+> **This repository ([m0d16l14n1/mcla-recomp](https://github.com/m0d16l14n1/mcla-recomp)) adds macOS on Apple Silicon.**
+> It follows [RenanQueiroz/mcla-recomp](https://github.com/RenanQueiroz/mcla-recomp) (Windows, Linux, PS5), described
+> below, and adds a native arm64 build for Macs: first drawing through Vulkan on MoltenVK, then through a Metal
+> backend for the SDK's Xbox 360 GPU emulation that other ReXGlue ports can use too. It is work in progress:
+> see [macOS](#macos-apple-silicon), [docs/macos.md](docs/macos.md) and [docs/BACKLOG.md](docs/BACKLOG.md).
+> Report macOS problems in [this fork's issues](https://github.com/m0d16l14n1/mcla-recomp/issues), everything else
+> where the sections below say.
+
 ## What this is
 
 *Midnight Club: Los Angeles Complete Edition* (Xbox 360, title `545407F8`) running natively on a PC. This is a fork of [holdmysocks/mcla-recomp](https://github.com/holdmysocks/mcla-recomp), the static recompilation of the game to native code for Windows, Linux and jailbroken PS5 consoles, built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). On top of upstream's `main` the fork adds performance work on both Windows renderers (Direct3D 12 and Vulkan) so that higher resolutions and frame rates hold, a Windows launcher with a setup wizard that builds, updates and starts the game, HDR, FSR 3.1 and frame generation, and several game fixes. The changes meant for upstream are offered there as pull requests over time.
@@ -10,6 +18,18 @@
 
 Only **Midnight Club: Los Angeles Complete Edition, USA/Europe, for Xbox 360** (title id `545407F8`), as a disc image (`.iso`). The fixes in `config/` are addresses in that release's executable; another region or revision would need them checked again.
 
+The copy this fork's macOS work is built and tested with, so that you can compare yours (`rexglue codegen` prints the first four):
+
+| | |
+|---|---|
+| Title id | `545407F8` |
+| Media id | `5940C9DB` |
+| `default.xex` version | 8 (base version 8), disc 1 of 1, built 2009-07-17 22:23 UTC |
+| `default.xex` SHA-1 | `03e5e2c6a5666edc79bd3b230ffaa5fcc03ef7e6` (9,252,864 bytes) |
+| Disc image | XGD2, 7,838,695,424 bytes; 15 files, 6.12 GiB extracted |
+
+No title update is needed or used.
+
 ## Status
 
 | Target | State in this fork |
@@ -18,6 +38,7 @@ Only **Midnight Club: Los Angeles Complete Edition, USA/Europe, for Xbox 360** (
 | Windows, Vulkan | Runs with the same settings; not yet played through by hand. |
 | Linux, Vulkan | Upstream's build plays. The fork's patches have not been built or run there. |
 | PS5 (jailbroken) | Upstream's build plays at a steady 30 FPS. The fork's patches have not been built or run on a console. |
+| macOS, Apple Silicon (this fork) | Boots to free roam on an M5 (title, menus, the city, HUD, audio), through Vulkan on MoltenVK. Free roam at native 720p: about 20 FPS with MSAA 2x, 31 FPS with anti-aliasing off (holds the 30 FPS cap); still GPU-bound. A native Metal backend is in development (`--mcla_gpu_backend=metal`: the game runs on it, nothing is drawn yet). [docs/macos.md](docs/macos.md), [docs/metal-backend.md](docs/metal-backend.md), [docs/BACKLOG.md](docs/BACKLOG.md) |
 
 Everything the fork adds was built and measured on Windows only, on an NVIDIA RTX 5080 and a Ryzen 7 9800X3D (and on the Ryzen's integrated Radeon). It has not been tried on a discrete AMD card, Intel graphics, Linux or the PS5. If you try it on other hardware, please tell us in the [fork's issues](https://github.com/RenanQueiroz/mcla-recomp/issues), whether it works or not. What was tested and the frame times: [docs/status.md](docs/status.md).
 
@@ -109,6 +130,30 @@ cd mcla-recomp
 
 Upstream's build plays; the fork's SDK patches have not been built or run on Linux. Steps: [docs/building.md](docs/building.md#linux).
 
+### macOS (Apple Silicon)
+
+This fork's target. You need a Mac with Apple Silicon, Xcode 16 or newer (or its command line tools), Homebrew and about 12 GB of free disk besides the game:
+
+```bash
+git clone https://github.com/m0d16l14n1/mcla-recomp.git
+cd mcla-recomp
+bash scripts/make_mac.sh --iso /path/to/your.iso
+bash scripts/play_mac.sh
+```
+
+`make_mac.sh` checks the tools and offers to install what is missing, builds the ReXGlue SDK with the same patches as the other platforms, extracts and recompiles your game and builds it; `play_mac.sh` starts it with a log (`run.log` in the build folder) and has switches for lldb, MoltenVK's debug output and the Metal HUD.
+
+What is supported, and what is planned:
+
+| | |
+|---|---|
+| Macs | Apple Silicon (M1 and later), arm64 only. Intel Macs are not a target. |
+| Graphics | Now: the SDK's Xbox 360 GPU emulation on Vulkan, through MoltenVK (Metal underneath). In development: a native Metal backend ([docs/metal-backend.md](docs/metal-backend.md)), then EDR (HDR) and MetalFX upscaling. |
+| Not on macOS | Direct3D 12, FSR 3.1 and frame generation, NVIDIA Reflex, AMD Anti-Lag 2, the Windows launcher and installer. |
+| Input, audio | SDL3, as on Linux: Xbox and DualSense controllers, keyboard. |
+
+Every step, building by hand, and debugging: [docs/macos.md](docs/macos.md). What works so far: [docs/BACKLOG.md](docs/BACKLOG.md).
+
 ### PS5
 
 Upstream's build plays on a jailbroken PS5; the fork's patches have not been built or run on a console. Steps: [docs/building.md](docs/building.md#ps5).
@@ -123,6 +168,7 @@ Each change, how it was checked and what is not verified: [KNOWN-ISSUES.md](KNOW
 
 ## More documentation
 
+- [docs/macos.md](docs/macos.md): the macOS build, its plan and debugging; [docs/metal-backend.md](docs/metal-backend.md): the Metal backend; [docs/BACKLOG.md](docs/BACKLOG.md): the macOS work list.
 - [docs/settings.md](docs/settings.md): every setting.
 - [docs/off-switches.md](docs/off-switches.md): every off switch, with what it does and what was measured.
 - [docs/fork-changes.md](docs/fork-changes.md): what the fork changes, and how it relates to upstream.
@@ -136,6 +182,7 @@ Each change, how it was checked and what is not verified: [KNOWN-ISSUES.md](KNOW
 - ReXGlue SDK by Tom Clay and contributors; Xenia by Ben Vanik and contributors; XenonRecomp by hedge-dev, on which ReXGlue's analysis builds.
 - [LARecomp](https://github.com/mzzvxm/LARecomp) by mzzvxm and contributors, whose fixes several parts of this project are ported from.
 - [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) by mihawk-99 (GPL-3): the RADV port and toolchain the PS5 version is built on.
+- [LibertyRecomp](https://github.com/hamishakl/LibertyRecomp) (GTA IV, GPL-3.0): the macOS port of ReXGlue and the Metal presenter this fork's macOS work learns from.
 - [ForzaHorizon1-ReImagined](https://github.com/Dyotson/ForzaHorizon1-ReImagined) and [RecompiledHaloReach](https://github.com/Dyotson/RecompiledHaloReach) by Dyotson and contributors (MIT), and [xenia-canary](https://github.com/xenia-canary/xenia-canary) and [Xenia](https://github.com/xenia-project/xenia): code and approaches the fork's changes are ported from.
 
 What was taken from each: [docs/fork-changes.md](docs/fork-changes.md#credits-in-detail).

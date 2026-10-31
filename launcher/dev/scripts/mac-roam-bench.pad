@@ -1,0 +1,11 @@
+# Free-roam benchmark for macOS (scripts/mac_bench.sh): boot, Start, the first-run
+# dialogs, then stand still at the spawn point and count engine frames for 10 s.
+wait 30s
+press_until start left_title every=2s timeout=90s
+press_until a roam every=3s timeout=240s
+wait 8s
+mark bench_start
+wait 10s
+mark bench_end
+shot bench.png
+quit

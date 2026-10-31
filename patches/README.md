@@ -90,6 +90,14 @@ git apply ../../patches/rexglue-linux-wait-sleep.patch
 
 They make page-protection lookups and multi-handle waits cheap on Linux. The Windows build needs neither. The PS5 build also applies `rexglue-linux-wait-sleep.patch` (`ps5/make_ps5.sh` does it): the PS5 runs the same POSIX threading code, where a wait shorter than 1 ms spun instead of sleeping.
 
+On macOS (`scripts/make_mac.sh`) both Linux patches go on as well (the Linux-only code in the first is behind `REX_PLATFORM_LINUX`; the second is the POSIX wait macOS shares), then everything above in the same order, then the macOS fork's own, last:
+
+```
+git apply ../../patches/rexglue-vulkan-render-pass-breaks.patch
+git apply ../../patches/rexglue-macos-audio-threads.patch
+git apply ../../patches/rexglue-metal-backend.patch
+```
+
 The first was several files at first; they are combined now because several touch the same build files and would not apply independently. The second goes on top of the first (both change `src/graphics/vulkan/command_processor.cpp`). The build scripts apply all of them, and add the second and the ones after the FFmpeg patch to an SDK checkout that was patched before they existed. Those later patches go on in the order listed, as several change neighbouring lines.
 
 ## rexglue-v0.10.0-mcla.patch
@@ -2084,3 +2092,79 @@ For the exponent bias (#490), pictures on Vulkan, from llvm-mingw builds of orig
 
 FFmpeg's Windows configuration is the Microsoft toolchain's (`--toolchain=msvc`): it asks for `crtversion.h`, which mingw-w64 with the UCRT doesn't have (151 files failed). Under `__MINGW32__`, `config.h` sets `HAVE_LIBC_MSVCRT` to 0, which also gives the C99 `printf` specifiers. Applied in the `thirdparty/FFmpeg` submodule, like `rexglue-ffmpeg-ps5-config.patch`; nothing changes for any other compiler.
 
+
+## rexglue-vulkan-render-pass-breaks.patch
+
+macOS fork. Apple's GPUs draw in tiles: a render pass ends with its attachments written out of tile memory and the next one reads them back, so each render pass break costs a pass's worth of bandwidth whatever was drawn in it, where on a desktop GPU it costs next to nothing. Through MoltenVK, MCLA's free roam at native resolution ran at 15.9 FPS (MSAA 2x) on an Apple M5, with about 9,600 Metal render encoders a second (an Instruments *Metal System Trace* of 6 s: the fragment stage busy 67% of the time, most of it in passes of 0.25 to 3 ms).
+
+`vulkan_pass_stats` (development, off by default) logs once a second, per frame, the render passes begun for draws and for EDRAM transfers and resolve clears, the passes ended by barriers with the buffer and image barriers in them, and where the buffer barriers came from (`pass_stats.h`). In free roam: 529 render passes a frame, 476 ended by barriers, and of those 333 by shared memory uploads that `rexglue-vulkan-hoist-shared-memory-uploads.patch` could not move before the render pass.
+
+The reason is the page size. Upload hoisting tracked what the draws of a render pass read a bit per *host* page, 16 KB on Apple Silicon against 4 KB on a PC, and MCLA's uploads are mostly the few hundred bytes a draw reads from a hot page: the next draw's bytes are nearly always in a page an earlier draw read. The reads are now tracked in units of `vulkan_hoist_read_granularity_log2` (default 8, 256 bytes; 0 = the host page, as before; restart). An upload of a hot page's bytes is checked against exactly those bytes; an upload of whole pages (a watched page a guest write invalidated, where which bytes changed is not known) is checked against the whole pages, as before, so what an earlier draw of the render pass read is never rewritten under it.
+
+Measured on an Apple M5 (macOS 27.2, MoltenVK 1.4), RelWithDebInfo, free roam standing at the spawn point (`launcher/dev/scripts/mac-roam-bench.pad` through `scripts/mac_bench.sh`), uncapped, native resolution, engine frames over 10 s:
+
+| | Render passes a frame | Ended by uploads | FPS |
+|---|---|---|---|
+| Host pages (`=0`, as before) | 529 | 333 | 15.7 |
+| 256 bytes (default) | 265 | 87 | 19.6 (+25%) |
+| 64 bytes | 277 | 82 | 19.5 |
+| 256 bytes, anti-aliasing off | 303 | 111 | 31.3 (23.3 before) |
+
+The 82 to 87 uploads that still end a render pass rewrite bytes a draw in the same render pass has read (a buffer the game refills between draws), which no hoisting can move. The pictures saved at the end of each run (the spawn point; the camera settles at a slightly different angle from run to run, so they are not compared pixel for pixel) show no missing or broken geometry with it, checked by eye. Built and run on macOS only; on Windows (4 KB pages) it changes the unit from 4 KB to 256 bytes too, which can only hoist more (untested there).
+
+| Change | Files | Affects |
+|---|---|---|
+| Render pass statistics (`vulkan_pass_stats`) | `src/graphics/vulkan/pass_stats.h` (new), `src/graphics/vulkan/command_processor.cpp`, `src/graphics/vulkan/render_target_cache.cpp`, `src/graphics/vulkan/shared_memory.cpp`, `src/graphics/vulkan/texture_cache.cpp` | Vulkan, logging only |
+| Hoisting reads tracked in 256-byte units; uploads checked by their bytes | `include/rex/graphics/vulkan/command_processor.h`, `include/rex/graphics/vulkan/shared_memory.h`, `src/graphics/vulkan/command_processor.cpp`, `src/graphics/vulkan/shared_memory.cpp` | Vulkan |
+
+## rexglue-macos-audio-threads.patch
+
+macOS fork. The sound lagged behind the picture. The fork's audio scheduling (`audio_thread_priority`, and the game's `audio_mixer_priority`, `rexglue-xma-decoder-fixes.patch`) is Windows-only, so on macOS the audio worker, the XMA decoder and the game's mixer thread ran at the default QoS; and CoreAudio's default device buffer, 1,024 samples (21 ms), sat on top of the 8-frame queue (43 ms).
+
+- `audio_thread_priority` and `RaiseCallingAudioThread` (which `audio_mixer_priority` calls) on macOS: levels 1 and 2 put the calling thread in QoS user-interactive, level 3 also makes it a time-constraint thread like Core Audio's (5.33 ms period, 1.5 ms computation). Set from the thread itself (`EnterAudioThreadMmcss`), as QoS can only be; the POSIX `SCHED_FIFO` priority `ApplyAudioThreadPriority` set from outside is skipped on macOS, as it keeps a thread out of the QoS classes.
+- `audio_stats` gets the threads' CPU time on macOS (`CLOCK_THREAD_CPUTIME_ID`), so its mixer line shows whether a slow round waited to run.
+- `audio_device_sample_frames` (0 = SDL's default): the samples the output device asks for at a time; the `SDL_AUDIO_DEVICE_SAMPLE_FRAMES` environment variable wins.
+
+The game sets, on macOS only (`src/mcla_app.cpp`), `audio_thread_priority` and `audio_mixer_priority` 2, `audio_device_sample_frames` 256 and `audio_maxqframes` 4. Measured with `--audio_stats=true` in free roam on an Apple M5 (17 to 19 FPS, `scripts/mac_bench.sh`), per 10 s:
+
+| | Before | QoS | QoS, 256 samples, 4 frames |
+|---|---|---|---|
+| Output callbacks | 468 (4 frames each) | 468 | 1,878 (1 frame each) |
+| Longest gap between the game's audio rounds | 18.8 to 22.8 ms | 19.1 ms | 10.2 ms |
+| Audio worker's longest wake-up | 13.9 ms | 5.7 ms | 4.5 ms |
+| Mixer thread's longest wake-up | 2,810 µs | 47 µs | 32 µs |
+| Underruns after start-up / least queued | 0 / 8 frames | 0 / 8 | 0 / 3 |
+| Device buffer + queue (delay) | 21 + 43 ms | 21 + 43 ms | 5 + 21 ms |
+
+At start-up 20 underruns (before) went to none in the last run. Built and run on macOS only; nothing changes elsewhere (the macOS code is under `__APPLE__`, the new option defaults to SDL's own buffer).
+
+## rexglue-metal-backend.patch
+
+macOS fork. A native Metal backend in the xenos plugin, picked with the backend name `metal` (the game's
+`--mcla_gpu_backend=metal`); built when `REXGLUE_USE_METAL` is on, the default on Apple platforms. Vulkan stays the
+plugin's default. The design, the reasons for it and the milestones: `docs/metal-backend.md` in the fork.
+
+Milestone M0: a provider (the system's Metal device and one command queue), a presenter that paints the newest
+guest output image into the window's `CAMetalLayer` (the surface the SDK already makes on macOS for MoltenVK),
+letterboxed and bilinearly scaled, and a command processor that runs the whole command stream through the common
+`CommandProcessor` (registers, waits, events, interrupts, shader loads) while it counts and skips draws and
+resolves, and fills the guest output with a placeholder at each swap. Objective-C++ with ARC, outside the plugin's
+C++ precompiled header; Metal, QuartzCore and Foundation frameworks.
+
+Run on an Apple M5: the game goes from start to free roam (the map zoom-out after Start in 7.4 to 9.5 s, where
+MoltenVK takes 92) at 30 swaps a second with about 4,900 draws and 54 resolves a frame skipped, and exits cleanly.
+No captures, no UI overlays (no immediate drawer yet). Nothing changes for the other backends.
+
+Milestone M1, first part: the guest shaders of each draw are translated (the SDK's SPIR-V translator, MoltenVK's
+SPIRV-Cross to MSL, `metal_shader_translator.cpp`, plain C++) and compiled by Metal asynchronously
+(`metal_shaders.mm`): 346 to 480 a run from start to free roam, none failed at any step
+(`metal_shader_dump_dir` writes the MSL of failures). `metal_shared_memory_zero_copy` (default on) makes the guest's
+physical memory a Metal buffer without a copy; a check in free roam found the microcode of all 436 shaders loaded
+(236 KB) read by the GPU exactly as the CPU sees it. The Metal backend needs `REXGLUE_USE_VULKAN` for now (the
+SPIR-V translator and SPIRV-Cross come with it); CMake stops with a message otherwise.
+
+| Change | Files | Affects |
+|---|---|---|
+| `REXGLUE_USE_METAL` | `CMakeLists.txt`, `src/graphics/CMakeLists.txt` | macOS builds |
+| Backend `metal` in the plugin's factory | `src/graphics/plugin_main.cpp` | macOS builds |
+| Provider, presenter, graphics system, command processor; shader translation and compiles; zero-copy shared memory | `src/graphics/metal/` (new) | Metal |

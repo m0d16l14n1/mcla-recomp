@@ -7,10 +7,22 @@
 *.pe
 *.bin
 *.god
+*.dvd
+*.xbe
+*.stfs
+*.svod
+root_directory_padding.pad
+nxeart
+$SystemUpdate/
+/MCLA/
 /private/
 /game/
 /extracted/
 /dump/
+/content/
+/saves/
+/cache/
+/shader_cache/
 /generated/*
 !/generated/rexglue.cmake
 
@@ -37,6 +49,17 @@ keys.*
 
 # The play shortcut scripts/make_pc.ps1 makes
 *.lnk
+
+# macOS: build output, debugger and GPU captures, Finder metadata
+*.app/
+*.dylib
+*.dSYM/
+*.gputrace/
+*.trace/
+*.metallib
+*.mtlp-json
+*.ips
+.DS_Store
 
 # Working notes and developer tools: kept on the maintainer's machine, not
 # published. The README and docs/ are the public documentation.
