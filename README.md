@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 30 to 50 FPS**, depending on what else the Mac is running. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 FPS** on a cool, quiet Mac; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -66,6 +66,9 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_persistent_vertex_size=0` | Copy every vertex range every frame instead of keeping unwritten ones |
 | `--metal_snapshot_trust_size=0xFFFFFFFF` | Check every vertex range at every draw (and count the ones that changed) |
 | `--metal_pass_merge=false` | Start a render pass for every change of targets |
+| `--metal_compose_resolves=false` | Load surfaces the game assembles from resolves from guest memory instead of copying the resolves' textures (`--metal_compose_gaps=false`: only when the resolves cover the whole surface) |
+| `--metal_transfers_in_pass=false` | Give each EDRAM transfer a render pass of its own instead of drawing it in the draw's pass |
+| `--metal_texture_pool=false` | Make a new texture for every resolve instead of reusing freed ones |
 | `--metal_cp_qos=0` | Leave the GPU command thread at the default QoS class (4: user interactive) |
 | `--mcla_fence_sleep_us=0` | Spin while the game waits for the GPU, as before |
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
@@ -76,7 +79,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 ## Known issues
 
 - **On Metal, the player's car sometimes falls through the road.** This is a race between the game's own threads that the Metal backend's timing exposes; MoltenVK never shows it. It is parked for now: [launcher/dev/metal-car-falls-2026-11-01.md](launcher/dev/metal-car-falls-2026-11-01.md).
-- Frame rates vary a lot with what else the Mac runs: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores.
+- Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
 - The Metal backend still lacks MSAA proper (2x is drawn as 1x2 supersampling), EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 

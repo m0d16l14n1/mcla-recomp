@@ -235,12 +235,51 @@ these changes: 0 of 240 samples under the road in 3 of 3 capped drives.
   target wrote since now starts a pass (which takes them over) instead of drawing over stale tiles; before, only
   the first draw of a pass had its rows synchronized.
 
+**Fifth pass (2026-11-01): about 60 FPS in free roam when the Mac is cool** (57 to 60 in single runs after a pause;
+GPU time about 17 ms a frame, from 19 to 20).
+
+- *Surfaces made from resolves* (`metal_compose_resolves`). The game draws the 720p scene in two EDRAM tiles and
+  resolves each to its rows of one surface (512 and 208 rows), then samples the whole surface. Such a texture was
+  untiled from guest memory every time a resolve had touched it, about 30 loads a frame. Now, when resolves wrote
+  pieces of it (each starting a whole number of 32-row macro tile rows in, with its width, pitch and format), it is
+  made by copying the pieces' textures; rows no piece covers (the surface is also read while only its top tile is
+  resolved, its other rows holding an older resolve, as on the console) are untiled from memory alone
+  (`metal_compose_gaps`). 12 real loads a frame are left, and 18 surfaces made from resolves. Resolves now write
+  whole words where a texel lies inside the destination.
+- *EDRAM transfers drawn in the draw's pass* (`metal_transfers_in_pass`). A transfer was a render pass of its own,
+  loading and storing its target from row 0 to its last row, before the draw's pass loaded it again. Now the
+  transfers a pass needs are drawn first in that pass, into their attachment only (pipelines for the pass's
+  attachment formats; shaders `transfer_color_from_*_N` for color attachment N). Transfers that read a target of
+  the pass, or reach past its rows, keep their own passes. 38 of 50 a frame are in a draw's pass; the transfers'
+  GPU time went from about 3 ms to 0.6 (the passes gained about 0.3).
+- *Rectangle draws claim the rows they cover.* The rows of a screen-space draw (a clear drawn as a rectangle) are
+  bounded by its vertices; the bound took one row more than `ceil(bottom)`, which for a 512-row depth clear reached
+  into the next 16-row EDRAM tile, owned by the color target placed after it. Each such draw then handed the tile
+  back and forth with a transfer and a new pass. Transfers 65 to 50 a frame, passes 70 to 58, passes restarted for
+  transfers 11 to 0.
+- *Pass checks without walking the EDRAM.* A draw that stays in the open pass checks that no other target wrote
+  its rows since; that walked every EDRAM tile the rows cover, for each attachment (2 million tiles a frame, 15% of
+  the command thread). Each target now keeps the range other targets may have written since it last took its
+  tiles over, and the last range it found current; most checks are a comparison.
+- *Resolve textures from a pool* (`metal_texture_pool`). About 50 resolve destinations a frame were each made and
+  freed (an IOKit call apiece on the command thread). Freed ones go to a pool and are taken again when the pool
+  holds the last reference (no cached view of them, no command buffer using them still running).
+
+How these were measured matters: this Mac heats up, and in a series of back-to-back benchmark runs each run is
+slower than the one before (the command thread's CPU time per frame goes from about 13 ms to 25 for the same
+build), so a variant always run first in its pair wins. Use a pause of a couple of minutes between runs, or
+A-B-B-A ordering, and the GPU time from a trace.
+
 **Where the GPU time goes**, from a Metal System Trace (`xcrun xctrace record --template 'Metal System Trace'
 --attach <pid>`, with `--metal_debug_labels=true` so encoders have names; `out/research/parse_gputrace.py` sums
 the exported `metal-gpu-intervals` table by label), per frame before the clears and pass merging: render passes
 12.9 ms of fragment and 5.8 of vertex work (the scene's 1280x1024 pass 5.2 ms), resolves 3.1, EDRAM transfers
 2.9, texture loads 2.4 (a 1280x720 surface the game assembles from resolves, loaded again about 5 times a frame),
-resolve clears 2.4. Anti-aliasing off saves about 5 ms of GPU time (MSAA 2x is drawn as 1x2 supersampling).
+resolve clears 2.4. After the fifth pass: render passes 14.8 ms of fragment and 5.6 of vertex work (the scene's
+1280x1024 pass 5.3 and 1.6), resolves 2.3, surfaces made from resolves 2.5 (copies 1.4, rows from memory 1.1),
+resolve clears 0.9, texture loads 0.7, transfers in passes of their own 0.6. These sum to more than the frame,
+since the stages of different passes overlap. Anti-aliasing off saves about 5 ms of GPU time (MSAA 2x is drawn as
+1x2 supersampling).
 The Metal HUD, if `MetalForceHudEnabled` is set for the whole system, is loaded into the game whatever
 `MTL_HUD_ENABLED` says and costs the command processor 4 to 5%.
 
