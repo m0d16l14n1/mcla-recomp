@@ -29,8 +29,8 @@ Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a fra
 The rows above are before the tenth pass (the 4x reflections at one sample a pixel, now the default), which adds
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: EDRAM transfers
 of 64-bit formats, 3D textures, the UI overlays (ImGui), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
-the tenth pass). Known bug: the player's car sometimes falls through the road on Metal
-([BACKLOG](BACKLOG.md) 27). The passes below, first to tenth, record how it got here.
+the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to tenth, record how it got here.
 
 ## Why
 
@@ -151,7 +151,7 @@ and the snapshot megabytes a frame (about 34 loads: surfaces the game resolves e
 format or size than the resolve wrote, read back from memory). The GPU reads textures from guest memory when it runs the frame, up to a frame after the game wrote
 them; the vertices and indices are copied at the draw (`metal_snapshot_vertices`).
 
-**Open: the car falls through the city** (2026-11-01, parked). On Metal the player's car sometimes loses its collision and falls through the road, uncapped in nearly every drive of the test route, capped in about half. It is not anything the GPU writes: it happens with no GPU work at all when the command processor is made to pause briefly at resolves, fences or draws, and never when it is always ahead or stalls for long. A race between the game's own threads, then, that the command processor's timing exposes. The unattended test (a recorded drive replayed by the dev pad: `launcher/dev/drive-test/route-test.sh`), every result and the diagnostic switches are in `launcher/dev/metal-car-falls-2026-11-01.md`.
+**The car fell through the city** (2026-11-01; not seen since the speed passes, closed for now). On Metal the player's car sometimes loses its collision and falls through the road, uncapped in nearly every drive of the test route, capped in about half. It is not anything the GPU writes: it happens with no GPU work at all when the command processor is made to pause briefly at resolves, fences or draws, and never when it is always ahead or stalls for long. A race between the game's own threads, then, that the command processor's timing exposes. The unattended test (a recorded drive replayed by the dev pad: `launcher/dev/drive-test/route-test.sh`), every result and the diagnostic switches are in `launcher/dev/metal-car-falls-2026-11-01.md`.
 
 **EDRAM is kept in samples.** Free roam first showed only the HUD over a flat colour: the scene's draws landed, but
 always failed the depth and stencil tests. The game clears its 2x MSAA 1280-wide scene by drawing over the same

@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD); plays from boot to free roam. **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 94 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD); plays from boot to free roam. **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 94 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -117,7 +117,6 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 
 ## Known issues
 
-- **On Metal, the player's car sometimes falls through the road.** This is a race between the game's own threads that the Metal backend's timing exposes; MoltenVK never shows it. It is parked for now: [launcher/dev/metal-car-falls-2026-11-01.md](launcher/dev/metal-car-falls-2026-11-01.md).
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
 - The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
