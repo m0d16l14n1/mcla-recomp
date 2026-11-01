@@ -305,6 +305,42 @@ resolve clears 2.4. After the fifth pass: render passes 14.8 ms of fragment and 
 resolve clears 0.9, texture loads 0.7, transfers in passes of their own 0.6. These sum to more than the frame,
 since the stages of different passes overlap. Anti-aliasing off saves about 5 ms of GPU time (MSAA 2x is drawn as
 1x2 supersampling).
+**Seventh pass (2026-11-01): about 62 to 63 FPS on a cool Mac** (with a UTM virtual machine running beside it;
+GPU busy about 17.8 ms a frame, the command thread 11 ms of CPU time of which 4.5 waiting for the GPU).
+
+- *Resolve clears in the next pass* (`metal_clears_in_pass`): the clear after a resolve was a render pass of its
+  own that loaded and stored its target from the first row to the last cleared one. It now waits for the next
+  pass on that target and is drawn first in it (scissored), or becomes that pass's load action when it covers the
+  pass; it is drawn on its own only before something reads the target first (a resolve, an EDRAM transfer from
+  it) or when it is wider than the pass. 28 clears a frame move into passes, so 28 fewer encoders (each costs
+  the command thread, more so with the Metal HUD's per-encoder hooks).
+- *Shadow atlas from its resolves* (`metal_compose_columns`): the 1280x1280 shadow map is four 640x640 depth
+  resolves side by side. Each resolve's memory range covers whole 32-row macro tile rows, so every resolve
+  dropped its neighbour and the atlas was untiled from memory 2.5 times a frame (0.5 ms). A resolve now keeps
+  the earlier ones whose 32x32 tiles it does not touch (`TilesDisjoint`: in the tiled layout a piece is a set of
+  tiles `base + row * P + column`), and `ComposeResolves` places pieces at their tile column as well as their row
+  (rows no piece covers across the whole width are still loaded from memory). Texture loads 12 to 10 a frame.
+- *Command thread*: the five hash maps keyed by a texture's string key (texture, hash, frame checked, range,
+  watch) are one entry per key; the texture signs of the system constants are made for the fetch constants the
+  draw's shaders sample, not for all 32 (the game writes fetch constants nearly every draw, so caching them by
+  generation did not help); the system constants are built into a kept buffer; dropping the fast texture
+  lookups a resolve covers compares 16 entries at a time without branches. The slow texture path went from 12.5%
+  to 8.6% of the thread's busy time, the whole texture lookup from 17% to 11%, and the scan at resolves
+  (`InvalidateRange`, 4.4%) left the profile.
+
+A-B-A with the shadow atlas composition off in the middle (150 s pauses): 62.7, 62.5, 63.1 FPS; the command
+thread 11.1 against 11.7 ms. The clears in the next pass measured the same as without (59.7 against 59.9 FPS):
+the GPU is the limit, and the clears were small.
+
+Where the scene's passes break, from the trace and a debug frame: the 1280x1024 scene target (RGBA16F and
+D32S8) is opened about 11 times a frame. Resolves need it closed (they are compute work reading it), and so do
+the surfaces made from resolves and texture loads a draw needs while the pass is open (compute and blit work
+cannot run inside a render pass), which split the post-processing passes. The remaining GPU work, by size:
+render passes (16 ms of fragment and 5.7 of vertex work a frame on this run), resolves 2.9, composed surfaces
+about 2.4 (rows loaded from memory 1.1: during the scene's top tile the game reads the whole 1280x720 surface,
+whose other rows hold an earlier depth resolve's bits, which only a load from memory reproduces), texture loads
+0.7, EDRAM transfers 0.6.
+
 The Metal HUD, if `MetalForceHudEnabled` is set for the whole system, is loaded into the game whatever
 `MTL_HUD_ENABLED` says and costs the command processor 4 to 5%.
 
