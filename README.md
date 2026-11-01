@@ -56,6 +56,29 @@ bash scripts/play_mac.sh --mcla_gpu_backend=metal     # the native Metal backend
 
 Every step, building by hand, and debugging: [docs/macos.md](docs/macos.md).
 
+### Keyboard
+
+A controller (Xbox, DualSense) works as it is. For the keyboard, add `--mnk_mode=true`. The keys are the SDK's
+default controller layout for now: a driving layout (W for gas) and a controls setup in a settings app are planned
+([BACKLOG](docs/BACKLOG.md) 29). Each key can be changed with a `--keybind_<button>=<keys>` option, for example
+`--keybind_right_trigger=W`.
+
+| Xbox 360 | Keys | In the game |
+|---|---|---|
+| Right trigger | E, O | Gas |
+| Left trigger | Q, I | Brake, reverse |
+| Left stick | W A S D | Steer (A, D) |
+| Right stick | Arrow keys | Camera |
+| A | Space, ; | Confirm (menus) |
+| B | Backspace, ' | Back (menus) |
+| X | L | |
+| Y | P | |
+| Left, right shoulder | 1, 3 | |
+| Left, right stick press | F, K | |
+| D-pad | Shift + arrow keys | |
+| Start | Return, X | Pause |
+| Back | Tab, Z | |
+
 ## Metal backend options
 
 The Metal backend's speed-ups are on by default, and each has an off switch for testing:
