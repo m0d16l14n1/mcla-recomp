@@ -1,6 +1,8 @@
 #!/bin/sh
-# Makes MCLA.app from the macOS build (scripts/make_mac.sh first): a double-click starts the game on the native
-# Metal backend with the settings below, full screen, with its log in ~/Library/Logs/MCLA/mcla.log.
+# Makes MCLA.app from the macOS build (scripts/make_mac.sh first). A double-click opens the launcher
+# (launcher/mac: the game's files, saves, and the settings that need a restart), and its Play starts the game on
+# the native Metal backend, with its log in ~/Library/Logs/MCLA/mcla.log. MCLA_NO_LAUNCHER=1 makes the old app,
+# where a double-click starts the game at once.
 #
 #   sh scripts/make_app.sh [where]     # default: out/MCLA.app (drag it to the Dock or /Applications)
 #
@@ -17,7 +19,8 @@ sdk_lib="$root/third_party/rexglue-sdk/out/install/mac-arm64/lib"
 game="$root/game"
 
 [ -x "$build/mcla" ] || { echo "error: $build/mcla not found; build it first (bash scripts/make_mac.sh)" >&2; exit 1; }
-[ -f "$game/default.xex" ] || { echo "error: no game in $game (scripts/make_mac.sh extracts it)" >&2; exit 1; }
+# Without a game here, the launcher's Game Files page takes it from a disc image.
+[ -f "$game/default.xex" ] || { echo "note: no game in $game; choose it in the launcher (Game Files)" >&2; game=""; }
 
 macos="$app/Contents/MacOS"
 mkdir -p "$macos" "$app/Contents/Resources"
@@ -28,6 +31,14 @@ for lib in "$sdk_lib"/librexgpu-*.dylib; do
   [ -e "$lib" ] && cp -fL "$lib" "$macos/"
 done
 
+# The launcher is the app's program; the game (mcla) sits beside it and reads mcla.toml from this folder.
+main=mcla
+if [ -z "$MCLA_NO_LAUNCHER" ] && command -v xcrun >/dev/null; then
+  sh "$root/launcher/mac/build.sh" "$macos/MCLA Launcher"
+  cp -f "$root/scripts/ci/game-files.json" "$app/Contents/Resources/game-files.json"
+  main="MCLA Launcher"
+fi
+
 version=$(git -C "$root" describe --always --dirty 2>/dev/null || echo dev)
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -37,7 +48,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>MCLA</string>
   <key>CFBundleDisplayName</key><string>Midnight Club: LA (recomp)</string>
   <key>CFBundleIdentifier</key><string>local.mcla-recomp</string>
-  <key>CFBundleExecutable</key><string>mcla</string>
+  <key>CFBundleExecutable</key><string>$main</string>
   <key>CFBundleIconFile</key><string>MCLA</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
@@ -74,9 +85,11 @@ fi
 logs="$HOME/Library/Logs/MCLA"
 mkdir -p "$logs"
 if [ ! -f "$macos/mcla.toml" ]; then
+  game_line=""
+  if [ -n "$game" ]; then game_line="game_data_root = \"$game\""; fi
   cat > "$macos/mcla.toml" <<EOF
-# MCLA.app's settings (scripts/make_app.sh wrote them once; edit freely, the game's settings menu saves here too).
-game_data_root = "$game"
+# MCLA.app's settings (scripts/make_app.sh wrote them once; the launcher and the game's settings menu save here too).
+$game_line
 log_file = "$logs/mcla.log"
 log_level = "info"
 # Native Metal, MetalFX upscaling from 640x360 (about 90 FPS on an M5), held to an even 60 FPS.

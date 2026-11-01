@@ -2201,3 +2201,14 @@ belong to the launcher (`launcher/mac`) or `mcla.toml`; `settings_overlay_live_o
 game sets it on macOS to what a Mac doesn't have (`GPU/D3D12`, `low_latency`, `frame_generation`). The categories
 tree is built from the settings shown, so empty ones go too; the bottom bar says where the others are.
 
+
+## rexglue-upstream-posix-fixes.patch (macOS)
+
+Five open pull requests of rexglue/rexglue-sdk, taken as they are (2026-11-01), that the macOS build runs into:
+#531 (POSIX events lost wakeups: `SignalAndWait` wasn't atomic, an auto-reset `Signal` woke every waiter, a
+manual-reset set-then-reset didn't release the threads waiting at that moment; hangs found on macOS), #538 (a guest
+timer re-armed with a due time near 1601 overflowed `steady_clock` and never fired; found on an M4), #497 (a 10 ms
+sleep in `XMPGetPlaybackController`), #479 (symlinked folders in the game's folder were listed as files) and #496
+(the XAM enumerator was released wrongly, `NO_MORE_FILES` left the item count unwritten, the task thread handle
+leaked). Drop each part when its pull request is merged and the SDK is updated. The review of the other open pull
+requests is in `docs/BACKLOG.md` (#31).

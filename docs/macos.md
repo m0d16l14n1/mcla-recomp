@@ -72,6 +72,31 @@ speakers instead of about 64. If the sound crackles, `--audio_maxqframes=8` is t
 FSR 3.1 is not built on macOS (FidelityFX's Vulkan library is not made for MoltenVK); the game offers MSAA and off.
 NVIDIA Reflex, AMD Anti-Lag, D3D12 and the Windows launcher do not apply.
 
+## The app and its launcher
+
+`sh scripts/make_app.sh` makes `out/MCLA.app`: the launcher (`launcher/mac`, built by `launcher/mac/build.sh`) is
+the app's program, and the game, its runtime and the GPU plugins are copies beside it in `Contents/MacOS`, with
+`mcla.toml`. `MCLA_NO_LAUNCHER=1 sh scripts/make_app.sh` makes the old app, which starts the game at once. The
+launcher starts `Contents/MacOS/mcla` with that folder as its working folder and the options typed in Advanced
+(for a test run windowed, `--fullscreen=false`); it hides while the game runs and comes back when it ends, with the
+end of the log if the game crashed.
+
+Things worth knowing:
+
+- **macOS privacy prompts.** The app (the launcher, and the game it starts) is one app to macOS. A game folder in
+  `~/Documents`, `~/Desktop` or `~/Downloads` brings up "MCLA would like to access files in your Documents folder"
+  once; until it is answered the game waits at start with no window. A game taken from a disc image by the
+  launcher goes to `~/Library/Application Support/MCLA/Game`, which needs no permission. After the app's program
+  changed (the launcher arrived) macOS asks again even if it was allowed before.
+- **Screens.** `--monitor=N` (the launcher's Display page) counts screens from 1 in the order macOS lists them, the
+  one with the menu bar first; 0 is the main screen. The launcher lists them with their pixels, refresh rate and
+  EDR headroom, and suggests settings from the chip (*For this Mac*: measured on an M5, estimated for Pro, Max and
+  Ultra chips from their GPU cores). Only one screen (the built-in one) has been tried so far.
+- **Saves.** The library (`~/Library/Application Support/MCLA/Saves/<name>/545407F8` with `slot.json`) holds whole
+  copies of the game's `545407F8` folder from `<user data>/B13EBABEBABEBABE/` (the SDK's one profile). Loading puts
+  a copy in the game's place after keeping the save that was there (unless an equal copy is in the library).
+  Nothing is changed while the game runs.
+
 ## Running and debugging
 
 ```bash

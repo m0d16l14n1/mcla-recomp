@@ -43,18 +43,32 @@ cd mcla-recomp
 bash scripts/make_mac.sh --iso /path/to/your.iso
 bash scripts/play_mac.sh                              # Vulkan on MoltenVK
 bash scripts/play_mac.sh --mcla_gpu_backend=metal     # the native Metal backend
-sh scripts/make_app.sh                                # out/MCLA.app: double-click to play
+sh scripts/make_app.sh                                # out/MCLA.app: the launcher, then Play
 ```
 
 `make_mac.sh` checks the tools and offers to install what is missing, applies the fork's patches to the ReXGlue SDK and builds it, then extracts and recompiles your game and builds it. `play_mac.sh` starts the game with a log (`run.log` in the build folder). Any option after it goes to the game, for example `--fullscreen=false` for a window or `--mcla_fps=0` for no frame-rate cap. It also has switches for lldb (`MCLA_LLDB=1`), MoltenVK's debug output (`MCLA_MVK_DEBUG=1`) and Apple's Metal HUD (`MCLA_METAL_HUD=1`).
 
-`make_app.sh` makes `out/MCLA.app` from the build (drag it to the Dock or to Applications): it starts full screen on Metal with MetalFX upscaling (Performance) held to 60 FPS and the keyboard on, and logs to `~/Library/Logs/MCLA/mcla.log`. Its settings are `MCLA.app/Contents/MacOS/mcla.toml` (one `name = value` a line, the same names as the options; the game's settings menu saves there too), which a new run of the script keeps. Run it again after a build to update the app. The game stays in `game/` in this folder; saves are in `~/.local/share/mcla`, the same for the app and `play_mac.sh`.
+`make_app.sh` makes `out/MCLA.app` from the build (drag it to the Dock or to Applications). A double-click opens the launcher; its **Play** starts the game (full screen on Metal, MetalFX Performance, 60 FPS, the keyboard on, by default) and logs to `~/Library/Logs/MCLA/mcla.log`. Run the script again after a build to update the app; it keeps the settings.
+
+### The launcher
+
+The launcher (`launcher/mac`, SwiftUI) holds what needs the game to start again; what changes during play is in the game itself (the pause menu, and the F4 overlay, which on a Mac list only those).
+
+- **Game Files**: take the game from your Xbox 360 disc image (it is copied, unmodified, to `~/Library/Application Support/MCLA/Game`) or use a folder that has it. Either way it is checked against the supported release: names and sizes at once, and every file's SHA-256 with *Verify Contents*.
+- **Saves**: the game's career save, and a library of copies of it (`~/Library/Application Support/MCLA/Saves`): back up, load (the save it replaces is kept first), play with a copy, rename, export to a `.zip` and import one (for another Mac), start a new game, move a copy to the Trash.
+- **Graphics**, **Display & HDR**, **Game**, **Controls**: the graphics API, anti-aliasing and MetalFX upscaling, the frame-rate cap, effects and detail; which screen the game opens on (every connected screen is listed with its resolution, refresh rate and HDR), full screen or a window and its size; HDR and its levels; the player's name, language and intro; controller options, the keyboard and every key (press a key to bind it). Settings marked *also in game* can be changed during play too. *For this Mac* suggests settings from the chip.
+- **Advanced**: the files and folders, the log's detail, options to add to the game's command line, what the launcher does when the game starts, and a reset.
+
+Its settings are `MCLA.app/Contents/MacOS/mcla.toml` (one `name = value` a line, the same names as the options), which the game's own settings menu saves into too; the launcher changes only the lines it sets and keeps the rest. Saves live in `~/.local/share/mcla`, the same for the app and `play_mac.sh`. If the game is in `~/Documents`, `~/Desktop` or `~/Downloads`, macOS asks once whether MCLA may read that folder: allow it.
+
+The launcher owes its idea to the Mac launchers for other racing games before it, the Need for Speed: Underground 2 launcher for macOS and Speedbreaker (Most Wanted, Carbon); it is written from scratch for this game.
 
 | | |
 |---|---|
 | Macs | Apple Silicon (M1 and later), arm64 only. Intel Macs are not a target. |
 | Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR settings are MetalFX: `--mcla_anti_aliasing=fsr` temporal anti-aliasing, with `--mcla_upscaling=quality`, `balanced` or `performance` upscaling to the window's 720p. HDR on Metal: on displays that can show EDR (MacBook built-in displays, XDR, HDR monitors) the picture is HDR10 with the Windows builds' HDR scene and highlights, the HUD at SDR white (`--hdr=auto`, the default; `off` or `on`; `--hdr_peak_nits`, `--mcla_hdr_highlights`). |
 | Input, audio | SDL3: Xbox and DualSense controllers, keyboard. |
+| Resolution | On Metal the game draws at the console's 1280×720 (MetalFX upscales to it from as little as 640×360) and the picture is scaled to the screen: Retina, external 4K or any other, full screen or in a window, on the screen you pick (`--monitor=N`). A higher internal resolution (`resolution_scale`) is Vulkan-only for now. |
 | Not on macOS | Direct3D 12, FSR 3.1 and frame generation, NVIDIA Reflex, AMD Anti-Lag 2, the Windows launcher and installer. |
 
 Every step, building by hand, and debugging: [docs/macos.md](docs/macos.md).
