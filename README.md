@@ -48,7 +48,7 @@ sh scripts/make_app.sh                                # out/MCLA.app: double-cli
 
 `make_mac.sh` checks the tools and offers to install what is missing, applies the fork's patches to the ReXGlue SDK and builds it, then extracts and recompiles your game and builds it. `play_mac.sh` starts the game with a log (`run.log` in the build folder). Any option after it goes to the game, for example `--fullscreen=false` for a window or `--mcla_fps=0` for no frame-rate cap. It also has switches for lldb (`MCLA_LLDB=1`), MoltenVK's debug output (`MCLA_MVK_DEBUG=1`) and Apple's Metal HUD (`MCLA_METAL_HUD=1`).
 
-`make_app.sh` makes `out/MCLA.app` from the build (drag it to the Dock or to Applications): it starts full screen on Metal with MetalFX upscaling (Performance) held to 60 FPS and the keyboard on, and logs to `~/Library/Logs/MCLA/mcla.log`. Its settings are `MCLA.app/Contents/MacOS/mcla.toml` (one `name = value` a line, the same names as the options; the game's settings menu saves there too), which a new run of the script keeps. Run it again after a build to update the app. The game stays in `game/` in this folder.
+`make_app.sh` makes `out/MCLA.app` from the build (drag it to the Dock or to Applications): it starts full screen on Metal with MetalFX upscaling (Performance) held to 60 FPS and the keyboard on, and logs to `~/Library/Logs/MCLA/mcla.log`. Its settings are `MCLA.app/Contents/MacOS/mcla.toml` (one `name = value` a line, the same names as the options; the game's settings menu saves there too), which a new run of the script keeps. Run it again after a build to update the app. The game stays in `game/` in this folder; saves are in `~/.local/share/mcla`, the same for the app and `play_mac.sh`.
 
 | | |
 |---|---|

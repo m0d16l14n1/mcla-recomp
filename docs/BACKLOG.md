@@ -32,7 +32,7 @@ Game: Midnight Club: Los Angeles Complete Edition, Xbox 360 disc image, title `5
 | 10 | Audio (XMA through FFmpeg, SDL3 output) | needs play test | plays (heard 2026-10-31) but lagged. Causes found with `--audio_stats=true`: the fork's audio thread priorities were Windows-only (threads at default QoS: mixer wake-ups up to 2.8 ms, worker up to 13.9 ms), and CoreAudio's 1,024-sample device buffer (21 ms) sat on the 8-frame queue (43 ms), about 64 ms behind the picture. Fixed in `patches/rexglue-macos-audio-threads.patch` + macOS defaults in `src/mcla_app.cpp` (QoS user-interactive, 256-sample device buffer, 4-frame queue): about 27 ms, mixer wake-ups ≤ 47 µs, no underruns in free roam. **Listen for lag and crackle**; if it crackles, `--audio_maxqframes=6` or `8` |
 | 11 | Controller (SDL3: Xbox, DualSense) and keyboard | todo | |
 | 12 | Frame pacing: CAMetalLayer present modes through MoltenVK, 30/60/120 FPS caps, ProMotion | todo | |
-| 13 | Saves and settings location | todo | next to the executable today; `~/Library/Application Support/MCLA` for an app bundle |
+| 13 | Saves and settings location | done | 2026-11-01: saves, achievements and the shader cache are already outside the program, in `~/.local/share/mcla` (the SDK's user folder on macOS: `$XDG_DATA_HOME`, else `~/.local/share`), shared by `play_mac.sh` and `MCLA.app`. Settings are `mcla.toml` beside the program (`MCLA.app/Contents/MacOS/` for the app; `make_app.sh` keeps it). Moving to `~/Library/Application Support` would need the saves moved too, for nothing gained; `--user_data_root=<folder>` picks another place |
 | 15 | Settings that do not apply on a Mac hidden in the pause menu | todo | D3D12, Reflex, Anti-Lag 2, FSR |
 
 ## Phase 3: native Metal (shared with other ReXGlue titles)
