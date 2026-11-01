@@ -53,7 +53,7 @@ sh scripts/make_app.sh                                # out/MCLA.app: double-cli
 | | |
 |---|---|
 | Macs | Apple Silicon (M1 and later), arm64 only. Intel Macs are not a target. |
-| Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR settings are MetalFX: `--mcla_anti_aliasing=fsr` temporal anti-aliasing, with `--mcla_upscaling=quality`, `balanced` or `performance` upscaling to the window's 720p. Planned: EDR (HDR). |
+| Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR settings are MetalFX: `--mcla_anti_aliasing=fsr` temporal anti-aliasing, with `--mcla_upscaling=quality`, `balanced` or `performance` upscaling to the window's 720p. HDR on Metal: on displays that can show EDR (MacBook built-in displays, XDR, HDR monitors) the picture is HDR10 with the Windows builds' HDR scene and highlights, the HUD at SDR white (`--hdr=auto`, the default; `off` or `on`; `--hdr_peak_nits`, `--mcla_hdr_highlights`). |
 | Input, audio | SDL3: Xbox and DualSense controllers, keyboard. |
 | Not on macOS | Direct3D 12, FSR 3.1 and frame generation, NVIDIA Reflex, AMD Anti-Lag 2, the Windows launcher and installer. |
 
@@ -124,7 +124,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 ## Known issues
 
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
-- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing) and EDR.
+- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing).
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 
 ## More documentation

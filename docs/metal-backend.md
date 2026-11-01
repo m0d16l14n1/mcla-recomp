@@ -28,9 +28,9 @@ from boot to free roam and drives. A warm or busy Mac loses up to a third of the
 Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a frame, 3.4 of it waiting for the GPU.
 The rows above are before the tenth pass (the 4x reflections at one sample a pixel, now the default), which adds
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
-sampled in free roam, drives or races so far), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
+sampled in free roam, drives or races so far) and frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to thirteenth, record how it got here.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to fourteenth, record how it got here. HDR output (EDR) came with the fourteenth.
 
 ## Why
 
@@ -94,7 +94,7 @@ positions, the EDRAM layout in MSL). Code taken from it keeps its BSD notice and
 | M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | done 2026-11-01 (the first picture, then 28 to 30 FPS in free roam) |
 | M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | mostly done: EDRAM transfers between formats and depth and color, MSAA as supersampling (real MSAA as an option), float24 depth (D24FS8), the gamma ramp, the spawn point matching MoltenVK. To do: EDRAM transfers of 64bpp formats, 3D textures |
 | M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | mostly done: nine speed passes (below), MetalFX temporal AA and upscaling; binary archives deferred. To do: `CAMetalDisplayLink` pacing |
-| M4 | The rest: the immediate drawer (ImGui overlays), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | captures and the immediate drawer done; EDR to do |
+| M4 | The rest: the immediate drawer (ImGui overlays), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | done (EDR in the fourteenth pass) |
 
 ### M1 to M3, as it went (2026-10-31 and 2026-11-01)
 
@@ -509,6 +509,38 @@ own textures are tiled and keep their watches, and the few linear ones (the movi
 textures) cost about 8 MB of hashing a frame in free roam and 3 MB during a movie. The intro now plays, and
 the in-engine cutscene after it (the characters at Carney's) draws as it should; free roam at MetalFX
 Performance is unchanged (93.4 FPS).
+
+**HDR output with EDR, fourteenth pass (2026-11-01).** The Windows builds' HDR (launcher/dev/hdr-2026-10-16.md:
+the game's HUD and menus separated into a layer, the scene rebuilt in HDR from the tone map draw's inputs, HDR10
+output) is mostly in the SDK's shared `CommandProcessor`; Metal now gives it what a backend has to:
+
+- *The UI layer's target operations* (`MetalDraw::HdrCopyFromTarget`, `HdrClearTarget`, `HdrRestoreTarget`, on the
+  8_8_8_8 target of `HdrColorTargetKey`, 1x or 4x as 1x): each ends the open pass, draws that target's waiting
+  clears and takes over its EDRAM tiles first, then blits, clears or draws the put-back (target + underlay x (1 -
+  target alpha), by the blend). Draw calls the command processor's `HdrRenderTargetsReady` once its targets are
+  known, before its pass.
+- *The scene pass* after the tone map draw: the SDK's `hdr_scene_mcla.cs`, and at the swap its refresher
+  `hdr_refresh.cs`, are the Vulkan backend's SPIR-V turned into MSL by the same SPIRV-Cross (`MetalSpirvComputeToMsl`,
+  descriptor sets mapped to texture slots, the gamma ramp as a texture buffer), so the HDR math is the Windows
+  builds' exactly. The scene pass reads the tone map draw's own textures.
+- *The presenter*: with HDR output on, the `CAMetalLayer` is BGR10A2 in the ITU-R 2100 PQ colour space with
+  `wantsExtendedDynamicRangeContent`, and HDR10 metadata (`CAEDRMetadata`) whose optical output scale is paper
+  white: the game's white lands on the display's SDR white and macOS maps the highlights into whatever EDR headroom
+  the display has at its brightness. The guest output is RGB10A2 (PQ code values from the refresher, or SDR ones,
+  which the paint places at the SDR level). The ImGui overlays are blended in light over the PQ picture in the
+  fragment shader (reading the attachment, which Apple GPUs keep in tile memory).
+- *macOS has no HDR switch*: `hdr = auto` (now the game's default on macOS too) turns HDR output on when the
+  display can show EDR at all (`NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue` above 1:
+  the MacBook Air M5's panel reports 2.0, XDR panels and HDR monitors more); `metal_hdr_auto_edr=false` keeps auto
+  SDR. The display's nits aren't reported, so the peak and paper white are the SDK's defaults (1,000 and 200 nits)
+  unless set; with the metadata only their ratio matters.
+
+Checked in free roam, MSAA 2x and MetalFX Performance: the log says the frames are put together from the UI layer
+and the scene is in HDR, with no fallback; the F4 overlay draws over the HDR picture; `set hdr off` and `set hdr on`
+during play switch the layer in place, and the captures (HDR10 turned back into SDR at paper white) match the SDR
+frame (mean RGB 38.5, 30.2, 24.6 against 38.3, 30.6, 25.5). It costs about 4% at MetalFX Performance (89.3 FPS
+against 93.4). `--metal_present_capture` and `shot` captures convert HDR10 back to SDR, so highlights are clipped in
+them.
 
 **Frame pacing:** `CAMetalDisplayLink` is put off. The Mac here has a 60 Hz panel, the presenter's layer has
 display sync on, and the game already holds each frame to its target at the swap with a precise clock

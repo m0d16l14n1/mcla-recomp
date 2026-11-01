@@ -1056,7 +1056,8 @@ void MclaApp::ApplyPcDefaults() {
   //   never below what the game asks for (it asks 16x for the road in a race),
   //   at no measurable cost on an RTX 5080 and 1.5% on an integrated Radeon
   //   (launcher/dev/aniso-2026-10-27.md);
-  // - on Windows, HDR output whenever the display is in HDR mode (the SDK's
+  // - on Windows, HDR output whenever the display is in HDR mode, and on macOS
+  //   (the Metal backend) whenever the display can show EDR (the SDK's
   //   own default stays off, for other titles). Not on Linux, where the
   //   display's HDR state isn't read yet, so auto would never turn it on
   //   (on would), nor on the PS5, whose host doesn't apply these.
@@ -1083,6 +1084,9 @@ void MclaApp::ApplyPcDefaults() {
       {"hdr", "auto"},
 #endif
 #if REX_PLATFORM_MAC
+      // HDR output where the display can show EDR (the Metal backend; on MoltenVK the display's state isn't
+      // read, so auto stays SDR there).
+      {"hdr", "auto"},
       {"audio_thread_priority", "2"},
       {"audio_mixer_priority", "2"},
       {"audio_device_sample_frames", "256"},

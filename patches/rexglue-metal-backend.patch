@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,567 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -167,6 +167,7 @@ new file mode 100644
 +#include <rex/logging.h>
 +
 +REXCVAR_DECLARE(bool, gpu_regwrite_bulk);
++REXCVAR_DECLARE(bool, metal_gamma_ramp);
 +REXCVAR_DEFINE_INT32(metal_cp_qos, 4, "GPU/Metal",
 +    "The command processor thread's QoS (0 unchanged, 1 background, 2 utility, 3 user initiated, 4 user interactive). "
 +    "It paces the frame: at the default QoS it shares the performance cores with everything else and moves to "
@@ -236,6 +237,8 @@ new file mode 100644
 +  draw_ = std::make_unique<MetalDraw>(device_, command_queue_, shared_memory_buffer_, *memory_,
 +      *register_file_, *shader_compiler_, graphics_system_->edram_tile_count());
 +  if (!draw_->Initialize()) return false;
++  // HDR output: the UI layer's underlay copy and clear, once a draw's render targets are known.
++  draw_->hdr_targets_ready_ = [this] { HdrRenderTargetsReady(); };
 +  // The scene's draws jittered for temporal AA (Vulkan's convention: the SPIR-V NDC is +y down, and the Metal
 +  // system constants flip it with the rest).
 +  // With upscaling, the scene's draws then squeezed into the render-size corner (the jitter decides that at the
@@ -404,7 +407,45 @@ new file mode 100644
 +    taa_frame_.status = draw_->TaaRun(inputs);
 +    if (taa_frame_.status == '+') taa_frame_.done = true;
 +  }
-+  return draw_ ? draw_->Draw(active_vertex_shader(), active_pixel_shader()) : false;
++  if (!draw_) return false;
++  if (!draw_->Draw(active_vertex_shader(), active_pixel_shader())) return false;
++  // HDR scene: after the tone map draw, from its textures.
++  if (hdr_scene_pending_) {
++    hdr_scene_pending_ = false;
++    if (draw_->HdrRenderScene(&hdr_scene_constants_, sizeof(hdr_scene_constants_), hdr_output_width_,
++                              hdr_output_height_)) {
++      HdrSceneRendered();
++    }
++  }
++  return true;
++}
++
++// HDR output's backend operations (CommandProcessor's shared UI layer and scene logic), on MetalDraw's textures.
++bool MetalCommandProcessor::HdrCopyFromColorTarget(uint32_t key, HdrTexture dest, const HdrRect& source,
++                                                   uint32_t dest_x, uint32_t dest_y) {
++  if (!draw_ || !draw_->HdrEnsureTextures(hdr_output_width_, hdr_output_height_)) return false;
++  const uint32_t rect[4] = {source.x, source.y, source.width, source.height};
++  return draw_->HdrCopyFromTarget(key, uint32_t(dest), rect, dest_x, dest_y);
++}
++bool MetalCommandProcessor::HdrClearColorTarget(uint32_t key, const HdrRect& rect) {
++  const uint32_t r[4] = {rect.x, rect.y, rect.width, rect.height};
++  return draw_ && draw_->HdrClearTarget(key, r);
++}
++bool MetalCommandProcessor::HdrRestoreColorTarget(uint32_t key, const HdrRect& rect) {
++  const uint32_t r[4] = {rect.x, rect.y, rect.width, rect.height};
++  return draw_ && draw_->HdrRestoreTarget(key, r);
++}
++bool MetalCommandProcessor::HdrCopyTexture(HdrTexture source, HdrTexture dest, const HdrRect& source_rect,
++                                           uint32_t dest_x, uint32_t dest_y) {
++  const uint32_t r[4] = {source_rect.x, source_rect.y, source_rect.width, source_rect.height};
++  return draw_ && draw_->HdrCopyTexture(uint32_t(source), uint32_t(dest), r, dest_x, dest_y);
++}
++bool MetalCommandProcessor::HdrClearTexture(HdrTexture texture) {
++  return draw_ && draw_->HdrEnsureTextures(hdr_output_width_, hdr_output_height_) &&
++         draw_->HdrClearTexture(uint32_t(texture));
++}
++void MetalCommandProcessor::HdrReleaseTextures() {
++  if (draw_) draw_->HdrReleaseTextures();
 +}
 +
 +void MetalCommandProcessor::RequestDrawShaders() {
@@ -498,6 +539,9 @@ new file mode 100644
 +      frontbuffer_height = 720;
 +    }
 +    const uint64_t swap = swaps_;
++    // HDR output's textures and composite are at the guest output's size (the draws are at 1x).
++    hdr_output_width_ = frontbuffer_width;
++    hdr_output_height_ = frontbuffer_height;
 +    // The ramp as the guest has it now, for this swap (the callback may run after more register writes).
 +    auto gamma = std::make_shared<MetalDraw::GammaRamp>();
 +    static_assert(sizeof(reg::DC_LUT_30_COLOR) == 4 && sizeof(reg::DC_LUT_PWL_DATA) == 4);
@@ -508,7 +552,36 @@ new file mode 100644
 +        [this, frontbuffer_ptr, swap, gamma](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
 +          auto& metal_context = static_cast<MetalGuestOutputRefreshContext&>(context);
 +          @autoreleasepool {
-+            if (draw_ && draw_->Present(frontbuffer_ptr, metal_context.texture(), gamma.get())) return true;
++            // HDR output: the SDK's refresher (HDR10 code values) while the presenter's layer is HDR10.
++            const ui::Presenter::HdrOutputState hdr_state = ui::Presenter::GetHdrOutputState();
++            ui::Presenter::SetGuestOutputHdrAvailable(true);
++            const bool use_hdr = hdr_state.active && REXCVAR_GET(metal_gamma_ramp) &&
++                                 metal_context.texture().pixelFormat == MTLPixelFormatRGB10A2Unorm;
++            MetalDraw::HdrRefresh refresh{};
++            if (use_hdr) {
++              const uint32_t width = uint32_t(metal_context.texture().width);
++              const uint32_t height = uint32_t(metal_context.texture().height);
++              HdrComposite composite = HdrGetComposite(width, height);
++              refresh.layer = composite == HdrComposite::kMask || composite == HdrComposite::kLayer;
++              if (refresh.layer && !draw_->HdrEnsureTextures(width, height)) {
++                composite = HdrComposite::kWholeFrame;
++                refresh.layer = false;
++              }
++              refresh.scene = hdr_frame_.scene && composite != HdrComposite::kWholeFrame;
++              refresh.constants[0] = width;
++              refresh.constants[1] = height;
++              HdrRefreshFlags(composite, hdr_state.debug_ui, &refresh.constants[2]);
++              refresh.constants[2] |= uint32_t(hdr_state.sdr_pure_gamma_2_2) | (uint32_t(hdr_state.test_pattern) << 1);
++              const float levels[4] = {hdr_state.sdr_white_nits, hdr_state.paper_white_nits,
++                                       hdr_state.rolloff_start_nits, hdr_state.peak_nits};
++              std::memcpy(&refresh.constants[4], levels, sizeof(levels));
++            }
++            bool wrote_pq = false;
++            if (draw_ && draw_->Present(frontbuffer_ptr, metal_context.texture(), gamma.get(),
++                                        use_hdr ? &refresh : nullptr, &wrote_pq)) {
++              if (wrote_pq) context.SetHdr({true, hdr_state.sdr_white_nits, hdr_state.sdr_pure_gamma_2_2});
++              return true;
++            }
 +            // The placeholder: a slow pulse, so that a moving picture shows that the swaps arrive.
 +            const double phase = double(swap % 120) / 120.0;
 +            const double level = 0.10 + 0.08 * (phase < 0.5 ? phase : 1.0 - phase) * 2.0;
@@ -629,7 +702,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,374 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -696,11 +769,51 @@ new file mode 100644
 +  // 256-entry table (DC_LUT_30_COLOR) for 8-bit front buffers, the piecewise-linear one (DC_LUT_PWL_DATA,
 +  // 128 x RGB) for 10-bit ones.
 +  struct GammaRamp { uint32_t table[256]; uint32_t pwl[128 * 3]; };
-+  bool Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma);
++  // HDR output (the SDK's rexglue-hdr-*.patch logic, shared in CommandProcessor): with hdr given and a 256-entry
++  // ramp, the SDK's HDR refresher (hdr_refresh.cs, its Vulkan SPIR-V through SPIRV-Cross) writes HDR10 code values
++  // (PQ, BT.2020) into the destination (RGB10A2) instead; false when it can't (the caller then paints SDR).
++  struct HdrRefresh {
++    uint32_t constants[8];  // CommandProcessor's HdrRefreshConstants: size, flags, levels
++    bool layer, scene;      // the UI layer and underlay, the HDR scene and tone map output, are this frame's
++  };
++  // wrote_pq (if given): whether HDR10 code values were written.
++  bool Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma, const HdrRefresh* hdr = nullptr,
++               bool* wrote_pq = nullptr);
++  // HDR output's textures, at the output's size, in CommandProcessor::HdrTexture order: the underlay (screen
++  // space), the underlay in render target space, the UI layer, the HDR scene (RGBA16Float), the tone map's output.
++  static constexpr uint32_t kHdrTextureCount = 5;
++  bool HdrEnsureTextures(uint32_t width, uint32_t height);
++  void HdrReleaseTextures();
++  // The 8_8_8_8 render target of CommandProcessor::HdrColorTargetKey (rect in its pixels): copied into an HDR
++  // texture, cleared to 0, or put back (target + underlay in render target space x (1 - target alpha)).
++  bool HdrCopyFromTarget(uint32_t key, uint32_t dest, const uint32_t rect[4], uint32_t dest_x, uint32_t dest_y);
++  bool HdrClearTarget(uint32_t key, const uint32_t rect[4]);
++  bool HdrRestoreTarget(uint32_t key, const uint32_t rect[4]);
++  bool HdrCopyTexture(uint32_t source, uint32_t dest, const uint32_t rect[4], uint32_t dest_x, uint32_t dest_y);
++  bool HdrClearTexture(uint32_t texture);
++  // The HDR scene pass (hdr_scene_mcla.cs) after the tone map draw, from that draw's textures (pixel shader fetches
++  // 0 to 2, vertex shader fetch 16) into the scene texture; constants: CommandProcessor::HdrSceneConstants.
++  bool HdrRenderScene(const void* constants, size_t constants_size, uint32_t width, uint32_t height);
++  // Called by Draw once the draw's render targets are known, before its pass (the command processor's
++  // HdrRenderTargetsReady: the UI layer's underlay copy and clear).
++  std::function<void()> hdr_targets_ready_;
 +  uint64_t draws() const { return draws_; }
 +  uint64_t resolves() const { return resolves_; }
 +  uint64_t failures() const { return failures_ + gpu_errors_->load(); }
 + private:
++  id<MTLTexture> HdrTarget(uint32_t key, uint32_t& kind);
++  // Before an HDR copy, clear or restore on a target: the open pass ended, its waiting clears drawn, the EDRAM
++  // tiles of these rows taken over from the targets that wrote them since.
++  void HdrPrepareTarget(id<MTLTexture> target, uint32_t kind, uint32_t y0, uint32_t y1);
++  id<MTLComputePipelineState> HdrComputePipeline(const uint32_t* words, size_t count,
++                                                 const std::vector<std::array<uint32_t, 3>>& slots, const char* name);
++  std::array<id<MTLTexture>, kHdrTextureCount> hdr_textures_{};
++  id<MTLComputePipelineState> hdr_refresh_ = nil, hdr_scene_ = nil;
++  id<MTLRenderPipelineState> hdr_restore_ = nil;
++  bool hdr_pipelines_failed_ = false;
++  // The last draw's translations, for the scene pass's textures.
++  Shader::Translation* last_vt_ = nullptr;
++  Shader::Translation* last_pt_ = nullptr;
 +  bool DebugFrame() const;
 +  uint64_t capture_frame_ = 0;
 +  bool debug_draw_log_ = false;
@@ -968,7 +1081,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2546 @@
+@@ -0,0 +1,2815 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1051,6 +1164,24 @@ new file mode 100644
 +
 +namespace rex::graphics::metal {
 +namespace {
++// HDR output's compute shaders, the Vulkan backend's SPIR-V (made from the SDK's XeSL), as MSL at first use.
++namespace hdr_spirv {
++#include "../shaders/vulkan_spirv/hdr_refresh_cs.h"
++#include "../shaders/vulkan_spirv/hdr_scene_mcla_cs.h"
++}  // namespace hdr_spirv
++// Puts an 8_8_8_8 target back after the UI layer: target + underlay x (1 - target alpha), by the blend.
++constexpr const char kHdrRestoreSource[] = R"(
++#include <metal_stdlib>
++using namespace metal;
++vertex float4 hdr_restore_vs(uint id [[vertex_id]]) {
++  return float4(float2((id << 1) & 2, id & 2) * 2.0f - 1.0f, 0.0f, 1.0f);
++}
++fragment float4 hdr_restore_ps(float4 position [[position]], texture2d<float> underlay [[texture(0)]]) {
++  uint2 p = uint2(position.xy);
++  if (p.x >= underlay.get_width() || p.y >= underlay.get_height()) discard_fragment();
++  return underlay.read(p);
++}
++)";
 +// PrimitiveProcessor needs the common shared-memory range service. No uploads or write watches
 +// are necessary for the no-copy buffer. Converted indices are invalidated at each draw below.
 +class UnifiedMemory final : public SharedMemory {
@@ -1553,6 +1684,7 @@ new file mode 100644
 +    if (REXCVAR_GET(metal_draw_stop) == 2) return true;
 +    auto vt = vs->GetOrCreateTranslation(vm);
 +    auto pt = ps ? ps->GetOrCreateTranslation(pm) : nullptr;
++    last_vt_ = vt; last_pt_ = pt;
 +    id<MTLLibrary> vl = shaders_.GetLibrary(vt), pl = pt ? shaders_.GetLibrary(pt) : nil;
 +    if (!vl || (ps && !pl)) { ++failures_; return false; }
 +    auto dc = draw_util::GetNormalizedDepthControl(regs_);
@@ -1674,6 +1806,8 @@ new file mode 100644
 +    for (auto t : next) if (t) attachment_height = std::min(attachment_height, uint32_t(t.height));
 +    uint32_t pass_rows = REXCVAR_GET(metal_pass_rows)
 +        ? std::min(attachment_height, std::max(32u, (y1 + 31) & ~31u)) : attachment_height;
++    // HDR output: the UI layer's underlay copy and clear, before the draw that starts it (ends the open pass).
++    if (hdr_targets_ready_) hdr_targets_ready_();
 +    // A draw whose targets the open pass already has (fewer of them is fine) goes into it.
 +    bool reuse = encoder_ && pass_rows <= pass_height_;
 +    if (reuse && next != attachments_) {
@@ -3482,7 +3616,8 @@ new file mode 100644
 +  commands_ = [queue_ commandBuffer];
 +}
 +
-+bool MetalDraw::Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma) {
++bool MetalDraw::Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma, const HdrRefresh* hdr,
++                        bool* wrote_pq) {
 +  // EndFrame has committed the frame; the front buffer's load and the copy follow it on the queue.
 +  Submit(false);
 +  // The swap packet installs the front buffer's texture fetch constant in slot 0; it goes through
@@ -3504,6 +3639,42 @@ new file mode 100644
 +  if (!commands_) commands_ = [queue_ commandBuffer];
 +  auto commands = commands_; commands.label = @"Xenos front buffer";
 +  commands_ = nil;
++  if (hdr && gamma && !pwl && destination.pixelFormat == MTLPixelFormatRGB10A2Unorm) {
++    if (!hdr_refresh_ && !hdr_pipelines_failed_)
++      hdr_refresh_ = HdrComputePipeline(hdr_spirv::hdr_refresh_cs, std::size(hdr_spirv::hdr_refresh_cs),
++          {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3}, {3, 1, 4}, {3, 2, 5}, {3, 3, 6}}, "hdr refresh");
++    // The ramp as the Vulkan backend gives it: a texel buffer of the 256 raw words, A2B10G10R10 (RGB10A2 here).
++    id<MTLBuffer> ramp = hdr_refresh_ ? [device_ newBufferWithBytes:gamma->table length:sizeof(gamma->table)
++                                                            options:MTLResourceStorageModeShared] : nil;
++    auto ramp_desc = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm
++                                                                           width:256
++                                                                 resourceOptions:MTLResourceStorageModeShared
++                                                                           usage:MTLTextureUsageShaderRead];
++    id<MTLTexture> ramp_texture = ramp ? [ramp newTextureWithDescriptor:ramp_desc offset:0 bytesPerRow:1024] : nil;
++    id<MTLTexture> source_2d = source.textureType == MTLTextureType2D ? source
++        : [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2D
++                                         levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++    if (ramp_texture && source_2d) {
++      auto compute = [commands computeCommandEncoder];
++      [compute setComputePipelineState:hdr_refresh_];
++      [compute setBytes:hdr->constants length:sizeof(hdr->constants) atIndex:0];
++      [compute setTexture:ramp_texture atIndex:0];
++      [compute setTexture:source_2d atIndex:1];
++      [compute setTexture:destination atIndex:2];
++      // Unused ones are the source again, as on Vulkan.
++      [compute setTexture:hdr->layer && hdr_textures_[0] ? hdr_textures_[0] : source_2d atIndex:3];
++      [compute setTexture:hdr->layer && hdr_textures_[2] ? hdr_textures_[2] : source_2d atIndex:4];
++      [compute setTexture:hdr->scene && hdr_textures_[3] ? hdr_textures_[3] : source_2d atIndex:5];
++      [compute setTexture:hdr->scene && hdr_textures_[4] ? hdr_textures_[4] : source_2d atIndex:6];
++      [compute dispatchThreadgroups:MTLSizeMake((destination.width + 15) / 16, (destination.height + 7) / 8, 1)
++              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++      [compute endEncoding]; [commands commit];
++      if (wrote_pq) *wrote_pq = true;
++      return true;
++    }
++  }
++  // Otherwise SDR code values, also into an RGB10A2 destination (the presenter then shows them as SDR content).
++  if (wrote_pq) *wrote_pq = false;
 +  auto compute = [commands computeCommandEncoder];
 +  [compute setComputePipelineState:present_];
 +  [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
@@ -3514,12 +3685,223 @@ new file mode 100644
 +  [compute endEncoding]; [commands commit];
 +  return true;
 +}
++
++id<MTLComputePipelineState> MetalDraw::HdrComputePipeline(const uint32_t* words, size_t count,
++    const std::vector<std::array<uint32_t, 3>>& slots, const char* name) {
++  std::vector<MetalSpirvTextureSlot> metal_slots;
++  for (auto& slot : slots) metal_slots.push_back({slot[0], slot[1], slot[2]});
++  std::string error;
++  std::string msl = MetalSpirvComputeToMsl(words, count, metal_slots, error);
++  NSError* ns_error = nil;
++  id<MTLLibrary> library = msl.empty() ? nil
++      : [device_ newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()] options:nil error:&ns_error];
++  id<MTLFunction> function = library ? [library newFunctionWithName:@"main0"] : nil;
++  id<MTLComputePipelineState> pipeline = function ? [device_ newComputePipelineStateWithFunction:function error:&ns_error] : nil;
++  if (!pipeline) {
++    hdr_pipelines_failed_ = true;
++    REXGPU_ERROR("Metal HDR: the {} shader failed: {}", name,
++                 !error.empty() ? error : ns_error ? std::string(ns_error.localizedDescription.UTF8String) : "?");
++  } else {
++    REXGPU_INFO("Metal HDR: the {} shader is ready", name);
++  }
++  return pipeline;
++}
++
++bool MetalDraw::HdrEnsureTextures(uint32_t width, uint32_t height) {
++  if (!width || !height) return false;
++  if (hdr_textures_[0] && hdr_textures_[0].width == width && hdr_textures_[0].height == height) return true;
++  for (uint32_t i = 0; i < kHdrTextureCount; ++i) {
++    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:i == 3 ? MTLPixelFormatRGBA16Float
++                                                                               : MTLPixelFormatRGBA8Unorm
++                                                                   width:width height:height mipmapped:NO];
++    desc.storageMode = MTLStorageModePrivate;
++    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
++    hdr_textures_[i] = [device_ newTextureWithDescriptor:desc];
++    if (!hdr_textures_[i]) { HdrReleaseTextures(); return false; }
++    static const char* const kNames[] = {"underlay", "underlay (target space)", "UI layer", "scene", "tone map output"};
++    hdr_textures_[i].label = [NSString stringWithFormat:@"HDR %s", kNames[i]];
++  }
++  return true;
++}
++
++void MetalDraw::HdrReleaseTextures() { hdr_textures_ = {}; }
++
++id<MTLTexture> MetalDraw::HdrTarget(uint32_t key, uint32_t& kind) {
++  // CommandProcessor::HdrColorTargetKey: base tiles, MSAA, format, pitch (pixels).
++  auto msaa = xenos::MsaaSamples((key >> 12) & 3);
++  auto format = xenos::ColorRenderTargetFormat((key >> 14) & 0xF);
++  uint32_t pitch = key >> 18;
++  if (format != xenos::ColorRenderTargetFormat::k_8_8_8_8 || !pitch) return nil;
++  uint32_t samples; bool multisample;
++  SurfaceSamples(msaa, samples, multisample);
++  // Only targets kept in pixels: 1x, and 4x as 1x (metal_4x_as_1x). A 2x target is kept in samples (1x2).
++  if (multisample || (msaa != xenos::MsaaSamples::k1X && samples == 1)) return nil;
++  std::string target_key;
++  TargetKey(target_key, key & 0xFFF, ColorFormat(format), pitch, false, samples, multisample);
++  auto found = targets_.find(target_key);
++  if (found == targets_.end()) return nil;
++  kind = ColorKind(format);
++  return found->second;
++}
++
++void MetalDraw::HdrPrepareTarget(id<MTLTexture> target, uint32_t kind, uint32_t y0, uint32_t y1) {
++  EndEncoder();
++  FlushClears(target);
++  if (REXCVAR_GET(metal_edram_transfers)) SyncTarget(target, kind, y0, y1);
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++}
++
++bool MetalDraw::HdrCopyFromTarget(uint32_t key, uint32_t dest, const uint32_t rect[4], uint32_t dest_x, uint32_t dest_y) {
++  uint32_t kind;
++  id<MTLTexture> target = HdrTarget(key, kind);
++  if (!target || dest >= kHdrTextureCount || !hdr_textures_[dest]) return false;
++  id<MTLTexture> texture = hdr_textures_[dest];
++  if (texture.pixelFormat != target.pixelFormat) return false;
++  uint32_t x = rect[0], y = rect[1];
++  if (x >= target.width || y >= target.height || dest_x >= texture.width || dest_y >= texture.height) return false;
++  uint32_t width = std::min({rect[2], uint32_t(target.width) - x, uint32_t(texture.width) - dest_x});
++  uint32_t height = std::min({rect[3], uint32_t(target.height) - y, uint32_t(texture.height) - dest_y});
++  if (!width || !height) return true;
++  HdrPrepareTarget(target, kind, y, y + height);
++  auto blit = [commands_ blitCommandEncoder];
++  [blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(x, y, 0)
++             sourceSize:MTLSizeMake(width, height, 1) toTexture:texture destinationSlice:0 destinationLevel:0
++      destinationOrigin:MTLOriginMake(dest_x, dest_y, 0)];
++  [blit endEncoding];
++  return true;
++}
++
++bool MetalDraw::HdrClearTarget(uint32_t key, const uint32_t rect[4]) {
++  uint32_t kind;
++  id<MTLTexture> target = HdrTarget(key, kind);
++  if (!target || !helper_library_) return false;
++  uint32_t x = std::min<uint32_t>(rect[0], uint32_t(target.width));
++  uint32_t width = std::min<uint32_t>(rect[2], uint32_t(target.width) - x);
++  uint32_t y0 = std::min<uint32_t>(rect[1], uint32_t(target.height));
++  uint32_t y1 = std::min<uint32_t>(y0 + rect[3], uint32_t(target.height));
++  if (!width || y0 >= y1) return true;
++  HdrPrepareTarget(target, kind, y0, y1);
++  EncodeClear(PendingClear{target, false, {0.0f, 0.0f, 0.0f, 0.0f}, 0.0, 0, x, y0, width, y1});
++  MarkWritten(target, kind, y0, y1, nullptr);
++  return true;
++}
++
++bool MetalDraw::HdrRestoreTarget(uint32_t key, const uint32_t rect[4]) {
++  uint32_t kind;
++  id<MTLTexture> target = HdrTarget(key, kind);
++  if (!target || !hdr_textures_[1]) return false;
++  if (!hdr_restore_) {
++    NSError* error = nil;
++    id<MTLLibrary> library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:kHdrRestoreSource]
++                                                   options:nil error:&error];
++    auto pd = [MTLRenderPipelineDescriptor new];
++    pd.vertexFunction = [library newFunctionWithName:@"hdr_restore_vs"];
++    pd.fragmentFunction = [library newFunctionWithName:@"hdr_restore_ps"];
++    auto attachment = pd.colorAttachments[0];
++    attachment.pixelFormat = target.pixelFormat;
++    attachment.blendingEnabled = YES;
++    attachment.rgbBlendOperation = attachment.alphaBlendOperation = MTLBlendOperationAdd;
++    attachment.sourceRGBBlendFactor = attachment.sourceAlphaBlendFactor = MTLBlendFactorOneMinusDestinationAlpha;
++    attachment.destinationRGBBlendFactor = attachment.destinationAlphaBlendFactor = MTLBlendFactorOne;
++    hdr_restore_ = library ? [device_ newRenderPipelineStateWithDescriptor:pd error:&error] : nil;
++    if (!hdr_restore_) {
++      REXGPU_ERROR("Metal HDR: no restore pipeline: {}", error ? error.localizedDescription.UTF8String : "?");
++      return false;
++    }
++  }
++  uint32_t x = std::min<uint32_t>(rect[0], uint32_t(target.width));
++  uint32_t width = std::min<uint32_t>(rect[2], uint32_t(target.width) - x);
++  uint32_t y0 = std::min<uint32_t>(rect[1], uint32_t(target.height));
++  uint32_t y1 = std::min<uint32_t>(y0 + rect[3], uint32_t(target.height));
++  if (!width || y0 >= y1) return true;
++  HdrPrepareTarget(target, kind, y0, y1);
++  auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
++  pass.colorAttachments[0].texture = target;
++  pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
++  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++  pass.renderTargetWidth = target.width; pass.renderTargetHeight = y1;
++  auto encoder = [commands_ renderCommandEncoderWithDescriptor:pass];
++  if (REXCVAR_GET(metal_debug_labels)) encoder.label = @"HDR: the UI's target put back";
++  [encoder setRenderPipelineState:hdr_restore_];
++  [encoder setScissorRect:MTLScissorRect{x, y0, width, y1 - y0}];
++  [encoder setFragmentTexture:hdr_textures_[1] atIndex:0];
++  [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++  [encoder endEncoding];
++  MarkWritten(target, kind, y0, y1, nullptr);
++  return true;
++}
++
++bool MetalDraw::HdrCopyTexture(uint32_t source, uint32_t dest, const uint32_t rect[4], uint32_t dest_x, uint32_t dest_y) {
++  if (source >= kHdrTextureCount || dest >= kHdrTextureCount || !hdr_textures_[source] || !hdr_textures_[dest])
++    return false;
++  id<MTLTexture> from = hdr_textures_[source], to = hdr_textures_[dest];
++  if (rect[0] >= from.width || rect[1] >= from.height || dest_x >= to.width || dest_y >= to.height) return false;
++  uint32_t width = std::min({rect[2], uint32_t(from.width) - rect[0], uint32_t(to.width) - dest_x});
++  uint32_t height = std::min({rect[3], uint32_t(from.height) - rect[1], uint32_t(to.height) - dest_y});
++  if (!width || !height) return true;
++  EndEncoder();
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  auto blit = [commands_ blitCommandEncoder];
++  [blit copyFromTexture:from sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(rect[0], rect[1], 0)
++             sourceSize:MTLSizeMake(width, height, 1) toTexture:to destinationSlice:0 destinationLevel:0
++      destinationOrigin:MTLOriginMake(dest_x, dest_y, 0)];
++  [blit endEncoding];
++  return true;
++}
++
++bool MetalDraw::HdrClearTexture(uint32_t texture) {
++  if (texture >= kHdrTextureCount || !hdr_textures_[texture]) return false;
++  EndEncoder();
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
++  pass.colorAttachments[0].texture = hdr_textures_[texture];
++  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
++  pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
++  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++  [[commands_ renderCommandEncoderWithDescriptor:pass] endEncoding];
++  return true;
++}
++
++bool MetalDraw::HdrRenderScene(const void* constants, size_t constants_size, uint32_t width, uint32_t height) {
++  if (!HdrEnsureTextures(width, height) || !last_pt_ || !last_vt_) return false;
++  if (!hdr_scene_ && !hdr_pipelines_failed_)
++    hdr_scene_ = HdrComputePipeline(hdr_spirv::hdr_scene_mcla_cs, std::size(hdr_spirv::hdr_scene_mcla_cs),
++        {{0, 0, 0}, {0, 1, 1}, {0, 2, 2}, {0, 3, 3}, {1, 0, 4}}, "hdr scene");
++  if (!hdr_scene_) return false;
++  // The tone map draw's textures, as its bindings fetched them (the scene, motion blur and bloom from the pixel
++  // shader, the adapted luminance from the vertex shader), as 2D arrays.
++  static constexpr uint32_t kFetches[4] = {0, 1, 2, 16};
++  id<MTLTexture> textures[4] = {};
++  for (uint32_t i = 0; i < 4; ++i) {
++    const uint32_t stage = i < 3 ? 1 : 0;
++    const auto& bindings = shaders_.translator().bindings(stage ? last_pt_ : last_vt_).textures;
++    for (uint32_t b = 0; b < bindings.size() && b < draw_texture_count_[stage]; ++b)
++      if (bindings[b].fetch_constant == kFetches[i]) textures[i] = draw_textures_[stage][b];
++    if (!textures[i]) return false;
++    if (textures[i].textureType == MTLTextureType2D)
++      textures[i] = [textures[i] newTextureViewWithPixelFormat:textures[i].pixelFormat textureType:MTLTextureType2DArray
++                                                        levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++    else if (textures[i].textureType != MTLTextureType2DArray) return false;
++  }
++  EndEncoder();
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  auto compute = [commands_ computeCommandEncoder];
++  if (REXCVAR_GET(metal_debug_labels)) compute.label = @"HDR scene";
++  [compute setComputePipelineState:hdr_scene_];
++  [compute setBytes:constants length:constants_size atIndex:0];
++  for (uint32_t i = 0; i < 4; ++i) [compute setTexture:textures[i] atIndex:i];
++  [compute setTexture:hdr_textures_[3] atIndex:4];
++  [compute dispatchThreadgroups:MTLSizeMake((width + 15) / 16, (height + 7) / 8, 1)
++          threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++  [compute endEncoding];
++  return true;
++}
 +}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_internal.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,225 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -3633,7 +4015,18 @@ new file mode 100644
 +      : Presenter(host_gpu_loss_callback), device_(device), command_queue_(command_queue) {}
 +  bool Initialize();
 +  // metal_present_capture: the painted drawable to a PPM file once the GPU is done with it.
-+  void CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture);
++  void CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture, float sdr_nits);
++  // HDR output: whether to paint HDR10 now (the hdr setting; auto: the display can show EDR), and switching the
++  // layer between BGRA8 sRGB and BGR10A2 PQ with EDR.
++  bool HdrWanted();
++  void ConfigureLayerHdr(CAMetalLayer* layer, bool hdr);
++  bool layer_hdr_ = false;
++  double edr_potential_ = 0.0;
++  std::chrono::steady_clock::time_point edr_checked_{};
++  float edr_metadata_peak_ = 0.0f, edr_metadata_white_ = 0.0f;
++  id<MTLRenderPipelineState> paint_hdr_pipeline_ = nil;
++  // What each guest output image holds (PQ or not), for captures.
++  std::array<GuestOutputHdr, kGuestOutputMailboxSize> guest_output_hdr_{};
 +
 +  id<MTLDevice> device_;
 +  id<MTLCommandQueue> command_queue_;
@@ -3691,6 +4084,15 @@ new file mode 100644
 +  // stretch it back (metal_taa_upscale).
 +  bool TaaUpscaleSupported() const override;
 +  bool HdrHostRenderTargets() const override { return true; }
++  uint32_t HdrEdramTileCount() const override { return graphics_system_->edram_tile_count(); }
++  bool HdrCopyFromColorTarget(uint32_t key, HdrTexture dest, const HdrRect& source, uint32_t dest_x,
++                              uint32_t dest_y) override;
++  bool HdrClearColorTarget(uint32_t key, const HdrRect& rect) override;
++  bool HdrRestoreColorTarget(uint32_t key, const HdrRect& rect) override;
++  bool HdrCopyTexture(HdrTexture source, HdrTexture dest, const HdrRect& source_rect, uint32_t dest_x,
++                      uint32_t dest_y) override;
++  bool HdrClearTexture(HdrTexture texture) override;
++  void HdrReleaseTextures() override;
 +  bool TaaCheckAvailable() override;
 +
 + private:
@@ -3729,7 +4131,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,549 @@
+@@ -0,0 +1,748 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -3737,8 +4139,11 @@ new file mode 100644
 + * Added by the mcla-recomp macOS fork (patches/rexglue-metal-backend.patch). The presenter draws the newest
 + * guest output image into the window's CAMetalLayer (the surface the SDK makes on macOS), letterboxed and
 + * bilinearly scaled, on the provider's one command queue, then the UI drawers (the ImGui overlays: settings, debug,
-+ * console, achievements) through MetalImmediateDrawer. The presenter effects of the other backends (FSR, CAS,
-+ * dither, HDR) are not done yet.
++ * console, achievements) through MetalImmediateDrawer. HDR output (the SDK's `hdr` setting): the layer becomes HDR10
++ * (BGR10A2, PQ, BT.2020) with EDR and HDR10 metadata whose optical output scale puts paper white at the display's
++ * SDR white, so macOS maps the highlights into the display's EDR headroom; the guest output then holds PQ code
++ * values (the refresher's) or SDR ones (encoded here), and the UI is blended in light at the SDR level. The other
++ * presenter effects of the other backends (FSR, CAS, dither) are not done.
 + *
 + * @license     BSD 3-Clause License
 + *              See LICENSE file in the project root for full license text.
@@ -3747,6 +4152,8 @@ new file mode 100644
 +#include "metal_internal.h"
 +#include <chrono>
 +#include <cstdio>
++#include <algorithm>
++#include <cmath>
 +#include <cstring>
 +#include <string>
 +
@@ -3756,13 +4163,43 @@ new file mode 100644
 +#include <rex/ui/immediate_drawer.h>
 +#include <rex/ui/surface_mac.h>
 +
++#import <AppKit/AppKit.h>
++#import <QuartzCore/QuartzCore.h>
++
 +REXCVAR_DEFINE_STRING(metal_present_capture, "", "GPU/Metal",
 +    "Development: write what the presenter paints (the guest output and the UI overlays) to this PPM file, at most "
 +    "every 2 seconds");
 +
++REXCVAR_DECLARE(std::string, hdr);
++REXCVAR_DEFINE_BOOL(metal_hdr_auto_edr, true, "GPU/Metal",
++    "With hdr = auto: HDR output when the display can show extended dynamic range (EDR) at all (macOS has no HDR "
++    "switch; on a Mac the built-in displays and HDR monitors can)");
++
 +namespace rex::graphics::metal {
 +
 +namespace {
++
++// HDR10 (PQ, BT.2020) in the presenter's shaders, as the SDK's hdr_output.xesli writes it.
++#define METAL_HDR_FUNCTIONS R"(
++float3 hdr_sdr_to_linear(float3 code, bool gamma22) {
++  code = max(code, 0.0);
++  return gamma22 ? pow(code, 2.2) : select(code / 12.92, pow((code + 0.055) / 1.055, 2.4), code > 0.04045);
++}
++float3 hdr_encode_pq(float3 nits) {
++  float3 bt2020 = float3(dot(nits, float3(0.627404, 0.329283, 0.043313)),
++                         dot(nits, float3(0.069097, 0.919540, 0.011362)),
++                         dot(nits, float3(0.016391, 0.088013, 0.895595)));
++  float3 y = pow(clamp(bt2020 / 10000.0, 0.0, 1.0), 0.1593017578125);
++  return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), 78.84375);
++}
++float3 hdr_decode_pq(float3 code) {
++  float3 e = pow(clamp(code, 0.0, 1.0), 1.0 / 78.84375);
++  float3 bt2020 = pow(max(e - 0.8359375, 0.0) / (18.8515625 - 18.6875 * e), 1.0 / 0.1593017578125) * 10000.0;
++  return max(float3(dot(bt2020, float3(1.660491, -0.587641, -0.072850)),
++                    dot(bt2020, float3(-0.124550, 1.132900, -0.008349)),
++                    dot(bt2020, float3(-0.018151, -0.100579, 1.118730))), 0.0);
++}
++)"
 +
 +// A quad over the viewport (the guest output's rectangle in the drawable), sampling the guest output.
 +constexpr const char kPaintShaderSource[] = R"(
@@ -3785,6 +4222,14 @@ new file mode 100644
 +fragment float4 paint_ps(PaintVertexOut in [[stage_in]], texture2d<float> guest_output [[texture(0)]],
 +                         sampler guest_output_sampler [[sampler(0)]]) {
 +  return float4(guest_output.sample(guest_output_sampler, in.uv).rgb, 1.0);
++}
++)" METAL_HDR_FUNCTIONS R"(
++// Into the HDR10 layer: PQ code values as they are, or SDR ones placed at the SDR level.
++struct PaintHdr { float sdr_nits; uint is_pq; uint gamma22; };
++fragment float4 paint_hdr_ps(PaintVertexOut in [[stage_in]], texture2d<float> guest_output [[texture(0)]],
++                             sampler guest_output_sampler [[sampler(0)]], constant PaintHdr& c [[buffer(0)]]) {
++  float3 color = guest_output.sample(guest_output_sampler, in.uv).rgb;
++  return float4(c.is_pq ? color : hdr_encode_pq(hdr_sdr_to_linear(color, c.gamma22 != 0) * c.sdr_nits), 1.0);
 +}
 +)";
 +
@@ -3814,6 +4259,18 @@ new file mode 100644
 +                             sampler texture_sampler [[sampler(0)]]) {
 +  return in.color * texture.sample(texture_sampler, in.uv);
 +}
++)" METAL_HDR_FUNCTIONS R"(
++// Over the HDR10 layer: the UI's colour as SDR content at the SDR level, blended in light with what is there
++// (read from the attachment: Apple GPUs keep it in tile memory).
++struct ImmediateHdr { float sdr_nits; uint gamma22; };
++fragment float4 immediate_hdr_ps(ImmediateOut in [[stage_in]], texture2d<float> texture [[texture(0)]],
++                                 sampler texture_sampler [[sampler(0)]], constant ImmediateHdr& c [[buffer(0)]],
++                                 float4 destination [[color(0)]]) {
++  float4 color = in.color * texture.sample(texture_sampler, in.uv);
++  float3 under = hdr_decode_pq(destination.rgb);
++  float3 over = hdr_sdr_to_linear(color.rgb, c.gamma22 != 0) * c.sdr_nits;
++  return float4(hdr_encode_pq(mix(under, over, saturate(color.a))), 1.0);
++}
 +)";
 +
 +}  // namespace
@@ -3821,12 +4278,21 @@ new file mode 100644
 +// What the presenter gives the UI drawers: the encoder of its paint pass, after the guest output.
 +class MetalUIDrawContext final : public ui::UIDrawContext {
 + public:
-+  MetalUIDrawContext(ui::Presenter& presenter, uint32_t width, uint32_t height, id<MTLRenderCommandEncoder> encoder)
-+      : UIDrawContext(presenter, width, height), encoder_(encoder) {}
++  MetalUIDrawContext(ui::Presenter& presenter, uint32_t width, uint32_t height, id<MTLRenderCommandEncoder> encoder,
++                     bool hdr = false, float sdr_nits = 0.0f, bool gamma22 = false)
++      : UIDrawContext(presenter, width, height), encoder_(encoder), hdr_(hdr), sdr_nits_(sdr_nits),
++        gamma22_(gamma22) {}
 +  id<MTLRenderCommandEncoder> encoder() const { return encoder_; }
++  // The paint pass draws into the HDR10 layer: the UI at this SDR level.
++  bool hdr() const { return hdr_; }
++  float sdr_nits() const { return sdr_nits_; }
++  bool gamma22() const { return gamma22_; }
 +
 + private:
 +  id<MTLRenderCommandEncoder> encoder_;
++  bool hdr_;
++  float sdr_nits_;
++  bool gamma22_;
 +};
 +
 +namespace {
@@ -3873,8 +4339,19 @@ new file mode 100644
 +  void Begin(ui::UIDrawContext& ui_draw_context, float coordinate_space_width,
 +             float coordinate_space_height) override {
 +    ImmediateDrawer::Begin(ui_draw_context, coordinate_space_width, coordinate_space_height);
-+    encoder_ = static_cast<MetalUIDrawContext&>(ui_draw_context).encoder();
-+    [encoder_ setRenderPipelineState:pipeline_];
++    auto& metal_context = static_cast<MetalUIDrawContext&>(ui_draw_context);
++    encoder_ = metal_context.encoder();
++    if (metal_context.hdr()) {
++      if (!hdr_pipeline_) {
++        encoder_ = nil;
++        return;
++      }
++      [encoder_ setRenderPipelineState:hdr_pipeline_];
++      struct { float sdr_nits; uint32_t gamma22; } c{metal_context.sdr_nits(), metal_context.gamma22() ? 1u : 0u};
++      [encoder_ setFragmentBytes:&c length:sizeof(c) atIndex:0];
++    } else {
++      [encoder_ setRenderPipelineState:pipeline_];
++    }
 +    [encoder_ setViewport:MTLViewport{0.0, 0.0, double(ui_draw_context.render_target_width()),
 +                                      double(ui_draw_context.render_target_height()), 0.0, 1.0}];
 +    const float space[2] = {this->coordinate_space_width(), this->coordinate_space_height()};
@@ -3965,6 +4442,16 @@ new file mode 100644
 +      REXGPU_ERROR("Metal immediate drawer: no pipeline: {}", error ? [error.localizedDescription UTF8String] : "?");
 +      return false;
 +    }
++    // HDR10 layer: blended in the shader (it reads the attachment).
++    desc.label = @"rexglue immediate drawer (HDR10)";
++    desc.fragmentFunction = [library newFunctionWithName:@"immediate_hdr_ps"];
++    color.pixelFormat = MTLPixelFormatBGR10A2Unorm;
++    color.blendingEnabled = NO;
++    hdr_pipeline_ = [device_ newRenderPipelineStateWithDescriptor:desc error:&error];
++    if (!hdr_pipeline_) {
++      REXGPU_WARN("Metal immediate drawer: no HDR pipeline (the UI is hidden in HDR): {}",
++                  error ? [error.localizedDescription UTF8String] : "?");
++    }
 +    for (uint32_t i = 0; i < 4; ++i) {
 +      MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
 +      sd.minFilter = sd.magFilter = (i & 1) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -3987,6 +4474,7 @@ new file mode 100644
 +
 +  id<MTLDevice> device_;
 +  id<MTLRenderPipelineState> pipeline_ = nil;
++  id<MTLRenderPipelineState> hdr_pipeline_ = nil;
 +  id<MTLSamplerState> samplers_[4] = {};  // nearest or linear (bit 0), clamped or repeated (bit 1)
 +  id<MTLTexture> white_ = nil;
 +  id<MTLRenderCommandEncoder> encoder_ = nil;
@@ -4074,6 +4562,14 @@ new file mode 100644
 +                 error ? [error.localizedDescription UTF8String] : "?");
 +    return false;
 +  }
++  pipeline_desc.label = @"rexglue guest output paint (HDR10)";
++  pipeline_desc.fragmentFunction = [library newFunctionWithName:@"paint_hdr_ps"];
++  pipeline_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGR10A2Unorm;
++  paint_hdr_pipeline_ = [device_ newRenderPipelineStateWithDescriptor:pipeline_desc error:&error];
++  if (!paint_hdr_pipeline_) {
++    REXGPU_WARN("Metal presenter: no HDR paint pipeline, HDR output stays off: {}",
++                error ? [error.localizedDescription UTF8String] : "?");
++  }
 +  MTLSamplerDescriptor* sampler_desc = [[MTLSamplerDescriptor alloc] init];
 +  sampler_desc.minFilter = MTLSamplerMinMagFilterLinear;
 +  sampler_desc.magFilter = MTLSamplerMinMagFilterLinear;
@@ -4108,6 +4604,14 @@ new file mode 100644
 +    image_out.width = uint32_t(texture.width); image_out.height = uint32_t(texture.height);
 +    image_out.stride = stride; image_out.data.resize(stride * texture.height);
 +    std::memcpy(image_out.data.data(), buffer.contents, image_out.data.size());
++    if (texture.pixelFormat == MTLPixelFormatRGB10A2Unorm) {
++      // HDR output: PQ code values back to SDR (or 10-bit SDR to 8-bit), as the other backends' captures.
++      GuestOutputCaptureConverter convert(guest_output_hdr_[index]);
++      for (size_t y = 0; y < texture.height; ++y) {
++        auto* row = reinterpret_cast<uint32_t*>(image_out.data.data() + y * stride);
++        for (size_t x = 0; x < texture.width; ++x) row[x] = convert(row[x]);
++      }
++    }
 +    return true;
 +  }
 +}
@@ -4130,6 +4634,11 @@ new file mode 100644
 +  }
 +  layer.device = device_;
 +  layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++  layer.wantsExtendedDynamicRangeContent = NO;
++  layer.colorspace = nil;
++  layer.EDRMetadata = nil;
++  layer_hdr_ = false;
++  SetHdrOutputActive(false);
 +  // Readable drawables only while metal_present_capture asks for them (writable-only lets Metal compress them).
 +  layer.framebufferOnly = REXCVAR_GET(metal_present_capture).empty() ? YES : NO;
 +  // The surface's size is in pixels already (SDL's pixel size of the window).
@@ -4144,6 +4653,46 @@ new file mode 100644
 +
 +void MetalPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
 +  layer_ = nil;
++  layer_hdr_ = false;
++  SetHdrOutputActive(false);
++}
++
++bool MetalPresenter::HdrWanted() {
++  if (!paint_hdr_pipeline_) return false;
++  const std::string mode = REXCVAR_GET(hdr);
++  if (mode == "on") return true;
++  if (mode != "auto" || !REXCVAR_GET(metal_hdr_auto_edr)) return false;
++  // Whether the display can show EDR at all (its headroom now depends on the brightness), read about once a second.
++  const auto now = std::chrono::steady_clock::now();
++  if (now - edr_checked_ > std::chrono::seconds(1)) {
++    edr_checked_ = now;
++    NSScreen* screen = [NSScreen mainScreen];
++    const double potential = screen ? double(screen.maximumPotentialExtendedDynamicRangeColorComponentValue) : 1.0;
++    if (potential != edr_potential_) {
++      edr_potential_ = potential;
++      REXGPU_INFO("Metal presenter: the display's EDR headroom can reach {:.2f}x SDR white{}", potential,
++                  potential > 1.0 ? "" : " (no EDR: hdr = auto stays SDR)");
++    }
++  }
++  return edr_potential_ > 1.0;
++}
++
++void MetalPresenter::ConfigureLayerHdr(CAMetalLayer* layer, bool hdr) {
++  if (hdr) {
++    layer.pixelFormat = MTLPixelFormatBGR10A2Unorm;
++    CGColorSpaceRef pq = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
++    layer.colorspace = pq;
++    CGColorSpaceRelease(pq);
++    layer.wantsExtendedDynamicRangeContent = YES;
++  } else {
++    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    layer.wantsExtendedDynamicRangeContent = NO;
++    layer.colorspace = nil;
++    layer.EDRMetadata = nil;
++  }
++  edr_metadata_peak_ = edr_metadata_white_ = 0.0f;
++  layer_hdr_ = hdr;
++  SetHdrOutputActive(hdr);
 +}
 +
 +bool MetalPresenter::RefreshGuestOutputImpl(
@@ -4155,9 +4704,12 @@ new file mode 100644
 +  }
 +  @autoreleasepool {
 +    id<MTLTexture> texture = guest_output_textures_[mailbox_index];
-+    if (!texture || texture.width != frontbuffer_width || texture.height != frontbuffer_height) {
++    // HDR output: 10 bits a channel, for PQ code values (or SDR ones, which the paint places at the SDR level).
++    const MTLPixelFormat format = IsHdrOutputActive() ? MTLPixelFormatRGB10A2Unorm : kGuestOutputFormat;
++    if (!texture || texture.width != frontbuffer_width || texture.height != frontbuffer_height ||
++        texture.pixelFormat != format) {
 +      MTLTextureDescriptor* desc =
-+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kGuestOutputFormat
++          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
 +                                                             width:frontbuffer_width
 +                                                            height:frontbuffer_height
 +                                                         mipmapped:NO];
@@ -4172,12 +4724,14 @@ new file mode 100644
 +      guest_output_textures_[mailbox_index] = texture;
 +    }
 +    MetalGuestOutputRefreshContext context(is_8bpc_out_ref, hdr_out_ref, texture, command_queue_);
-+    context.SetIs8bpc(true);
-+    return refresher(context);
++    context.SetIs8bpc(format == kGuestOutputFormat);
++    const bool refreshed = refresher(context);
++    guest_output_hdr_[mailbox_index] = hdr_out_ref;
++    return refreshed;
 +  }
 +}
 +
-+void MetalPresenter::CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture) {
++void MetalPresenter::CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture, float sdr_nits) {
 +  const std::string path = REXCVAR_GET(metal_present_capture);
 +  if (path.empty() || texture.framebufferOnly) return;
 +  const auto now = std::chrono::steady_clock::now();
@@ -4192,6 +4746,7 @@ new file mode 100644
 +             sourceSize:MTLSizeMake(width, height, 1) toBuffer:buffer destinationOffset:0
 + destinationBytesPerRow:stride destinationBytesPerImage:stride * height];
 +  [blit endEncoding];
++  const bool hdr = texture.pixelFormat == MTLPixelFormatBGR10A2Unorm;
 +  [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
 +    // BGRA to a binary PPM, written beside and renamed, so a reader never sees half a file.
 +    const std::string part = path + ".part";
@@ -4200,9 +4755,31 @@ new file mode 100644
 +    std::fprintf(file, "P6\n%u %u\n255\n", unsigned(width), unsigned(height));
 +    const uint8_t* bgra = static_cast<const uint8_t*>(buffer.contents);
 +    std::string row(width * 3, '\0');
++    // HDR10 (BGR10A2, PQ): light relative to the SDR level, Rec.709, clipped, as sRGB, so the SDR part compares.
++    float pq_to_relative[1024];
++    if (hdr) {
++      for (uint32_t i = 0; i < 1024; ++i) {
++        const double e = std::pow(i / 1023.0, 1.0 / 78.84375);
++        pq_to_relative[i] = float(std::pow(std::max(e - 0.8359375, 0.0) / (18.8515625 - 18.6875 * e),
++                                           1.0 / 0.1593017578125) * 10000.0 / std::max(sdr_nits, 1.0f));
++      }
++    }
++    auto srgb = [](float v) {
++      v = std::clamp(v, 0.0f, 1.0f);
++      return char(uint8_t(std::lround(255.0 * (v <= 0.0031308f ? 12.92 * v : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055))));
++    };
 +    for (NSUInteger y = 0; y < height; ++y) {
 +      for (NSUInteger x = 0; x < width; ++x) {
 +        const uint8_t* p = bgra + y * stride + x * 4;
++        if (hdr) {
++          uint32_t v; std::memcpy(&v, p, 4);
++          const float r = pq_to_relative[(v >> 20) & 0x3FF], g = pq_to_relative[(v >> 10) & 0x3FF],
++                      b = pq_to_relative[v & 0x3FF];
++          row[x * 3] = srgb(1.660491f * r - 0.587641f * g - 0.072850f * b);
++          row[x * 3 + 1] = srgb(-0.124550f * r + 1.132900f * g - 0.008349f * b);
++          row[x * 3 + 2] = srgb(-0.018151f * r - 0.100579f * g + 1.118730f * b);
++          continue;
++        }
 +        row[x * 3] = char(p[2]); row[x * 3 + 1] = char(p[1]); row[x * 3 + 2] = char(p[0]);
 +      }
 +      std::fwrite(row.data(), 1, row.size(), file);
@@ -4222,6 +4799,21 @@ new file mode 100644
 +    const uint32_t drawable_height = uint32_t(layer.drawableSize.height);
 +    if (!drawable_width || !drawable_height) {
 +      return PaintResult::kNotPresented;
++    }
++    // HDR output follows the setting (and, for auto, the display) during play: the layer switches in place.
++    const bool hdr = HdrWanted();
++    if (hdr != layer_hdr_) {
++      ConfigureLayerHdr(layer, hdr);
++      REXGPU_INFO("Metal presenter: HDR output (HDR10 with EDR) {}", hdr ? "on" : "off");
++    }
++    const HdrOutputState hdr_state = GetHdrOutputState();
++    if (hdr && (hdr_state.peak_nits != edr_metadata_peak_ || hdr_state.paper_white_nits != edr_metadata_white_)) {
++      // Paper white at EDR 1.0 (the display's SDR white); macOS maps the light above it into the headroom there is.
++      edr_metadata_peak_ = hdr_state.peak_nits;
++      edr_metadata_white_ = hdr_state.paper_white_nits;
++      layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0.005f
++                                                           maxLuminance:hdr_state.peak_nits
++                                                     opticalOutputScale:hdr_state.paper_white_nits];
 +    }
 +    id<CAMetalDrawable> drawable = [layer nextDrawable];
 +    if (!drawable) {
@@ -4258,7 +4850,14 @@ new file mode 100644
 +          MTLViewport viewport = {double(flow.output_x), double(flow.output_y), double(size.first),
 +                                  double(size.second), 0.0, 1.0};
 +          [encoder setViewport:viewport];
-+          [encoder setRenderPipelineState:paint_pipeline_];
++          const bool hdr_target = drawable.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm;
++          [encoder setRenderPipelineState:hdr_target ? paint_hdr_pipeline_ : paint_pipeline_];
++          if (hdr_target) {
++            struct { float sdr_nits; uint32_t is_pq, gamma22; } c{
++                hdr_state.sdr_white_nits, properties.hdr.is_pq && guest_output.pixelFormat == MTLPixelFormatRGB10A2Unorm,
++                hdr_state.sdr_pure_gamma_2_2};
++            [encoder setFragmentBytes:&c length:sizeof(c) atIndex:0];
++          }
 +          [encoder setFragmentTexture:guest_output atIndex:0];
 +          [encoder setFragmentSamplerState:paint_sampler_ atIndex:0];
 +          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
@@ -4266,11 +4865,13 @@ new file mode 100644
 +      }
 +      if (execute_ui_drawers) {
 +        [encoder setViewport:MTLViewport{0.0, 0.0, double(drawable_width), double(drawable_height), 0.0, 1.0}];
-+        MetalUIDrawContext ui_draw_context(*this, drawable_width, drawable_height, encoder);
++        MetalUIDrawContext ui_draw_context(*this, drawable_width, drawable_height, encoder,
++                                           drawable.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm,
++                                           hdr_state.sdr_white_nits, hdr_state.sdr_pure_gamma_2_2);
 +        ExecuteUIDrawersFromUIThread(ui_draw_context);
 +      }
 +      [encoder endEncoding];
-+      CapturePaint(command_buffer, drawable.texture);
++      CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
 +      [command_buffer presentDrawable:drawable];
 +      [command_buffer commit];
 +    }
@@ -4781,7 +5382,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,252 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -4939,6 +5540,32 @@ new file mode 100644
 +  return std::make_unique<SpirvShader>(type, hash, code, count);
 +}
 +
++std::string MetalSpirvComputeToMsl(const uint32_t* words, size_t word_count,
++                                   const std::vector<MetalSpirvTextureSlot>& slots, std::string& error_out) {
++  try {
++    SPIRV_CROSS_NAMESPACE::CompilerMSL compiler(words, word_count);
++    SPIRV_CROSS_NAMESPACE::CompilerMSL::Options options = compiler.get_msl_options();
++    options.platform = SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::macOS;
++    options.set_msl_version(3, 0);
++    options.texture_buffer_native = true;
++    compiler.set_msl_options(options);
++    for (const MetalSpirvTextureSlot& slot : slots) {
++      SPIRV_CROSS_NAMESPACE::MSLResourceBinding b{};
++      b.stage = spv::ExecutionModelGLCompute; b.desc_set = slot.set; b.binding = slot.binding;
++      b.msl_texture = slot.texture;
++      compiler.add_msl_resource_binding(b);
++    }
++    SPIRV_CROSS_NAMESPACE::MSLResourceBinding push{};
++    push.stage = spv::ExecutionModelGLCompute; push.desc_set = SPIRV_CROSS_NAMESPACE::kPushConstDescSet;
++    push.binding = SPIRV_CROSS_NAMESPACE::kPushConstBinding; push.msl_buffer = 0;
++    compiler.add_msl_resource_binding(push);
++    return compiler.compile();
++  } catch (const std::exception& e) {
++    error_out = e.what();
++    return {};
++  }
++}
++
 +void MetalTextureSwizzledSigns(const RegisterFile& regs, uint32_t* signs) {
 +  for (uint32_t i = 0; i < 8; ++i) signs[i] = 0;
 +  for (uint32_t i = 0; REXCVAR_GET(metal_texture_signs) && i < 32; ++i) {
@@ -5012,7 +5639,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.h b/src/graphics/metal/m
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.h
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,99 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.h
 + * @brief       Guest microcode to MSL: the SDK's SPIR-V translator, then SPIRV-Cross (plain C++)
@@ -5069,6 +5696,12 @@ new file mode 100644
 +    const draw_util::ViewportInfo& viewport, std::vector<uint8_t>& out, const uint32_t* texture_signs = nullptr,
 +    float ps_param_gen_scale = 1.0f);
 +void MetalTextureSwizzledSigns(const RegisterFile& regs, uint32_t* signs);
++// The SDK's own compute shaders (the Vulkan backend's SPIR-V, such as the HDR output's refresher and scene pass)
++// as MSL, through the same SPIRV-Cross: each (descriptor set, binding) to a texture index, push constants to
++// buffer 0, texel buffers as Metal texture buffers. Empty, with error_out set, if SPIRV-Cross refuses it.
++struct MetalSpirvTextureSlot { uint32_t set, binding, texture; };
++std::string MetalSpirvComputeToMsl(const uint32_t* words, size_t word_count,
++                                   const std::vector<MetalSpirvTextureSlot>& slots, std::string& error_out);
 +
 +class MetalShaderTranslator {
 + public:
