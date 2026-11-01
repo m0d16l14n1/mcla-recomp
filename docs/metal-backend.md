@@ -177,7 +177,7 @@ each): 339 translations in about 105 ms on 9 threads, then 14 new ones in the dr
 **Third pass (2026-11-01): about +35% in free roam** (paired runs, all of this against the old settings: 41.7
 against 30.5 FPS, then 27.0 against 20.3; uncapped). `sample` on a running free roam showed two threads saturated: the
 command processor (91% busy) and the game's render thread, spinning in `D3DDevice_BlockOnFence` for it; the GPU was
-busy 22 to 25 ms of a frame and the command processor never waited for it. On this Mac (an M4: four performance
+busy 22 to 25 ms of a frame and the command processor never waited for it. On this Mac (an M5: four performance
 cores, six efficiency cores, with a VM and WindowServer taking a share) both matter more than they would on an idle
 machine. The changes:
 
@@ -214,6 +214,35 @@ of its own with its GPU time logged, but on a shared GPU those times include oth
 vertex ranges (46 MB hashed and 20 MB copied a frame, about 15% of it), texture objects created for every resolve
 (about 6%), and `std::string` keys for the texture, sampler and pipeline maps. The car-falls route test after
 these changes: 0 of 240 samples under the road in 3 of 3 capped drives.
+
+**Fourth pass (2026-11-01): up to 44 to 49 FPS in free roam, now GPU-bound when the Mac is quiet.**
+
+- *Vertex ranges trusted within a frame* (`metal_snapshot_trust_size` now 0). With every range checked at every
+  draw, no vertex or index range changed between two draws of a frame, in boot, menus, free roam or a drive
+  (the stats line counts them when `metal_snapshot_trust_size=0xFFFFFFFF`). Each range is now copied at its first
+  draw in a frame and reused: no hashing (46 MB a frame before). +15 to 18% in paired runs.
+- *Persistent vertex copies* (`metal_persistent_vertex_size`, 16 KB). The snapshots are one buffer: a ring per
+  frame slot and a 192 MB persistent region. A range of 16 KB or more is copied there once, with a write watch,
+  and used from there in later frames until the CPU writes its pages; then it moves to a new copy (frames in
+  flight keep the old one), and a range written three times goes back to the per-frame copies. Copies went from
+  20 to 6 MB a frame, about 290 ranges a frame kept. +13 to 35% in paired runs.
+- *Texture lookups* go through a 1,024-entry cache keyed by the raw fetch constant, valid until textures or
+  resolves change (each draw asked twice, with a string key and three to four hash-map lookups each).
+- *Resolve clears clear only the resolved rectangle* (a scissored draw in a pass limited to the resolve's rows),
+  not the whole host target: a 320x7296 target was cleared 25 times a frame. This was also a correctness gap.
+- *Draws join the open pass* (`metal_pass_merge`) when it already has their targets (a draw without depth, or
+  with fewer colors, no longer ends the scene's pass): 84 to 70 passes a frame. A draw any of whose rows another
+  target wrote since now starts a pass (which takes them over) instead of drawing over stale tiles; before, only
+  the first draw of a pass had its rows synchronized.
+
+**Where the GPU time goes**, from a Metal System Trace (`xcrun xctrace record --template 'Metal System Trace'
+--attach <pid>`, with `--metal_debug_labels=true` so encoders have names; `out/research/parse_gputrace.py` sums
+the exported `metal-gpu-intervals` table by label), per frame before the clears and pass merging: render passes
+12.9 ms of fragment and 5.8 of vertex work (the scene's 1280x1024 pass 5.2 ms), resolves 3.1, EDRAM transfers
+2.9, texture loads 2.4 (a 1280x720 surface the game assembles from resolves, loaded again about 5 times a frame),
+resolve clears 2.4. Anti-aliasing off saves about 5 ms of GPU time (MSAA 2x is drawn as 1x2 supersampling).
+The Metal HUD, if `MetalForceHudEnabled` is set for the whole system, is loaded into the game whatever
+`MTL_HUD_ENABLED` says and costs the command processor 4 to 5%.
 
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
