@@ -64,8 +64,10 @@ Every step, building by hand, and debugging: [docs/macos.md](docs/macos.md).
 A controller (Xbox, DualSense) works as it is. For the keyboard, add `--mnk_mode=true`. The keys are a driving
 layout (`--mcla_keyboard_layout=driving`, the default); `--mcla_keyboard_layout=controller` gives the SDK's own
 layout instead (gas on E, W A S D the left stick). Each key can be changed with a `--keybind_<button>=<keys>`
-option, for example `--keybind_x=Shift+N`, and a key changed that way stays when the layout is applied. A controls
-page in a settings app is planned ([BACKLOG](docs/BACKLOG.md) 29).
+option, for example `--keybind_x=Shift+N`, and a key changed that way stays when the layout is applied. In the
+game, F4 opens the settings overlay: Input, Keybinds, Controller lists every button's keys, with Rebind and Reset,
+and "Save to config" keeps them (in `mcla.toml`). The "(!)" beside W and S marks that they are bound twice, on
+purpose (gas and brake, and up and down in menus). F3 shows a debug overlay and the Backtick key a console.
 
 | Keys | Xbox 360 | In the game |
 |---|---|---|
@@ -121,7 +123,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 ## Known issues
 
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
-- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing), the UI overlays and EDR.
+- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing) and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 
 ## More documentation

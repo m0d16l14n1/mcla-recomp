@@ -3512,7 +3512,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,205 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -3542,6 +3542,7 @@ new file mode 100644
 +#include <atomic>
 +#include <cstdint>
 +#include <memory>
++#include <chrono>
 +#include <unordered_map>
 +#include <utility>
 +#include <vector>
@@ -3564,8 +3565,8 @@ new file mode 100644
 +  std::unique_ptr<ui::Presenter> CreatePresenter(
 +      ui::Presenter::HostGpuLossCallback host_gpu_loss_callback =
 +          ui::Presenter::FatalErrorHostGpuLossCallback) override;
-+  // None yet: without it the app runs without the ImGui overlays.
-+  std::unique_ptr<ui::ImmediateDrawer> CreateImmediateDrawer() override { return nullptr; }
++  // The ImGui overlays' drawer (metal_presenter.mm): draws into the presenter's paint pass.
++  std::unique_ptr<ui::ImmediateDrawer> CreateImmediateDrawer() override;
 +
 +  id<MTLDevice> device() const { return device_; }
 +  // One queue for the guest's work and for presenting it: Metal runs a queue's command buffers in the order
@@ -3624,9 +3625,12 @@ new file mode 100644
 +                 id<MTLCommandQueue> command_queue)
 +      : Presenter(host_gpu_loss_callback), device_(device), command_queue_(command_queue) {}
 +  bool Initialize();
++  // metal_present_capture: the painted drawable to a PPM file once the GPU is done with it.
++  void CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture);
 +
 +  id<MTLDevice> device_;
 +  id<MTLCommandQueue> command_queue_;
++  std::chrono::steady_clock::time_point last_capture_{};
 +  id<MTLRenderPipelineState> paint_pipeline_ = nil;
 +  id<MTLSamplerState> paint_sampler_ = nil;
 +  CAMetalLayer* layer_ = nil;
@@ -3718,25 +3722,36 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,549 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
 + *
 + * Added by the mcla-recomp macOS fork (patches/rexglue-metal-backend.patch). The presenter draws the newest
 + * guest output image into the window's CAMetalLayer (the surface the SDK makes on macOS), letterboxed and
-+ * bilinearly scaled, on the provider's one command queue. The presenter effects of the other backends (FSR, CAS,
-+ * dither, HDR), the UI overlays and captures are not done yet.
++ * bilinearly scaled, on the provider's one command queue, then the UI drawers (the ImGui overlays: settings, debug,
++ * console, achievements) through MetalImmediateDrawer. The presenter effects of the other backends (FSR, CAS,
++ * dither, HDR) are not done yet.
 + *
 + * @license     BSD 3-Clause License
 + *              See LICENSE file in the project root for full license text.
 + */
 +
 +#include "metal_internal.h"
++#include <chrono>
++#include <cstdio>
 +#include <cstring>
++#include <string>
++
++#include <rex/cvar.h>
 +
 +#include <rex/logging.h>
++#include <rex/ui/immediate_drawer.h>
 +#include <rex/ui/surface_mac.h>
++
++REXCVAR_DEFINE_STRING(metal_present_capture, "", "GPU/Metal",
++    "Development: write what the presenter paints (the guest output and the UI overlays) to this PPM file, at most "
++    "every 2 seconds");
 +
 +namespace rex::graphics::metal {
 +
@@ -3766,7 +3781,217 @@ new file mode 100644
 +}
 +)";
 +
++// The immediate drawer's (ImGui's) vertices: position in the coordinate space, texture coordinates, RGBA8 color.
++constexpr const char kImmediateShaderSource[] = R"(
++#include <metal_stdlib>
++using namespace metal;
++
++struct ImmediateVertex { packed_float2 position; packed_float2 uv; uint color; };
++struct ImmediateOut {
++  float4 position [[position]];
++  float2 uv;
++  float4 color;
++};
++
++vertex ImmediateOut immediate_vs(uint id [[vertex_id]], const device ImmediateVertex* vertices [[buffer(0)]],
++                                 constant float2& coordinate_space [[buffer(1)]]) {
++  ImmediateVertex v = vertices[id];
++  ImmediateOut out;
++  out.position = float4(float2(v.position) / coordinate_space * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
++  out.uv = float2(v.uv);
++  out.color = unpack_unorm4x8_to_float(v.color);
++  return out;
++}
++
++fragment float4 immediate_ps(ImmediateOut in [[stage_in]], texture2d<float> texture [[texture(0)]],
++                             sampler texture_sampler [[sampler(0)]]) {
++  return in.color * texture.sample(texture_sampler, in.uv);
++}
++)";
++
 +}  // namespace
++
++// What the presenter gives the UI drawers: the encoder of its paint pass, after the guest output.
++class MetalUIDrawContext final : public ui::UIDrawContext {
++ public:
++  MetalUIDrawContext(ui::Presenter& presenter, uint32_t width, uint32_t height, id<MTLRenderCommandEncoder> encoder)
++      : UIDrawContext(presenter, width, height), encoder_(encoder) {}
++  id<MTLRenderCommandEncoder> encoder() const { return encoder_; }
++
++ private:
++  id<MTLRenderCommandEncoder> encoder_;
++};
++
++namespace {
++
++class MetalImmediateTexture final : public ui::ImmediateTexture {
++ public:
++  MetalImmediateTexture(uint32_t width, uint32_t height, id<MTLTexture> texture, id<MTLSamplerState> sampler)
++      : ImmediateTexture(width, height), texture(texture), sampler(sampler) {}
++  id<MTLTexture> texture;
++  id<MTLSamplerState> sampler;
++};
++
++// ImGui's draws in the presenter's paint pass. A command buffer keeps what it uses alive (textures, the batch
++// buffers), so nothing here waits for the GPU.
++class MetalImmediateDrawer final : public ui::ImmediateDrawer {
++ public:
++  static std::unique_ptr<MetalImmediateDrawer> Create(id<MTLDevice> device) {
++    std::unique_ptr<MetalImmediateDrawer> drawer(new MetalImmediateDrawer(device));
++    return drawer->Initialize() ? std::move(drawer) : nullptr;
++  }
++
++  std::unique_ptr<ui::ImmediateTexture> CreateTexture(uint32_t width, uint32_t height,
++                                                      ui::ImmediateTextureFilter filter, bool is_repeated,
++                                                      const uint8_t* data) override {
++    if (!width || !height) return nullptr;
++    @autoreleasepool {
++      MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
++                                                                                       width:width
++                                                                                      height:height
++                                                                                   mipmapped:NO];
++      desc.usage = MTLTextureUsageShaderRead;
++      desc.storageMode = MTLStorageModeShared;
++      id<MTLTexture> texture = [device_ newTextureWithDescriptor:desc];
++      if (!texture) return nullptr;
++      if (data) {
++        [texture replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0 withBytes:data
++                   bytesPerRow:width * 4];
++      }
++      return std::make_unique<MetalImmediateTexture>(
++          width, height, texture, samplers_[(filter == ui::ImmediateTextureFilter::kLinear ? 1 : 0) | (is_repeated ? 2 : 0)]);
++    }
++  }
++
++  void Begin(ui::UIDrawContext& ui_draw_context, float coordinate_space_width,
++             float coordinate_space_height) override {
++    ImmediateDrawer::Begin(ui_draw_context, coordinate_space_width, coordinate_space_height);
++    encoder_ = static_cast<MetalUIDrawContext&>(ui_draw_context).encoder();
++    [encoder_ setRenderPipelineState:pipeline_];
++    [encoder_ setViewport:MTLViewport{0.0, 0.0, double(ui_draw_context.render_target_width()),
++                                      double(ui_draw_context.render_target_height()), 0.0, 1.0}];
++    const float space[2] = {this->coordinate_space_width(), this->coordinate_space_height()};
++    [encoder_ setVertexBytes:space length:sizeof(space) atIndex:1];
++  }
++
++  void BeginDrawBatch(const ui::ImmediateDrawBatch& batch) override {
++    batch_ok_ = false;
++    if (!encoder_ || !batch.vertices || batch.vertex_count <= 0) return;
++    const size_t vertex_bytes = sizeof(ui::ImmediateVertex) * size_t(batch.vertex_count);
++    if (vertex_bytes <= 4096) {
++      [encoder_ setVertexBytes:batch.vertices length:vertex_bytes atIndex:0];
++    } else {
++      id<MTLBuffer> vertices = [device_ newBufferWithBytes:batch.vertices length:vertex_bytes
++                                                   options:MTLResourceStorageModeShared];
++      if (!vertices) return;
++      [encoder_ setVertexBuffer:vertices offset:0 atIndex:0];
++    }
++    indices_ = nil;
++    if (batch.indices && batch.index_count > 0) {
++      indices_ = [device_ newBufferWithBytes:batch.indices length:sizeof(uint16_t) * size_t(batch.index_count)
++                                     options:MTLResourceStorageModeShared];
++      if (!indices_) return;
++    }
++    batch_ok_ = true;
++  }
++
++  void Draw(const ui::ImmediateDraw& draw) override {
++    if (!batch_ok_ || draw.count <= 0) return;
++    uint32_t left, top, width, height;
++    if (!ScissorToRenderTarget(draw, left, top, width, height)) return;
++    [encoder_ setScissorRect:MTLScissorRect{left, top, width, height}];
++    auto* texture = static_cast<MetalImmediateTexture*>(draw.texture);
++    [encoder_ setFragmentTexture:texture ? texture->texture : white_ atIndex:0];
++    [encoder_ setFragmentSamplerState:texture ? texture->sampler : samplers_[0] atIndex:0];
++    const MTLPrimitiveType type =
++        draw.primitive_type == ui::ImmediatePrimitiveType::kLines ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle;
++    if (indices_) {
++      [encoder_ drawIndexedPrimitives:type indexCount:NSUInteger(draw.count) indexType:MTLIndexTypeUInt16
++                          indexBuffer:indices_ indexBufferOffset:sizeof(uint16_t) * NSUInteger(draw.index_offset)
++                        instanceCount:1 baseVertex:draw.base_vertex baseInstance:0];
++    } else {
++      [encoder_ drawPrimitives:type vertexStart:NSUInteger(draw.base_vertex) vertexCount:NSUInteger(draw.count)];
++    }
++  }
++
++  void EndDrawBatch() override {
++    batch_ok_ = false;
++    indices_ = nil;
++  }
++
++  void End() override {
++    // The pass goes on after the UI (the presenter ends it): the scissor back to the whole target.
++    if (encoder_ && ui_draw_context()) {
++      [encoder_ setScissorRect:MTLScissorRect{0, 0, ui_draw_context()->render_target_width(),
++                                              ui_draw_context()->render_target_height()}];
++    }
++    encoder_ = nil;
++    ImmediateDrawer::End();
++  }
++
++ private:
++  explicit MetalImmediateDrawer(id<MTLDevice> device) : device_(device) {}
++
++  bool Initialize() {
++    NSError* error = nil;
++    id<MTLLibrary> library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:kImmediateShaderSource]
++                                                   options:nil
++                                                     error:&error];
++    if (!library) {
++      REXGPU_ERROR("Metal immediate drawer: the shaders did not compile: {}",
++                   error ? [error.localizedDescription UTF8String] : "?");
++      return false;
++    }
++    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
++    desc.label = @"rexglue immediate drawer";
++    desc.vertexFunction = [library newFunctionWithName:@"immediate_vs"];
++    desc.fragmentFunction = [library newFunctionWithName:@"immediate_ps"];
++    auto* color = desc.colorAttachments[0];
++    color.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    color.blendingEnabled = YES;
++    color.sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
++    color.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    color.sourceAlphaBlendFactor = MTLBlendFactorOne;
++    color.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
++    pipeline_ = [device_ newRenderPipelineStateWithDescriptor:desc error:&error];
++    if (!pipeline_) {
++      REXGPU_ERROR("Metal immediate drawer: no pipeline: {}", error ? [error.localizedDescription UTF8String] : "?");
++      return false;
++    }
++    for (uint32_t i = 0; i < 4; ++i) {
++      MTLSamplerDescriptor* sd = [[MTLSamplerDescriptor alloc] init];
++      sd.minFilter = sd.magFilter = (i & 1) ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
++      sd.sAddressMode = sd.tAddressMode = (i & 2) ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
++      samplers_[i] = [device_ newSamplerStateWithDescriptor:sd];
++      if (!samplers_[i]) return false;
++    }
++    const uint32_t white = 0xFFFFFFFFu;
++    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
++                                                                                  width:1
++                                                                                 height:1
++                                                                              mipmapped:NO];
++    td.usage = MTLTextureUsageShaderRead;
++    td.storageMode = MTLStorageModeShared;
++    white_ = [device_ newTextureWithDescriptor:td];
++    if (!white_) return false;
++    [white_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&white bytesPerRow:4];
++    return true;
++  }
++
++  id<MTLDevice> device_;
++  id<MTLRenderPipelineState> pipeline_ = nil;
++  id<MTLSamplerState> samplers_[4] = {};  // nearest or linear (bit 0), clamped or repeated (bit 1)
++  id<MTLTexture> white_ = nil;
++  id<MTLRenderCommandEncoder> encoder_ = nil;
++  id<MTLBuffer> indices_ = nil;
++  bool batch_ok_ = false;
++};
++
++}  // namespace
++
++std::unique_ptr<ui::ImmediateDrawer> MetalProvider::CreateImmediateDrawer() {
++  return MetalImmediateDrawer::Create(device_);
++}
 +
 +bool IsMetalAvailable() {
 +  @autoreleasepool {
@@ -3898,7 +4123,8 @@ new file mode 100644
 +  }
 +  layer.device = device_;
 +  layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-+  layer.framebufferOnly = YES;
++  // Readable drawables only while metal_present_capture asks for them (writable-only lets Metal compress them).
++  layer.framebufferOnly = REXCVAR_GET(metal_present_capture).empty() ? YES : NO;
 +  // The surface's size is in pixels already (SDL's pixel size of the window).
 +  layer.drawableSize = drawable_size;
 +  layer.maximumDrawableCount = 3;
@@ -3944,7 +4170,42 @@ new file mode 100644
 +  }
 +}
 +
-+ui::Presenter::PaintResult MetalPresenter::PaintAndPresentImpl([[maybe_unused]] bool execute_ui_drawers) {
++void MetalPresenter::CapturePaint(id<MTLCommandBuffer> command_buffer, id<MTLTexture> texture) {
++  const std::string path = REXCVAR_GET(metal_present_capture);
++  if (path.empty() || texture.framebufferOnly) return;
++  const auto now = std::chrono::steady_clock::now();
++  if (now - last_capture_ < std::chrono::seconds(2)) return;
++  last_capture_ = now;
++  REXGPU_INFO("Metal presenter: capturing a {}x{} paint", uint32_t(texture.width), uint32_t(texture.height));
++  const NSUInteger width = texture.width, height = texture.height, stride = width * 4;
++  id<MTLBuffer> buffer = [device_ newBufferWithLength:stride * height options:MTLResourceStorageModeShared];
++  if (!buffer) return;
++  id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
++  [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
++             sourceSize:MTLSizeMake(width, height, 1) toBuffer:buffer destinationOffset:0
++ destinationBytesPerRow:stride destinationBytesPerImage:stride * height];
++  [blit endEncoding];
++  [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
++    // BGRA to a binary PPM, written beside and renamed, so a reader never sees half a file.
++    const std::string part = path + ".part";
++    FILE* file = std::fopen(part.c_str(), "wb");
++    if (!file) return;
++    std::fprintf(file, "P6\n%u %u\n255\n", unsigned(width), unsigned(height));
++    const uint8_t* bgra = static_cast<const uint8_t*>(buffer.contents);
++    std::string row(width * 3, '\0');
++    for (NSUInteger y = 0; y < height; ++y) {
++      for (NSUInteger x = 0; x < width; ++x) {
++        const uint8_t* p = bgra + y * stride + x * 4;
++        row[x * 3] = char(p[2]); row[x * 3 + 1] = char(p[1]); row[x * 3 + 2] = char(p[0]);
++      }
++      std::fwrite(row.data(), 1, row.size(), file);
++    }
++    std::fclose(file);
++    std::rename(part.c_str(), path.c_str());
++  }];
++}
++
++ui::Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
 +  @autoreleasepool {
 +    CAMetalLayer* layer = layer_;
 +    if (!layer) {
@@ -3996,7 +4257,13 @@ new file mode 100644
 +          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 +        }
 +      }
++      if (execute_ui_drawers) {
++        [encoder setViewport:MTLViewport{0.0, 0.0, double(drawable_width), double(drawable_height), 0.0, 1.0}];
++        MetalUIDrawContext ui_draw_context(*this, drawable_width, drawable_height, encoder);
++        ExecuteUIDrawersFromUIThread(ui_draw_context);
++      }
 +      [encoder endEncoding];
++      CapturePaint(command_buffer, drawable.texture);
 +      [command_buffer presentDrawable:drawable];
 +      [command_buffer commit];
 +    }

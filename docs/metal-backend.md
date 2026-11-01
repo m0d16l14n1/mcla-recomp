@@ -28,9 +28,9 @@ from boot to free roam and drives. A warm or busy Mac loses up to a third of the
 Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a frame, 3.4 of it waiting for the GPU.
 The rows above are before the tenth pass (the 4x reflections at one sample a pixel, now the default), which adds
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
-sampled in free roam, drives or races so far), the UI overlays (ImGui), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
+sampled in free roam, drives or races so far), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to eleventh, record how it got here.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to twelfth, record how it got here.
 
 ## Why
 
@@ -94,7 +94,7 @@ positions, the EDRAM layout in MSL). Code taken from it keeps its BSD notice and
 | M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | done 2026-11-01 (the first picture, then 28 to 30 FPS in free roam) |
 | M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | mostly done: EDRAM transfers between formats and depth and color, MSAA as supersampling (real MSAA as an option), float24 depth (D24FS8), the gamma ramp, the spawn point matching MoltenVK. To do: EDRAM transfers of 64bpp formats, 3D textures |
 | M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | mostly done: nine speed passes (below), MetalFX temporal AA and upscaling; binary archives deferred. To do: `CAMetalDisplayLink` pacing |
-| M4 | The rest: the immediate drawer (ImGui overlays, the pause menu's settings), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | captures done (`shot`); the rest to do |
+| M4 | The rest: the immediate drawer (ImGui overlays), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | captures and the immediate drawer done; EDR to do |
 
 ### M1 to M3, as it went (2026-10-31 and 2026-11-01)
 
@@ -485,6 +485,17 @@ sample takes its one or two dwords from whichever source samples hold them (`Tra
 transfer dropped and no texture sampled as zero, in free roam, the route drive or a rainy arcade race; the spawn
 point's picture away from passing traffic is 0.62 from the reference. **3D textures** come back as zero (a
 1x1x1 fallback), but nothing the game drew in these runs sampled one, so they wait until something does.
+
+**The immediate drawer, twelfth pass (2026-11-01): the SDK's ImGui overlays on Metal.** `MetalProvider` now
+makes a `MetalImmediateDrawer` (metal_presenter.mm): ImGui's textures as RGBA8 textures, each batch's vertices
+(`setVertexBytes` up to 4 KB, else a buffer) and indices in buffers the command buffer keeps alive, one
+alpha-blended pipeline for triangles and lines, scissors through `ScissorToRenderTarget`. The presenter runs
+the UI drawers in its paint pass after the guest output (`MetalUIDrawContext` carries the encoder). F3 (debug)
+and F4 (settings) were checked; the console (Backtick) and the achievement toasts use the same drawer. F4's Input, Keybinds,
+Controller page lists every button's keys with Rebind and Reset, and "Save to config" writes `mcla.toml`.
+`--metal_present_capture=<file.ppm>` writes what the presenter painted (overlays included) at most every 2
+seconds, for checking overlays without screen recording (it makes the layer's drawables readable). The F4
+picture over free roam was checked that way, and the FPS with the overlays closed is unchanged.
 
 **Frame pacing:** `CAMetalDisplayLink` is put off. The Mac here has a 60 Hz panel, the presenter's layer has
 display sync on, and the game already holds each frame to its target at the swap with a precise clock
