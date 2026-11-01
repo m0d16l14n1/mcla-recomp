@@ -65,7 +65,7 @@ positions, the EDRAM layout in MSL). Code taken from it keeps its BSD notice and
 | | What | State |
 |---|---|---|
 | M0 | Provider, presenter (CAMetalLayer, letterboxed bilinear guest output, the presenter's 3-image mailbox), graphics system, a command processor that runs the whole command stream and skips draws and resolves; game runs start to free roam | done 2026-10-31 |
-| M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | doing: **the first picture, 2026-11-01**: the title screen and free roam draw (below), 28 to 30 FPS in free roam (MoltenVK: 19.6) |
+| M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | doing: **the first picture, 2026-11-01**: the title screen and free roam draw (below), 28 to 30 FPS in free roam, then 45 to 50 uncapped (MoltenVK: 19.6) |
 | M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | todo |
 | M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | todo |
 | M4 | The rest: the immediate drawer (ImGui overlays, the pause menu's settings), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | todo |
@@ -111,10 +111,21 @@ whole frame either, which had hidden the overlap at first). A texture is cached 
 through a view per swizzle, so the post-processing passes that sample the scene with different sampler settings
 share one load. Tried and dropped: reusing a frame's vertex copies by the write watches' page validity instead of
 a hash of the data, 23 to 24 FPS against 28 to 30 in the same run (watching every vertex range costs more than
-hashing it). The frame is now CPU-bound in the command
-processor: hashing the per-draw vertex snapshots (about 10%), 40 to 80 texture loads a frame, the draws' own
-encoding. The GPU reads textures from guest memory when it runs the frame, up to a frame after the game wrote
+hashing it).
+
+**Second pass (2026-11-01): 25 to 26 ms a frame, then about 20 (45 to 50 FPS uncapped)**, all of it on the command
+processor's CPU time (GPU busy 14 to 17 ms): the pipeline descriptor was built for every draw even when the pipeline
+was cached (9% of the thread); a resolve looked at every cached texture to drop those it wrote over (10%; now
+an index by address) and dropped a texture's swizzle views by scanning them all; and the vertex snapshots hashed
+154 MB a frame to copy 20, the same few MB of static geometry again at every draw that used it. A range of 64 KB
+or more is now hashed once a frame (`metal_snapshot_trust_size`; `0xFFFFFFFF` checks every draw as before),
+small ranges, where dynamic vertices are, still at every draw; checked with a diagnostic that hashed the trusted
+ranges anyway: no large range changed within a frame in free roam. The stats line also gives the texture loads
+and the snapshot megabytes a frame (about 34 loads: surfaces the game resolves every frame and samples in another
+format or size than the resolve wrote, read back from memory). The GPU reads textures from guest memory when it runs the frame, up to a frame after the game wrote
 them; the vertices and indices are copied at the draw (`metal_snapshot_vertices`).
+
+**Open: the car falls through the city** (2026-11-01, parked). On Metal the player's car sometimes loses its collision and falls through the road, uncapped in nearly every drive of the test route, capped in about half. It is not anything the GPU writes: it happens with no GPU work at all when the command processor is made to pause briefly at resolves, fences or draws, and never when it is always ahead or stalls for long. A race between the game's own threads, then, that the command processor's timing exposes. The unattended test (a recorded drive replayed by the dev pad: `launcher/dev/drive-test/route-test.sh`), every result and the diagnostic switches are in `launcher/dev/metal-car-falls-2026-11-01.md`.
 
 **EDRAM is kept in samples.** Free roam first showed only the HUD over a flat colour: the scene's draws landed, but
 always failed the depth and stencil tests. The game clears its 2x MSAA 1280-wide scene by drawing over the same
@@ -133,13 +144,46 @@ frame. A texture fetch now uses a resolve's own texture only when its address, s
 otherwise it loads from guest memory, which the resolves write (depth resolves too now: 24-bit unorm or float24
 over a zero stencil). A resolve drops the cached textures and resolve textures in the memory it writes.
 
+**Fixes of 2026-11-01, the picture now matching MoltenVK at the spawn point (39 to 40 FPS uncapped, unchanged):**
+
+- *Shadows.* The shadow maps were right all along (four 640x640 cascades of real depth in a 1280x1280 k_24_8
+  atlas, about 0.0006 to 0.0016). The scene's shadow pass reads the atlas through the fetch constant's swizzle,
+  and a texture view of a one-channel format gave 0 or 1 for G, B and A. Texture views now repeat the last channel
+  of the format, like the Vulkan backend's host swizzles: RRRR for one channel (k_24_8, k_32_FLOAT, k_8, k_16...),
+  RGGG for two (k_8_8, k_16_16, DXN...). Shadows and most of the warm colour grading came back with it.
+- *16-bit packed textures.* k_1_5_5_5, k_5_6_5, k_6_5_5 and k_4_4_4_4 are expanded to RGBA8 by the load kernel
+  (red in the low bits; the formats without alpha repeat blue there).
+- *EDRAM shared between targets.* Host targets are one texture per EDRAM base, format and width, while Xenos has
+  one EDRAM. The minimap's grey blocks are a depth clear (depth 0x006666 and its stencil) into the tiles of the
+  color target at the same base, read back as RGBA8 (0x66 grey, alpha 0). Now every EDRAM tile has a version and
+  its last writer; a target bound for a pass, or resolved, takes over the tiles another target wrote since it last
+  had them, as raw 32 bits per sample (color to color, depth to color, color to depth, depth to depth; 8_8_8_8,
+  2_10_10_10, 7e3, 16_16, 16_16_FLOAT, 32_FLOAT, D24S8, D24FS8; 64bpp formats not yet) with a small render pass.
+  Screen-space rectangle draws (clears by drawing) are bounded by their vertices, not the window scissor, or a clear
+  would claim all EDRAM after its base (that briefly made the cars glow). About 60 transfers a frame, no measurable
+  cost. `--metal_edram_transfers=false` turns it off.
+- *Depth clip:* clamp when PA_CL_CLIP_CNTL disables clipping. *Gamma ramp:* the swap applies the guest's 256-entry
+  or PWL ramp (`metal_gamma_ramp`).
+
+**Shader storage and warm-up (2026-11-01).** Translating a guest shader (microcode to SPIR-V to MSL) takes about
+1.2 to 1.9 ms on the command processor thread, about 460 of them from boot to a drive: stutters whenever new ones
+appear. Metal's own compile is asynchronous and cached by macOS (0.1 ms on later runs), render pipelines take about
+0.1 ms. Each new translation's shader microcode and modification now go to
+`<cache>/shaders/metal/<title>.mcla-metal-shaders` (append-only; a torn last record is cut off), and before the title
+starts the next run translates all of them on worker threads (a shader's modifications on one thread, one translator
+each): 339 translations in about 105 ms on 9 threads, then 14 new ones in the drive instead of 339.
+`--metal_shader_storage=false` turns it off.
+
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
-resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM.
+resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM. With it:
+`--metal_debug_all_draws=true` logs every draw (blend, color mask, depth and viewport state, and the vertices of
+small draws), `--metal_debug_depth_dumps=1` writes the depth target after each depth-ALWAYS draw and before each
+depth resolve (PGM, plus raw floats), `--metal_debug_rt_base=<tiles>` writes color target 0 after every draw into
+that EDRAM base, and the EDRAM transfers are logged.
 
 Shadows work (the title's plaza scene shows the palm trees' shadows). Still to do in M1: the stencil in depth resolves,
-clears of only the resolved rectangle (the whole surface is cleared), EDRAM shared between formats (a surface
-reinterpreted as another format starts from its own texture), and pixel positions in shaders drawn with MSAA (the
+clears of only the resolved rectangle (the whole surface is cleared), EDRAM transfers of 64bpp formats, and pixel positions in shaders drawn with MSAA (the
 shaders are translated for 1x).
 
 Known gaps in M0: no captures (`shot` in a pad script answers "no guest output yet"), no ImGui overlays (the
