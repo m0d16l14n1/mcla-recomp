@@ -400,6 +400,14 @@ limit (about 125 FPS). The spawn point's picture at Performance has the same mea
 and the minimap is stable over 10 frames.
 No mips are sampled on Metal yet, so the SDK's LOD bias for the squeezed scene (`TaaLodBias`) is not applied.
 
+After it, the command thread's per-draw maps keyed by strings (the vertex snapshots, rebuilt every frame; the
+samplers; the depth-stencil states) take 64-bit keys, and the pipeline key is six words instead of a 69-byte
+string (a heap allocation a draw): 92.6 FPS at Performance (91.3), the command thread 7.4 ms (8.0), of which 3.4
+waiting for the GPU. So at Performance the GPU is the limit again. A trace of it (`gputrace.sh`): the scene pass
+at 640x360 is about 1 ms; the largest item is the game's 4x MSAA targets, drawn here as 2x2 supersampling (about
+25 passes of 160x128 reflections a frame, 320x256 here, about 1.8 ms; a 520-pitch surface about 1 ms; others),
+about 4 ms together. Real MSAA (Metal multisample textures, shaded once a pixel) is the next GPU step.
+
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
 resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM. With it:

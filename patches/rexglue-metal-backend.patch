@@ -629,7 +629,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,322 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -770,7 +770,7 @@ new file mode 100644
 +  std::shared_ptr<std::atomic<uint64_t>> gpu_errors_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  size_t snapshot_used_ = 0;
 +  // Offset in the snapshot buffer and the hash of the copied data, by address and size.
-+  std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> snapshots_;
++  std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t>> snapshots_;  // address << 32 | size
 +  std::array<uint32_t, 192> draw_fetch_{};
 +  memory::Memory& memory_;
 +  RegisterFile& regs_;
@@ -847,9 +847,21 @@ new file mode 100644
 +  id<MTLCommandBuffer> TextureWorkCommands();
 +  uint64_t texture_hashed_ = 0, texture_watch_hits_ = 0, snapshot_changed_ = 0, snapshot_changed_bytes_ = 0;
 +  uint64_t frame_ = 1;
-+  std::unordered_map<std::string, id<MTLSamplerState>> samplers_;
-+  std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines_;
-+  std::unordered_map<std::string, id<MTLDepthStencilState>> depth_states_;
++  std::unordered_map<uint64_t, id<MTLSamplerState>> samplers_;
++  // The vertex and pixel translations, the color mask with the depth attachment's presence (bit 32), the four
++  // attachment formats (16 bits each), and the blends of the written attachments (two per word).
++  using PipelineKey = std::array<uint64_t, 6>;
++  struct PipelineKeyHash {
++    size_t operator()(const PipelineKey& k) const {
++      uint64_t h = 0x9E3779B97F4A7C15ull;
++      for (uint64_t v : k) h = (h ^ v) * 0x100000001B3ull ^ (h >> 29);
++      return size_t(h);
++    }
++  };
++  std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines_;
++  // RB_DEPTHCONTROL, then the front and back stencil masks (RB_STENCILREFMASK bits 8 to 23; the reference is set
++  // on the encoder).
++  std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_states_;
 +  // A resolve's own texture, used in place of a load from guest memory only by a fetch of exactly
 +  // what it wrote (same address, size and format). Guest memory is the truth for everything else.
 +  struct ResolvedTexture { id<MTLTexture> texture; uint32_t start, length, width, height, format, pitch = 0; };
@@ -944,7 +956,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2441 @@
+@@ -0,0 +1,2440 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1503,8 +1515,7 @@ new file mode 100644
 +    if (taa_draw_) taa_draw_(viewport, scissor, param_gen_scale);
 +    const uint32_t width = pitch * ssx;
 +    std::array<id<MTLTexture>, 5> next{};
-+    std::string key; Key(key, reinterpret_cast<uintptr_t>(vt)); Key(key, reinterpret_cast<uintptr_t>(pt));
-+    Key(key, mask);
++    PipelineKey key{uint64_t(reinterpret_cast<uintptr_t>(vt)), uint64_t(reinterpret_cast<uintptr_t>(pt)), mask, 0, 0, 0};
 +    std::array<MTLPixelFormat, 4> formats{};
 +    std::array<uint32_t, 4> blends{};
 +    std::array<uint32_t, 5> kinds{};
@@ -1725,9 +1736,10 @@ new file mode 100644
 +    // the always-pass state without writes).
 +    for (uint32_t i = 0; i < 4; ++i) {
 +      formats[i] = attachments_[i] ? attachments_[i].pixelFormat : MTLPixelFormatInvalid;
-+      Key(key, formats[i]); Key(key, ((mask >> (4 * i)) & 15) ? blends[i] : 0u);
++      key[3] |= uint64_t(formats[i] & 0xFFFF) << (16 * i);
++      key[4 + i / 2] |= uint64_t(((mask >> (4 * i)) & 15) ? blends[i] : 0u) << (32 * (i & 1));
 +    }
-+    Key(key, bool(attachments_[4]));
++    if (attachments_[4]) key[2] |= uint64_t(1) << 32;
 +    id<MTLRenderPipelineState> pipeline;
 +    auto pi = pipelines_.find(key);
 +    if (pi != pipelines_.end()) pipeline = pi->second;
@@ -1764,10 +1776,9 @@ new file mode 100644
 +      if (depth_writes) MarkWritten(next[4], kinds[4], y0, y1, &pass_ranges_[4]);
 +    }
 +    [encoder_ setRenderPipelineState:pipeline];
-+    std::string dk; Key(dk, dc.value);
 +    auto sf = regs_.Get<reg::RB_STENCILREFMASK>();
 +    auto sb = regs_.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
-+    Key(dk, sf.value); Key(dk, sb.value);
++    const uint64_t dk = dc.value | (uint64_t((sf.value >> 8) & 0xFFFF) << 32) | (uint64_t((sb.value >> 8) & 0xFFFF) << 48);
 +    auto ds = depth_states_.find(dk);
 +    id<MTLDepthStencilState> state;
 +    if (ds != depth_states_.end()) state = ds->second;
@@ -1882,7 +1893,7 @@ new file mode 100644
 +  // frame, in boot, menus, free roam or a drive (2026-11-01, every range checked: 0 in thousands of
 +  // frames), and cost 46 to 154 MB of hashing a frame. The game writes a frame's vertices before its
 +  // draws; the copy at the first draw protects them from the next frame's writes.
-+  std::string key; Key(key, address); Key(key, size);
++  const uint64_t key = (uint64_t(address) << 32) | size;
 +  auto found = snapshots_.find(key);
 +  const bool trusted = size >= REXCVAR_GET(metal_snapshot_trust_size);
 +  if (found != snapshots_.end() && trusted) return found->second.first;
@@ -2519,8 +2530,8 @@ new file mode 100644
 +  auto fetch = regs_.GetTextureFetch(b.fetch_constant);
 +  auto mag = b.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter : b.mag_filter;
 +  auto min = b.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter : b.min_filter;
-+  std::string key; Key(key, mag); Key(key, min); Key(key, uint32_t(fetch.clamp_x));
-+  Key(key, uint32_t(fetch.clamp_y)); Key(key, uint32_t(fetch.clamp_z));
++  const uint64_t key = uint64_t(mag) | (uint64_t(min) << 8) | (uint64_t(fetch.clamp_x) << 16) |
++                       (uint64_t(fetch.clamp_y) << 24) | (uint64_t(fetch.clamp_z) << 32);
 +  auto found = samplers_.find(key); if (found != samplers_.end()) return found->second;
 +  auto d = [MTLSamplerDescriptor new];
 +  d.magFilter = mag == xenos::TextureFilter::kLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
