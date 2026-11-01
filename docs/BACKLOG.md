@@ -33,7 +33,7 @@ Game: Midnight Club: Los Angeles Complete Edition, Xbox 360 disc image, title `5
 | 11 | Controller (SDL3: Xbox, DualSense) and keyboard | todo | |
 | 12 | Frame pacing: CAMetalLayer present modes through MoltenVK, 30/60/120 FPS caps, ProMotion | todo | |
 | 13 | Saves and settings location | done | 2026-11-01: saves, achievements and the shader cache are already outside the program, in `~/.local/share/mcla` (the SDK's user folder on macOS: `$XDG_DATA_HOME`, else `~/.local/share`), shared by `play_mac.sh` and `MCLA.app`. Settings are `mcla.toml` beside the program (`MCLA.app/Contents/MacOS/` for the app; `make_app.sh` keeps it). Moving to `~/Library/Application Support` would need the saves moved too, for nothing gained; `--user_data_root=<folder>` picks another place |
-| 15 | Settings that do not apply on a Mac hidden in the pause menu | todo | D3D12, Reflex, Anti-Lag 2, FSR |
+| 15 | Settings that do not apply on a Mac hidden in the pause menu | done | 2026-11-01: on macOS the pause menu's DISPLAY, PERFORMANCE and CONTROLS pages have only what changes during play (`src/settings_menu.cpp`, `FilterMenusForMac`): the restart-only rows (resolution, race shadows, simple car shadows, distant trees, fullscreen blur, intro) are the launcher's, and frame generation, low latency (Reflex, Anti-Lag 2), FSR sharpening and single-tile rendering where it can't be had are gone; the anti-aliasing row says METALFX. The F4 overlay likewise lists only live settings (`patches/rexglue-settings-overlay-live-only.patch`), without D3D12, low latency and frame generation (`settings_overlay_hide`) |
 
 ## Phase 3: native Metal (shared with other ReXGlue titles)
 | # | Item | Status | Notes |

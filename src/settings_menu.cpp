@@ -828,6 +828,10 @@ constexpr const char* kUpscalingValues[] = {"off", "off", "off", "ultra_quality"
 constexpr const char* kAntiAliasingLabels[] = {"OFF", "MSAA 2X", "FSR 3.1 NATIVE AA",
                                                "FSR ULTRA Q.", "FSR QUALITY", "FSR BALANCED",
                                                "FSR PERFORM."};
+#elif REX_PLATFORM_MAC
+// On a Mac (the Metal backend) the FSR choices are MetalFX: temporal anti-aliasing and its upscaler.
+constexpr const char* kAntiAliasingLabels[] = {"OFF", "MSAA 2X", "METALFX TAA", "METALFX ULTRA Q.",
+                                               "METALFX QUALITY", "METALFX BALANCED", "METALFX PERFORM."};
 #else
 // Built for Linux and the console, but not yet run on either.
 constexpr const char* kAntiAliasingLabels[] = {"OFF", "MSAA 2X", "FSR 3.1 (UNTESTED)",
@@ -910,7 +914,7 @@ struct MenuDef {
   int item_count;
 };
 
-const MenuDef kMenus[] = {
+MenuDef kMenus[] = {
     {"PM_MxTabDisplay", "DISPLAY", "MxDisplayMenu", kDisplayItems,
      int(sizeof(kDisplayItems) / sizeof(kDisplayItems[0]))},
     {"PM_MxTabPerf", "PERFORMANCE", "MxPerfMenu", kPerformanceItems,
@@ -927,6 +931,44 @@ bool RestartOnly(const char* option) {
   const rex::cvar::FlagEntry* info = rex::cvar::GetFlagInfo(option);
   return info && info->lifecycle == rex::cvar::Lifecycle::kRequiresRestart;
 }
+
+#if REX_PLATFORM_MAC
+// On macOS the pause menu has only what changes during play: the options read at start are the launcher's
+// (launcher/mac, or mcla.toml), and the rows for what a Mac doesn't have go (FSR 3.1 frame generation, NVIDIA
+// Reflex and AMD Anti-Lag 2, FSR's sharpening, which MetalFX doesn't take, single-tile rendering where it can't
+// be had). The menus' item lists are replaced
+// once, before the submenus are made, so every lookup by row index sees the same rows.
+bool ShownOnMac(const ItemDef& item) {
+  static constexpr const char* kNotOnMac[] = {"frame_generation", "low_latency", "temporal_aa_sharpness"};
+  for (const char* option : kNotOnMac) {
+    if (std::strcmp(item.option, option) == 0) return false;
+  }
+  // A row that could only say "not available" (the EDRAM here can't hold the scene in one tile).
+  if (std::strcmp(item.option, "mcla_single_tile") == 0 && !MclaSingleTileAvailable()) return false;
+  return !RestartOnly(item.option);
+}
+void FilterMenusForMac() {
+  static std::vector<ItemDef> filtered[kMenuCount];
+  for (int menu = 0; menu < kMenuCount; ++menu) {
+    filtered[menu].clear();
+    std::string left_out;
+    for (int i = 0; i < kMenus[menu].item_count; ++i) {
+      if (ShownOnMac(kMenus[menu].items[i])) {
+        filtered[menu].push_back(kMenus[menu].items[i]);
+      } else {
+        left_out += left_out.empty() ? "" : ", ";
+        left_out += kMenus[menu].items[i].option;
+      }
+    }
+    if (!left_out.empty()) {
+      REXLOG_INFO("settings menu: '{}' without {} (restart-only: set in the launcher; or not on a Mac)",
+                  kMenus[menu].label, left_out);
+    }
+    kMenus[menu].items = filtered[menu].data();
+    kMenus[menu].item_count = int(filtered[menu].size());
+  }
+}
+#endif
 
 // A restart-only row says "(NEXT START)" (level 0), "(RESTART)" (1) or "(R)" (2), always,
 // whatever the option's value: the game scales the whole menu
@@ -1909,6 +1951,10 @@ void CreateSubmenus() {
   if (!settings) {
     return;
   }
+#if REX_PLATFORM_MAC
+  static std::once_flag filtered;
+  std::call_once(filtered, FilterMenusForMac);
+#endif
   for (int menu = 0; menu < kMenuCount; ++menu) {
     const MenuDef& def = kMenus[menu];
 

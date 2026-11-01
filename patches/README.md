@@ -98,6 +98,7 @@ git apply ../../patches/rexglue-macos-audio-threads.patch
 git apply ../../patches/rexglue-ppc-barriers-arm64.patch
 git apply ../../patches/rexglue-fence-hook.patch
 git apply ../../patches/rexglue-metal-backend.patch
+git apply ../../patches/rexglue-settings-overlay-live-only.patch
 ```
 
 The first was several files at first; they are combined now because several touch the same build files and would not apply independently. The second goes on top of the first (both change `src/graphics/vulkan/command_processor.cpp`). The build scripts apply all of them, and add the second and the ones after the FFmpeg patch to an SDK checkout that was patched before they existed. Those later patches go on in the order listed, as several change neighbouring lines.
@@ -2190,3 +2191,13 @@ SPIR-V translator and SPIRV-Cross come with it); CMake stops with a message othe
 | `REXGLUE_USE_METAL` | `CMakeLists.txt`, `src/graphics/CMakeLists.txt` | macOS builds |
 | Backend `metal` in the plugin's factory | `src/graphics/plugin_main.cpp` | macOS builds |
 | Provider, presenter, graphics system, command processor; shader translation and compiles; zero-copy shared memory | `src/graphics/metal/` (new) | Metal |
+
+## rexglue-settings-overlay-live-only.patch
+
+macOS fork. The settings overlay (F4) lists only the settings that take effect while the game runs: those whose
+lifecycle is `kHotReload`, and the key bindings. Settings that need a restart (`kRequiresRestart`, `kInitOnly`)
+belong to the launcher (`launcher/mac`) or `mcla.toml`; `settings_overlay_live_only = false` lists all of them again.
+`settings_overlay_hide` (comma-separated categories, with those under them, or name prefixes) leaves out more; the
+game sets it on macOS to what a Mac doesn't have (`GPU/D3D12`, `low_latency`, `frame_generation`). The categories
+tree is built from the settings shown, so empty ones go too; the bottom bar says where the others are.
+

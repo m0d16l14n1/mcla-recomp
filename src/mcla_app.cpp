@@ -1087,6 +1087,8 @@ void MclaApp::ApplyPcDefaults() {
       // HDR output where the display can show EDR (the Metal backend; on MoltenVK the display's state isn't
       // read, so auto stays SDR there).
       {"hdr", "auto"},
+      // The F4 overlay without what a Mac doesn't have (Direct3D 12, Reflex and Anti-Lag 2, frame generation).
+      {"settings_overlay_hide", "GPU/D3D12,low_latency,frame_generation"},
       {"audio_thread_priority", "2"},
       {"audio_mixer_priority", "2"},
       {"audio_device_sample_frames", "256"},

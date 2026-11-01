@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,567 @@
+@@ -0,0 +1,570 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -171,7 +171,8 @@ new file mode 100644
 +REXCVAR_DEFINE_INT32(metal_cp_qos, 4, "GPU/Metal",
 +    "The command processor thread's QoS (0 unchanged, 1 background, 2 utility, 3 user initiated, 4 user interactive). "
 +    "It paces the frame: at the default QoS it shares the performance cores with everything else and moves to "
-+    "the efficiency cores under load (user interactive: about 10% more frames on a busy M4)");
++    "the efficiency cores under load (user interactive: about 10% more frames on a busy M4)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_taa_upscale, true, "GPU/Metal",
 +                    "MetalFX upscaling with temporal_aa_upscale above 1 (the game's FSR upscaling setting): the scene drawn "
 +                    "into the render-size corner of its targets and stretched back by its resolves");
@@ -187,7 +188,8 @@ new file mode 100644
 +
 +REXCVAR_DEFINE_BOOL(metal_shared_memory_zero_copy, true, "GPU/Metal",
 +                    "Make the guest's physical memory (512 MB) a Metal buffer without copying it (Apple "
-+                    "Silicon's unified memory), and check once that the GPU reads what the CPU sees. Restart");
++                    "Silicon's unified memory), and check once that the GPU reads what the CPU sees. Restart")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +
 +namespace rex::graphics::metal {
 +
@@ -291,7 +293,8 @@ new file mode 100644
 +}
 +
 +REXCVAR_DEFINE_BOOL(metal_shader_storage, true, "GPU/Metal",
-+                    "Keep the shaders translated in a run and translate them on worker threads before the next starts");
++                    "Keep the shaders translated in a run and translate them on worker threads before the next starts")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +
 +void MetalCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
 +                                                    bool blocking) {
@@ -1081,7 +1084,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2815 @@
+@@ -0,0 +1,2817 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1128,10 +1131,12 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_texture_watches, true, "GPU/Metal",
 +    "Watch the guest memory of loaded textures for CPU writes and hash a texture again only after one (false: every frame)");
 +REXCVAR_DEFINE_BOOL(metal_msaa, false, "GPU/Metal",
-+    "MSAA 2x and 4x surfaces as Metal multisample textures (shaded once a pixel) instead of 1x2 and 2x2 supersampling");
++    "MSAA 2x and 4x surfaces as Metal multisample textures (shaded once a pixel) instead of 1x2 and 2x2 supersampling")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_4x_as_1x, true, "GPU/Metal",
 +    "MSAA 4x surfaces (the reflections) drawn at one sample a pixel instead of 2x2 supersampling: a quarter of their "
-+    "pixel work, without their anti-aliasing (+5% FPS with MSAA 2x, +16% with MetalFX Performance)");
++    "pixel work, without their anti-aliasing (+5% FPS with MSAA 2x, +16% with MetalFX Performance)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_pass_merge, true, "GPU/Metal",
 +    "A draw that uses some of the open render pass's targets (no depth, or fewer colors) goes into that pass instead of starting its own");
 +REXCVAR_DEFINE_BOOL(metal_compose_resolves, true, "GPU/Metal",
@@ -5827,7 +5832,7 @@ diff --git a/src/graphics/metal/metal_shaders.mm b/src/graphics/metal/metal_shad
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shaders.mm
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,185 @@
 +/**
 + * @file        graphics/metal/metal_shaders.mm
 + * @brief       Guest shaders to Metal (see metal_shaders.h)
@@ -5855,7 +5860,8 @@ new file mode 100644
 +                      "(with the compiler's message), or of all of them with metal_shader_dump_all");
 +REXCVAR_DEFINE_INT32(metal_shader_math, 0, "GPU/Metal",
 +                     "Guest shader float math: 0 safe (as the guest), 1 relaxed (reassociation; NaN and infinity kept), "
-+                     "2 fast (also no NaN or infinity, fast library functions)");
++                     "2 fast (also no NaN or infinity, fast library functions)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_shader_dump_all, false, "GPU/Metal",
 +                    "Development: with metal_shader_dump_dir, write the MSL of every guest shader");
 +

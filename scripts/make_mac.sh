@@ -148,6 +148,7 @@ rexglue-macos-audio-threads.patch src/audio/audio_thread.cpp ApplyAppleAudioSche
 rexglue-ppc-barriers-arm64.patch src/codegen/builders/system.cpp REX_LWSYNC
 rexglue-fence-hook.patch include/rex/graphics/command_processor.h WriteFenceValue
 rexglue-metal-backend.patch src/graphics/plugin_main.cpp CreateMetalGraphicsSystem
+rexglue-settings-overlay-live-only.patch src/ui/overlay/settings_overlay.cpp settings_overlay_live_only
 MAC
 
 # ---------------------------------------------------------------------------
