@@ -41,7 +41,7 @@ diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
  if(REXGLUE_USE_D3D12)
      list(APPEND REXGPU_XENOS_SOURCES
          ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
-@@ -148,6 +164,21 @@
+@@ -148,6 +164,22 @@
      xxHash::xxhash
  )
  
@@ -55,6 +55,7 @@ diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 +    target_compile_definitions(rexgpu-xenos PRIVATE REX_HAS_METAL=1)
 +    target_link_libraries(rexgpu-xenos PRIVATE
 +        "-framework Metal"
++        "-framework MetalFX"
 +        "-framework QuartzCore"
 +        "-framework Foundation"
 +    )
@@ -129,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,450 @@
+@@ -0,0 +1,465 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -232,7 +233,12 @@ new file mode 100644
 +  draw_ = std::make_unique<MetalDraw>(device_, command_queue_, shared_memory_buffer_, *memory_,
 +      *register_file_, *shader_compiler_, graphics_system_->edram_tile_count());
 +  if (!draw_->Initialize()) return false;
-+  REXGPU_WARN("Metal M1: experimental native drawing enabled (no MSAA or EDRAM ownership transfers yet)");
++  // The scene's draws jittered for temporal AA (Vulkan's convention: the SPIR-V NDC is +y down, and the Metal
++  // system constants flip it with the rest).
++  draw_->taa_jitter_ = [this](const uint32_t extent[2], float ndc_offset[3]) {
++    TaaJitterNdcOffset(register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type, false, extent, ndc_offset);
++  };
++  REXGPU_INFO("Metal backend: native drawing (in development; MSAA is drawn as supersampling)");
 +  stats_since_ms_ = chrono::Clock::QueryHostUptimeMillis();
 +  return true;
 +}
@@ -348,6 +354,9 @@ new file mode 100644
 +  return shader_ptr;
 +}
 +
++bool MetalCommandProcessor::TaaReady() const { return draw_ && draw_->TaaReady(); }
++bool MetalCommandProcessor::TaaCheckAvailable() { return device_ && MetalDraw::TaaSupported(device_); }
++
 +bool MetalCommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim_type,
 +                                      [[maybe_unused]] uint32_t index_count,
 +                                      [[maybe_unused]] IndexBufferInfo* index_buffer_info,
@@ -359,6 +368,13 @@ new file mode 100644
 +  ++stats_draws_;
 +  if (int32_t us = REXCVAR_GET(metal_draw_spin_us)) SpinMicroseconds(us);
 +  if (!REXCVAR_GET(metal_draw)) return true;
++  // Temporal AA: the anti-aliasing pass before the draw that reads the scene (the game's motion blur).
++  if (taa_pending_ && active_pixel_shader() && draw_) {
++    MetalDraw::TaaInputs inputs{&taa_vector_constants_, sizeof(taa_vector_constants_), {}, taa_camera_.reset};
++    TaaFsrJitter(inputs.jitter);
++    taa_frame_.status = draw_->TaaRun(inputs);
++    if (taa_frame_.status == '+') taa_frame_.done = true;
++  }
 +  return draw_ ? draw_->Draw(active_vertex_shader(), active_pixel_shader()) : false;
 +}
 +
@@ -584,9 +600,10 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,295 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
++#include <functional>
 +#include "metal_shaders.h"
 +#include <rex/graphics/pipeline/texture/info.h>
 +#include <rex/graphics/pipeline/texture/util.h>
@@ -612,6 +629,19 @@ new file mode 100644
 +  // false: the caller stores it.
 +  bool WriteFence(uint32_t address, uint32_t value);
 +  void EndFrame();
++  // Temporal anti-aliasing with MetalFX (the SDK's temporal_aa, which the fork's mcla_anti_aliasing = fsr
++  // turns on): the jitter of the scene's draws (the command processor's TaaJitterNdcOffset), and the pass
++  // before the game's motion blur draw. TaaRun returns the status for temporal_aa_debug 4 ('+' when it ran).
++  std::function<void(const uint32_t extent[2], float ndc_offset[3])> taa_jitter_;
++  struct TaaInputs {
++    const void* vector_constants;  // CommandProcessor::TaaVectorConstants (size and stencil component set here)
++    size_t vector_constants_size;
++    float jitter[2];  // host pixels, +y down (FSR's convention)
++    bool reset;
++  };
++  static bool TaaSupported(id<MTLDevice> device);
++  bool TaaReady() const { return taa_scaler_ != nil; }
++  char TaaRun(TaaInputs& inputs);
 +  // Shader constant registers [first, end) were written (float, fetch, bool and loop constants).
 +  void ConstantsWritten(uint32_t first, uint32_t end) {
 +    if (first < XE_GPU_REG_SHADER_CONSTANT_256_X && end > XE_GPU_REG_SHADER_CONSTANT_000_X) ++constant_generation_[0];
@@ -762,7 +792,16 @@ new file mode 100644
 +  uint64_t persistent_full_frame_ = 0;
 +  uint64_t snapshot_persistent_hits_ = 0;
 +  static void TextureWritten(const std::unique_lock<std::recursive_mutex>&, void*, void* data, uint64_t, bool);
-+  uint64_t passes_ = 0, passes_merged_ = 0, passes_resynced_ = 0;
++  uint64_t passes_ = 0, passes_merged_ = 0, passes_resynced_ = 0, passes_split_for_textures_ = 0;
++  // Passes given a command buffer of their own for texture work while open (metal_texture_work_before_pass):
++  // pre_commands_ holds what came before the pass, still open; pre_encoder_ is the pass it was made for.
++  id<MTLCommandBuffer> pre_commands_ = nil;
++  void* pre_encoder_ = nullptr;
++  uint32_t frame_passes_ = 0, open_pass_ordinal_ = 0;
++  std::vector<uint8_t> split_last_ = std::vector<uint8_t>(512, 0), split_now_ = std::vector<uint8_t>(512, 0);
++  uint64_t texture_work_before_pass_ = 0;
++  void CommitBefore();
++  id<MTLCommandBuffer> TextureWorkCommands();
 +  uint64_t texture_hashed_ = 0, texture_watch_hits_ = 0, snapshot_changed_ = 0, snapshot_changed_bytes_ = 0;
 +  uint64_t frame_ = 1;
 +  std::unordered_map<std::string, id<MTLSamplerState>> samplers_;
@@ -835,6 +874,13 @@ new file mode 100644
 +  void ClearRect(id<MTLTexture> target, bool depth, std::array<float, 4> color, double depth_value, uint32_t stencil,
 +                 uint32_t x, uint32_t y0, uint32_t width, uint32_t y1);
 +  id<MTLLibrary> helper_library_ = nil;
++  id taa_scaler_ = nil;  // id<MTLFXTemporalScaler>
++  uint32_t taa_width_ = 0, taa_height_ = 0;
++  id<MTLTexture> taa_motion_ = nil, taa_depth_ = nil, taa_output_ = nil;
++  id<MTLComputePipelineState> taa_vectors_pipeline_ = nil;
++  id<MTLRenderPipelineState> taa_depth_pipeline_ = nil;
++  id<MTLDepthStencilState> taa_depth_state_ = nil;
++  bool taa_failed_ = false;
 +  id<MTLDepthStencilState> transfer_depth_state_ = nil;
 +  uint32_t ColorKind(xenos::ColorRenderTargetFormat format) const;
 +  uint32_t DepthKind() const;
@@ -854,7 +900,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2230 @@
+@@ -0,0 +1,2414 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -863,6 +909,7 @@ new file mode 100644
 +#include "metal_draw.h"
 +#include <thread>
 +#include "metal_resolve.h"
++#import <MetalFX/MetalFX.h>
 +#include <rex/logging.h>
 +#include <rex/system/xmemory.h>
 +#include <xxhash.h>
@@ -910,6 +957,9 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_transfers_in_pass, true, "GPU/Metal",
 +    "EDRAM transfers into a draw's targets are drawn in the draw's pass, not in passes of their own");
 +REXCVAR_DECLARE(bool, metal_texture_signs);
++REXCVAR_DEFINE_BOOL(metal_texture_work_before_pass, true, "GPU/Metal",
++    "A pass that needed texture loads or surfaces made from resolves while open last frame gets a command buffer of "
++    "its own, and that work goes into the one before it instead of ending the pass");
 +REXCVAR_DEFINE_BOOL(metal_clears_in_pass, true, "GPU/Metal",
 +    "A resolve's clear is drawn first in the next pass on its target (or is its load action), not in a pass of its own");
 +REXCVAR_DEFINE_BOOL(metal_texture_pool, true, "GPU/Metal",
@@ -1063,6 +1113,9 @@ new file mode 100644
 +}
 +void MetalDraw::EndEncoder() {
 +  if (encoder_) {
++    // The command buffer before a pass takes texture work only while that pass is open (a later encoder may get
++    // the same address).
++    if (pre_encoder_ == (__bridge void*)encoder_) pre_encoder_ = nullptr;
 +    [encoder_ endEncoding]; encoder_ = nil;
 +    bound_encoder_ = nullptr;  // A new encoder may be allocated at the same address.
 +    if (commands_ && DebugFrame() && REXCVAR_GET(metal_debug_profile)) ProfileCut(pass_label_, draws_ - pass_first_draw_);
@@ -1078,8 +1131,33 @@ new file mode 100644
 +  Submit(false);
 +  commands_ = [queue_ commandBuffer];
 +}
++void MetalDraw::CommitBefore() {
++  if (!pre_commands_) return;
++  auto errors = gpu_errors_; auto gpu_us = gpu_us_;
++  [pre_commands_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
++    if (done.GPUEndTime > done.GPUStartTime) gpu_us->fetch_add(uint64_t((done.GPUEndTime - done.GPUStartTime) * 1e6));
++    if (done.status == MTLCommandBufferStatusError && errors->fetch_add(1) < 16)
++      REXGPU_ERROR("Metal draw command buffer failed: {}", done.error.localizedDescription.UTF8String);
++  }];
++  [pre_commands_ commit];
++  last_committed_ = pre_commands_; pre_commands_ = nil; pre_encoder_ = nullptr;
++}
++id<MTLCommandBuffer> MetalDraw::TextureWorkCommands() {
++  // Texture loads and surfaces made from resolves are compute and blit work, which cannot run in a render pass.
++  // In a pass that has a command buffer of its own, it goes into the one before (which runs first); otherwise
++  // it ends the pass, and the next frame's pass of the same ordinal gets a command buffer of its own.
++  if (encoder_ && pre_commands_ && pre_encoder_ == (__bridge void*)encoder_) { ++texture_work_before_pass_; return pre_commands_; }
++  if (encoder_) {
++    ++passes_split_for_textures_;
++    if (open_pass_ordinal_ < split_now_.size()) split_now_[open_pass_ordinal_] = 1;
++  }
++  EndEncoder();
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  return commands_;
++}
 +void MetalDraw::Submit(bool wait) {
 +  EndEncoder();
++  CommitBefore();
 +  if (commands_) {
 +    auto errors = gpu_errors_; auto gpu_us = gpu_us_;
 +    [commands_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
@@ -1121,6 +1199,7 @@ new file mode 100644
 +  // The frame goes to the GPU without waiting for it; the next one is encoded meanwhile, into the other
 +  // snapshot buffer, once the frame before last (its previous user) is done.
 +  Submit(false);
++  split_last_.swap(split_now_); std::fill(split_now_.begin(), split_now_.end(), 0); frame_passes_ = 0;
 +  frame_done_[slot_] = last_committed_;
 +  slot_ ^= 1;
 +  ring_base_ = slot_ * kSnapshotRing;
@@ -1153,11 +1232,11 @@ new file mode 100644
 +    snapshot_changed_ = 0; snapshot_changed_bytes_ = 0;
 +    REXGPU_INFO("Metal frame time: {:.1f} ms a frame, GPU busy {:.1f} ms, CPU waiting for the GPU {:.1f} ms; {:.1f} texture loads ({:.1f} made from resolves, {:.0f} rows loaded for them), {:.1f} resolve textures reused, "
 +        "{:.1f} MB of vertices and indices hashed and {:.1f} MB copied ({:.0f} kept from earlier frames), {:.1f} MB of textures hashed ({:.1f} skipped by watches), "
-+        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers) a frame; {} pipelines created ({:.1f} ms)",
++        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers, {:.1f} ended for texture loads, {:.1f} loads before their pass) a frame; {} pipelines created ({:.1f} ms)",
 +        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_ / 150.0, textures_composed_ / 150.0, texture_rows_loaded_ / 150.0, textures_reused_ / 150.0,
 +        snapshot_hashed_ / 1048576.0 / 150, snapshot_copied_ / 1048576.0 / 150, snapshot_persistent_hits_ / 150.0, texture_hashed_ / 1048576.0 / 150,
-+        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0);
-+    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; pipelines_created_ = 0; pipeline_us_ = 0;
++        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0);
++    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0;
 +    stats_frames_ = 0; wait_us_ = 0; texture_loads_ = 0; textures_composed_ = 0; texture_rows_loaded_ = 0; textures_reused_ = 0; snapshot_hashed_ = 0; snapshot_copied_ = 0; snapshot_persistent_hits_ = 0; texture_hashed_ = 0; texture_watch_hits_ = 0; stats_start_ = std::chrono::steady_clock::now();
 +  }
 +  if (DebugFrame() && !debug_snapshots_.empty()) {
@@ -1540,8 +1619,23 @@ new file mode 100644
 +        pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionLoad;
 +        pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
 +      }
++      open_pass_ordinal_ = frame_passes_++;
++      bool split = false;
++      if (REXCVAR_GET(metal_texture_work_before_pass) && open_pass_ordinal_ < split_last_.size() &&
++          split_last_[open_pass_ordinal_]) {
++        split = true;
++        // This pass needed texture work while open last frame: everything before it goes into a command buffer
++        // that stays open for that work until the pass ends.
++        CommitBefore();
++        pre_commands_ = commands_;
++        commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws";
++      }
 +      if (!pending_clears_.empty()) EncodeClearsInPass(pass);
 +      else encoder_ = [commands_ renderCommandEncoderWithDescriptor:pass];
++      // Only the pass split off just now takes texture work into the command buffer before it: a later pass's
++      // work there would run before what was encoded between the two (the resolves it reads: the minimap
++      // flickered every other frame).
++      pre_encoder_ = split ? (__bridge void*)encoder_ : nullptr;
 +      ++passes_;
 +      if (!pending_transfers_.empty()) EncodeTransfersInPass();
 +      if (REXCVAR_GET(metal_debug_labels)) {
@@ -1665,7 +1759,14 @@ new file mode 100644
 +    [encoder_ setCullMode:!polygonal ? MTLCullModeNone : raster.cull_front ? MTLCullModeFront : raster.cull_back ? MTLCullModeBack : MTLCullModeNone];
 +    [encoder_ setBlendColorRed:regs_.Get<float>(XE_GPU_REG_RB_BLEND_RED) green:regs_.Get<float>(XE_GPU_REG_RB_BLEND_GREEN)
 +                        blue:regs_.Get<float>(XE_GPU_REG_RB_BLEND_BLUE) alpha:regs_.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)];
-+    BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data());
++    if (taa_jitter_) {
++      // Temporal anti-aliasing: the scene's draws moved by this frame's jitter (in their NDC offset only).
++      draw_util::ViewportInfo jittered = viewport;
++      taa_jitter_(viewport.xy_extent, jittered.ndc_offset);
++      BuildMetalSystemConstants(regs_, primitive, jittered, system_bytes_, signs_.data());
++    } else {
++      BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data());
++    }
 +    const auto& system = system_bytes_;
 +    debug_draw_log_ = DebugFrame() && primitive.host_draw_vertex_count <= 6;
 +    Bind(*vs, vt, true, system); if (ps) Bind(*ps, pt, false, system);
@@ -2056,12 +2157,11 @@ new file mode 100644
 +  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +  id<MTLTexture> texture = [device_ newTextureWithDescriptor:desc];
 +  if (!texture) return nil;
-+  EndEncoder();
-+  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  id<MTLCommandBuffer> cb = TextureWorkCommands();
 +  struct Load { id<MTLBuffer> staging; size_t offset; uint32_t y0, rows; };
 +  std::vector<Load> loads;
 +  if (!gaps.empty()) {
-+    auto compute = [commands_ computeCommandEncoder];
++    auto compute = [cb computeCommandEncoder];
 +    if (REXCVAR_GET(metal_debug_labels))
 +      compute.label = [NSString stringWithFormat:@"compose %ux%u: rows from memory", width, height];
 +    [compute setComputePipelineState:load_texture_];
@@ -2083,7 +2183,7 @@ new file mode 100644
 +    }
 +    [compute endEncoding];
 +  }
-+  auto blit = [commands_ blitCommandEncoder];
++  auto blit = [cb blitCommandEncoder];
 +  if (REXCVAR_GET(metal_debug_labels))
 +    blit.label = [NSString stringWithFormat:@"compose %ux%u from %zu resolves", width, height, pieces.size()];
 +  for (auto& l : loads)
@@ -2305,9 +2405,8 @@ new file mode 100644
 +              fetch.endianness == xenos::Endian::k8in16 ? 1u : fetch.endianness == xenos::Endian::k8in32 ? 3u :
 +                  fetch.endianness == xenos::Endian::k16in32 ? 2u : 0u,
 +              bw, bh, convert};
-+          EndEncoder();
-+          if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
-+          auto compute = [commands_ computeCommandEncoder];
++          id<MTLCommandBuffer> cb = TextureWorkCommands();
++          auto compute = [cb computeCommandEncoder];
 +          if (REXCVAR_GET(metal_debug_labels))
 +            compute.label = [NSString stringWithFormat:@"texture load fmt %u %ux%u", uint32_t(format), bw, bh];
 +          [compute setComputePipelineState:load_texture_];
@@ -2315,7 +2414,7 @@ new file mode 100644
 +          [compute setBytes:&c length:sizeof(c) atIndex:2];
 +          [compute dispatchThreads:MTLSizeMake(bw, bh, layers) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 +          [compute endEncoding];
-+          auto blit = [commands_ blitCommandEncoder];
++          auto blit = [cb blitCommandEncoder];
 +          for (uint32_t layer = 0; layer < layers; ++layer)
 +            [blit copyFromBuffer:staging sourceOffset:staging_offset + layer * image sourceBytesPerRow:bw * out_bpb sourceBytesPerImage:image
 +                sourceSize:MTLSizeMake(w, h, 1) toTexture:texture destinationSlice:layer destinationLevel:0
@@ -2971,6 +3070,136 @@ new file mode 100644
 +  bound_encoder_ = nullptr;  // the transfers' fragment bytes are not the draw's
 +}
 +
++bool MetalDraw::TaaSupported(id<MTLDevice> device) {
++  if (@available(macOS 13.0, *)) return [MTLFXTemporalScalerDescriptor supportsDevice:device];
++  return false;
++}
++
++char MetalDraw::TaaRun(TaaInputs& inputs) {
++  if (@available(macOS 13.0, *)) {
++  @autoreleasepool {
++    if (taa_failed_ || !helper_library_) return 'x';
++    // The motion blur's inputs: the scene (fetch 0, 16_16_16_16_EXPAND), the stencil view of the depth resolve
++    // (fetch 1, 8_8_8_8) and the depth (fetch 2, 24_8_FLOAT), as this backend made them.
++    MetalTextureBinding scene_binding{0, 0, xenos::FetchOpDimension::k2D, false};
++    MetalTextureBinding stencil_binding{0, 1, xenos::FetchOpDimension::k2D, false};
++    MetalTextureBinding depth_binding{0, 2, xenos::FetchOpDimension::k2D, false};
++    id<MTLTexture> scene = Texture(scene_binding), stencil = Texture(stencil_binding), depth = Texture(depth_binding);
++    if (!scene || !stencil || !depth) return 't';
++    auto root = [](id<MTLTexture> t) { while (t.parentTexture) t = t.parentTexture; return t; };
++    id<MTLTexture> scene_base = root(scene), depth_base = root(depth);
++    const uint32_t width = uint32_t(scene_base.width), height = uint32_t(scene_base.height);
++    if (scene_base.pixelFormat != MTLPixelFormatRGBA16Float || depth_base.pixelFormat != MTLPixelFormatR32Float ||
++        depth_base.width != width || depth_base.height != height || stencil.width != width || stencil.height != height)
++      return 'r';
++    if (!taa_vectors_pipeline_) {
++      NSError* error = nil;
++      taa_vectors_pipeline_ = [device_ newComputePipelineStateWithFunction:
++          [helper_library_ newFunctionWithName:@"taa_motion_vectors"] error:&error];
++      auto pd = [MTLRenderPipelineDescriptor new];
++      pd.vertexFunction = [helper_library_ newFunctionWithName:@"transfer_vs"];
++      pd.fragmentFunction = [helper_library_ newFunctionWithName:@"taa_depth_fs"];
++      pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
++      taa_depth_pipeline_ = [device_ newRenderPipelineStateWithDescriptor:pd error:&error];
++      auto ds = [MTLDepthStencilDescriptor new];
++      ds.depthCompareFunction = MTLCompareFunctionAlways; ds.depthWriteEnabled = YES;
++      taa_depth_state_ = [device_ newDepthStencilStateWithDescriptor:ds];
++      if (!taa_vectors_pipeline_ || !taa_depth_pipeline_) {
++        REXGPU_ERROR("Metal temporal AA: pipelines failed: {}", error ? error.localizedDescription.UTF8String : "?");
++        taa_failed_ = true;
++        return 'x';
++      }
++    }
++    if (!taa_scaler_ || taa_width_ != width || taa_height_ != height) {
++      // MetalFX's temporal scaler at native size: anti-aliasing, not upscaling (the scene is drawn at the
++      // output size; with the game's MSAA off it is drawn in one EDRAM tile).
++      auto desc = [MTLFXTemporalScalerDescriptor new];
++      desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
++      desc.depthTextureFormat = MTLPixelFormatDepth32Float;
++      desc.motionTextureFormat = MTLPixelFormatRG16Float;
++      desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
++      desc.inputWidth = desc.outputWidth = width;
++      desc.inputHeight = desc.outputHeight = height;
++      desc.autoExposureEnabled = YES;  // the scene before the tone map
++      id<MTLFXTemporalScaler> scaler = [desc newTemporalScalerWithDevice:device_];
++      if (!scaler) {
++        REXGPU_ERROR("Metal temporal AA: no MetalFX temporal scaler for {}x{}", width, height);
++        taa_failed_ = true;
++        return 'x';
++      }
++      scaler.depthReversed = YES;  // 1 near, 0 far
++      auto texture = [&](MTLPixelFormat format, MTLTextureUsage usage) {
++        auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
++        d.storageMode = MTLStorageModePrivate; d.usage = usage;
++        return [device_ newTextureWithDescriptor:d];
++      };
++      taa_motion_ = texture(MTLPixelFormatRG16Float, scaler.motionTextureUsage | MTLTextureUsageShaderWrite);
++      taa_depth_ = texture(MTLPixelFormatDepth32Float, scaler.depthTextureUsage | MTLTextureUsageRenderTarget);
++      taa_output_ = texture(MTLPixelFormatRGBA16Float, scaler.outputTextureUsage);
++      if (!taa_motion_ || !taa_depth_ || !taa_output_) { taa_failed_ = true; return 'x'; }
++      taa_scaler_ = scaler; taa_width_ = width; taa_height_ = height;
++      REXGPU_INFO("Metal temporal AA: MetalFX temporal scaler ready for {}x{}", width, height);
++      inputs.reset = true;
++    }
++    id<MTLFXTemporalScaler> scaler = taa_scaler_;
++    // The stencil is the stencil view's first byte (red): where the fetch constant's swizzle puts it.
++    auto stencil_fetch = regs_.GetTextureFetch(1);
++    auto* constants = static_cast<float*>(const_cast<void*>(inputs.vector_constants));
++    float* size = constants + 24 * 16;
++    float* jitter = size + 4;
++    size[0] = float(width); size[1] = float(height);
++    size[2] = float(width) / float(regs_.GetTextureFetch(0).size_2d.width + 1);
++    size[3] = float(height) / float(regs_.GetTextureFetch(0).size_2d.height + 1);
++    jitter[2] = 0.0f;
++    for (uint32_t i = 0; i < 4; ++i)
++      if (((stencil_fetch.swizzle >> (3 * i)) & 7) == xenos::XE_GPU_TEXTURE_SWIZZLE_R) { jitter[2] = float(i); break; }
++
++    id<MTLCommandBuffer> cb = TextureWorkCommands();
++    auto compute = [cb computeCommandEncoder];
++    if (REXCVAR_GET(metal_debug_labels)) compute.label = @"temporal AA motion vectors";
++    [compute setComputePipelineState:taa_vectors_pipeline_];
++    [compute setBytes:inputs.vector_constants length:inputs.vector_constants_size atIndex:0];
++    [compute setTexture:depth atIndex:0]; [compute setTexture:stencil atIndex:1]; [compute setTexture:taa_motion_ atIndex:2];
++    [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++    [compute endEncoding];
++    {
++      auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
++      pass.depthAttachment.texture = taa_depth_;
++      pass.depthAttachment.loadAction = MTLLoadActionDontCare;
++      pass.depthAttachment.storeAction = MTLStoreActionStore;
++      auto encoder = [cb renderCommandEncoderWithDescriptor:pass];
++      if (REXCVAR_GET(metal_debug_labels)) encoder.label = @"temporal AA depth";
++      [encoder setRenderPipelineState:taa_depth_pipeline_];
++      [encoder setDepthStencilState:taa_depth_state_];
++      [encoder setFragmentTexture:depth atIndex:0];
++      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++      [encoder endEncoding];
++    }
++    // MetalFX reads 2D textures: a 2D view of the scene's first layer.
++    id<MTLTexture> color = scene_base.textureType == MTLTextureType2D ? scene_base
++        : [scene_base newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float textureType:MTLTextureType2D
++                                             levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++    scaler.colorTexture = color;
++    scaler.depthTexture = taa_depth_;
++    scaler.motionTexture = taa_motion_;
++    scaler.outputTexture = taa_output_;
++    scaler.inputContentWidth = width; scaler.inputContentHeight = height;
++    scaler.jitterOffsetX = inputs.jitter[0]; scaler.jitterOffsetY = inputs.jitter[1];
++    scaler.motionVectorScaleX = 1.0f; scaler.motionVectorScaleY = 1.0f;
++    scaler.reset = inputs.reset;
++    [scaler encodeToCommandBuffer:cb];
++    // The anti-aliased scene in place of the scene, for the motion blur and anything after it.
++    auto blit = [cb blitCommandEncoder];
++    [blit copyFromTexture:taa_output_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
++        sourceSize:MTLSizeMake(width, height, 1) toTexture:scene_base destinationSlice:0 destinationLevel:0
++        destinationOrigin:MTLOriginMake(0, 0, 0)];
++    [blit endEncoding];
++    return '+';
++  }
++  }
++  return 'x';
++}
++
 +void MetalDraw::DumpDepth(id<MTLTexture> texture, const std::string& name) {
 +  FlushClears(texture);
 +  const auto dir = REXCVAR_GET(metal_debug_dir);
@@ -3071,6 +3300,7 @@ new file mode 100644
 +  struct { uint32_t size[2]; uint32_t mode; } c{{uint32_t(std::min(source.width, destination.width)),
 +      uint32_t(std::min(source.height, destination.height))}, gamma && REXCVAR_GET(metal_gamma_ramp) ? (pwl ? 2u : 1u) : 0u};
 +  EndEncoder();
++  CommitBefore();
 +  if (!commands_) commands_ = [queue_ commandBuffer];
 +  auto commands = commands_; commands.label = @"Xenos front buffer";
 +  commands_ = nil;
@@ -3089,7 +3319,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,197 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -3250,6 +3480,10 @@ new file mode 100644
 +  // The Metal shader storage: the microcode and modifications of every shader translated before, warmed up
 +  // (translated and compiled on worker threads) before the title starts.
 +  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id, bool blocking) override;
++  // Temporal anti-aliasing with MetalFX's temporal scaler (the SDK's temporal_aa: jitter, motion vectors from
++  // the game's motion blur constants), at native size.
++  bool TaaReady() const override;
++  bool TaaCheckAvailable() override;
 +
 + private:
 +  // Starts the translation and compile of the draw's shaders (M1: coverage of the shader path).
@@ -3578,7 +3812,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,372 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -3916,6 +4150,39 @@ new file mode 100644
 +CLEAR_INTO_COLOR(1)
 +CLEAR_INTO_COLOR(2)
 +CLEAR_INTO_COLOR(3)
++// Temporal anti-aliasing (MetalFX, at Midnight Club's motion blur draw): motion vectors from the game's own
++// reprojection (taa_motion_vectors_mcla.cs.xesl of rexglue-temporal-aa.patch, the same maths): per pixel, the
++// unjittered centre and the depth (1 near, 0 far) make the clip position, which the matrix of the pixel's
++// vehicle ID (the stencil >> 2) takes to the previous frame's guest pixels. Previous minus current, in pixels.
++struct TaaMvConstants { float4 previous[96]; float4 size; float4 jitter; };
++kernel void taa_motion_vectors(constant TaaMvConstants& c [[buffer(0)]],
++    texture2d_array<float, access::read> depth [[texture(0)]], texture2d_array<float, access::read> stencil [[texture(1)]],
++    texture2d<float, access::write> dest [[texture(2)]], uint2 p [[thread_position_in_grid]]) {
++  if (p.x >= uint(c.size.x) || p.y >= uint(c.size.y)) return;
++  float d = depth.read(p, 0).x;
++  float s = stencil.read(p, 0)[uint(c.jitter.z)];
++  uint id = uint(s * 255.0f + 0.5f) >> 2u;
++  if (id >= 24u) id = 0u;
++  float2 position = float2(p) + 0.5f - c.jitter.xy;
++  float2 uv = position / c.size.xy;
++  float4 clip = float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f - d, 1.0f);
++  uint row = id * 4u;
++  float4 previous = clip.x * c.previous[row] + clip.y * c.previous[row + 1u] + clip.z * c.previous[row + 2u] +
++                    clip.w * c.previous[row + 3u];
++  float2 motion = float2(0.0f);
++  if (abs(previous.w) > 1.0e-20f) {
++    motion = previous.xy / previous.w * c.size.zw - position;
++    if ((as_type<uint>(motion.x) & 0x7FFFFFFFu) > 0x7F800000u || (as_type<uint>(motion.y) & 0x7FFFFFFFu) > 0x7F800000u)
++      motion = float2(0.0f);
++    motion = clamp(motion, -c.size.xy, c.size.xy);
++  }
++  dest.write(float4(motion, 0.0f, 0.0f), p);
++}
++// The depth for MetalFX, which takes a depth format.
++struct TaaDepthOut { float depth [[depth(any)]]; };
++fragment TaaDepthOut taa_depth_fs(float4 position [[position]], texture2d_array<float, access::read> source [[texture(0)]]) {
++  TaaDepthOut o; o.depth = source.read(uint2(position.xy), 0).x; return o;
++}
 +)MSL";
 +}
 diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal/metal_shader_translator.cpp
@@ -4330,7 +4597,7 @@ diff --git a/src/graphics/metal/metal_shaders.mm b/src/graphics/metal/metal_shad
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shaders.mm
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,184 @@
 +/**
 + * @file        graphics/metal/metal_shaders.mm
 + * @brief       Guest shaders to Metal (see metal_shaders.h)
@@ -4356,6 +4623,9 @@ new file mode 100644
 +REXCVAR_DEFINE_STRING(metal_shader_dump_dir, "", "GPU/Metal",
 +                      "Development: a folder to write the MSL of the guest shaders Metal could not compile "
 +                      "(with the compiler's message), or of all of them with metal_shader_dump_all");
++REXCVAR_DEFINE_INT32(metal_shader_math, 0, "GPU/Metal",
++                     "Guest shader float math: 0 safe (as the guest), 1 relaxed (reassociation; NaN and infinity kept), "
++                     "2 fast (also no NaN or infinity, fast library functions)");
 +REXCVAR_DEFINE_BOOL(metal_shader_dump_all, false, "GPU/Metal",
 +                    "Development: with metal_shader_dump_dir, write the MSL of every guest shader");
 +
@@ -4375,9 +4645,12 @@ new file mode 100644
 +    : device_(device), translator_(edram_tile_count), edram_tile_count_(edram_tile_count) {
 +  compile_options_ = [[MTLCompileOptions alloc] init];
 +  compile_options_.languageVersion = MTLLanguageVersion3_0;
-+  // The guest's float behaviour (no reassociation, NaN and infinity kept) over speed.
++  // The guest's float behaviour (no reassociation, NaN and infinity kept) over speed, unless
++  // metal_shader_math asks for relaxed (reassociation, NaN and infinity kept) or fast math.
 +  if (@available(macOS 15.0, *)) {
-+    compile_options_.mathMode = MTLMathModeSafe;
++    int32_t math = REXCVAR_GET(metal_shader_math);
++    compile_options_.mathMode = math >= 2 ? MTLMathModeFast : math == 1 ? MTLMathModeRelaxed : MTLMathModeSafe;
++    if (math >= 2) compile_options_.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast;
 +  } else {
 +#pragma clang diagnostic push
 +#pragma clang diagnostic ignored "-Wdeprecated-declarations"

@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 to 63 FPS** on a cool Mac (80 with anti-aliasing off); 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -50,7 +50,7 @@ bash scripts/play_mac.sh --mcla_gpu_backend=metal     # the native Metal backend
 | | |
 |---|---|
 | Macs | Apple Silicon (M1 and later), arm64 only. Intel Macs are not a target. |
-| Graphics | Vulkan through MoltenVK, or the native Metal backend. Planned: EDR (HDR) and MetalFX upscaling. |
+| Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR setting (`--mcla_anti_aliasing=fsr`) is MetalFX temporal anti-aliasing. Planned: EDR (HDR) and MetalFX upscaling. |
 | Input, audio | SDL3: Xbox and DualSense controllers, keyboard. |
 | Not on macOS | Direct3D 12, FSR 3.1 and frame generation, NVIDIA Reflex, AMD Anti-Lag 2, the Windows launcher and installer. |
 
@@ -71,12 +71,14 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_texture_pool=false` | Make a new texture for every resolve instead of reusing freed ones |
 | `--metal_fast_texture_frames=false` | Look every texture up again each frame instead of trusting its write watch |
 | `--metal_clears_in_pass=false` | Give each resolve's clear a render pass of its own instead of drawing it in the next pass |
+| `--metal_texture_work_before_pass=false` | End and reopen a render pass for a texture load a draw needs, instead of loading it in a command buffer before the pass |
 | `--metal_compose_columns=false` | Load a surface resolved in side-by-side pieces (the shadow atlas) from memory instead of making it from the pieces |
 | `--metal_constant_generations=false` | Compare all shader constants at every draw instead of only the blocks written since |
 | `--metal_cp_qos=0` | Leave the GPU command thread at the default QoS class (4: user interactive) |
 | `--mcla_fence_sleep_us=0` | Spin while the game waits for the GPU, as before |
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
 | `--metal_shader_storage=false` | No shader storage and warm-up at boot |
+| `--metal_shader_math=1` or `2` | Relaxed or fast math in the shader compiler (shifts the colour grading; for testing) |
 
 Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, texture loads, copies, transfers, render passes) and a `Metal command processor` line with the GPU command thread's CPU time. Diagnostics (frame dumps, GPU traces with `--metal_debug_labels=true`): [docs/metal-backend.md](docs/metal-backend.md).
 

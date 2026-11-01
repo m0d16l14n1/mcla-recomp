@@ -344,6 +344,36 @@ whose other rows hold an earlier depth resolve's bits, which only a load from me
 The Metal HUD, if `MetalForceHudEnabled` is set for the whole system, is loaded into the game whatever
 `MTL_HUD_ENABLED` says and costs the command processor 4 to 5%.
 
+**Eighth pass (2026-11-01): MetalFX temporal anti-aliasing, about 76 FPS** (`--mcla_anti_aliasing=fsr`, which
+on Metal means MetalFX; MSAA 2x stays the default).
+
+- *MetalFX temporal AA*: the SDK's temporal AA path (`temporal_aa.cpp`, written for FSR 3.1 on D3D12 and Vulkan)
+  picks the scene's draws and gives a sub-pixel jitter each frame; the Metal backend applies the jitter to the
+  viewport before the system constants are built (about 3,100 of 3,100 scene draws a frame), and at the end of
+  the scene runs `TaaRun`: a compute kernel makes motion vectors from depth and the previous and current camera
+  (`taa_motion_vectors`), the depth is copied to Depth32Float, an `MTLFXTemporalScaler` at native size (input
+  and output 1280x720, auto exposure, reversed depth) blends the frame with its history, and the result is
+  copied back into the scene's target. The scene is then drawn without supersampling, so: **76.5 FPS against
+  62.6 with MSAA 2x** (+22%), the command thread 8 against 10.5 ms. The still picture matches, and in motion
+  there are no trails; objects that move with the camera (the player's car) are a little softer than with MSAA,
+  since the motion vectors know only the camera's motion. The jitter keeps FSR's sign convention
+  (`temporal_aa_flip_jitter` flips it). Next: upscaling from below native (`temporal_aa_upscale` needs a
+  resolution scale in the Metal render targets) and MetalFX spatial upscaling in the presenter.
+- *Texture work before the pass* (`metal_texture_work_before_pass`): a texture load, a surface made from
+  resolves or the TAA run that a draw needs while a pass is open used to end the pass (compute and blit work
+  cannot run in a render pass) and reopen it, which stores and reloads its targets. The backend now remembers,
+  per pass of the frame, which passes were split that way, and at the same pass of the next frame opens a
+  separate command buffer before the pass; texture work for that pass is encoded there and committed first.
+  About 39 loads a frame then run before their pass, and about 5 passes a frame are still ended for texture
+  work. 62.5 against 61.6 FPS. A first version also put a
+  later pass's work in an earlier pass's buffer, ahead of the resolves it reads: the minimap showed stale tiles
+  every other frame. Only the pass split off just now takes work into its buffer.
+- *Shader math* (`metal_shader_math`: 0 safe, the default; 1 relaxed; 2 fast): relaxed and fast math in the
+  Metal compiler shift the colour grading (the sky and shadows go pink), and relaxed gained only 1% (68.1
+  against 67.3 FPS). Kept safe.
+- The stats line counts passes ended for texture work (`ended for texture loads`) and loads encoded before
+  their pass (`loads before their pass`).
+
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
 resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM. With it:
