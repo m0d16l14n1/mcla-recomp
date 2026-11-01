@@ -1,0 +1,51 @@
+--- a/resources/templates/codegen/pch_h.inja
++++ b/resources/templates/codegen/pch_h.inja
+@@ -144,6 +144,19 @@
+ #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
+ #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
+ 
++// PowerPC memory barriers. The guest's locks rely on them (a release is "lwsync; stw 0, lock"), and
++// ARM64 reorders loads and stores the way PowerPC does, so there they are real fences (dmb ish); x86
++// keeps its stores in order, and the recompiled code there stays as it was.
++#if defined(__aarch64__) || defined(_M_ARM64)
++#define REX_SYNC() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#define REX_LWSYNC() __atomic_thread_fence(__ATOMIC_ACQ_REL)
++#define REX_EIEIO() __atomic_thread_fence(__ATOMIC_SEQ_CST)
++#else
++#define REX_SYNC() ((void)0)
++#define REX_LWSYNC() ((void)0)
++#define REX_EIEIO() ((void)0)
++#endif
++
+ #define REX_MEMORY_SIZE 0x100000000ull
+ 
+ //=============================================================================
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -31,20 +31,20 @@
+ }
+ 
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // A fence on ARM64, nothing on x86 (pch_h.inja): ARM64 reorders memory accesses as PowerPC does.
++  ctx.println("\tREX_SYNC();");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // A fence on ARM64, nothing on x86 (pch_h.inja): ARM64 reorders memory accesses as PowerPC does.
++  ctx.println("\tREX_LWSYNC();");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // A fence on ARM64, nothing on x86 (pch_h.inja): ARM64 reorders memory accesses as PowerPC does.
++  ctx.println("\tREX_EIEIO();");
+   return true;
+ }
+ 

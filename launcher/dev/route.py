@@ -8,6 +8,9 @@ the path of the car that went furthest as a route for "follow" (src/dev_pad.cpp)
                                                  it before the countdown ends)
   route.py from-log <run folder> <file.route>    the same from a run whose script had
                                                  `watch 15` on (arcade-race.pad WATCH=15)
+  route.py from-pos <game.log> <file.route>      the player's own drive, from a log where a
+                                                 script ran `pos` a few times a second (macOS:
+                                                 out/research/drives/record-drive.pad)
   route.py show <file.route>                     length, points, speeds
 
 The game runs the race at its own pace while this records, so start it with a
@@ -70,7 +73,7 @@ def length(track):
     return sum(math.dist(p[2], q[2]) for p, q in zip(track, track[1:]))
 
 
-def write_route(a, tracks, heights=None):
+def write_route(a, tracks, heights=None, who="opponent"):
     """tracks {car: [(time s, frame, (x, z))]}: the route of the car that went furthest.
     heights {(x, z): y} gives each point a fourth column, the ground's height there (follow's
     teleport puts a car back at it)."""
@@ -81,7 +84,7 @@ def write_route(a, tracks, heights=None):
     # Drop the part after the leader stopped.
     while len(track) > 2 and math.dist(track[-1][2], track[-2][2]) < 0.05:
         track.pop()
-    print(f"{len(tracks)} opponents; the furthest, {address}, went {length(track):.0f} m "
+    print(f"{len(tracks)} {who}s; the furthest, {address}, went {length(track):.0f} m "
           f"in {track[-1][0] - track[0][0]:.0f} s")
 
     # Resample every --spacing metres, with the speed it had there.
@@ -102,7 +105,7 @@ def write_route(a, tracks, heights=None):
     # The leader's speed from the start: the first point gets the second's.
     points[0] = (points[0][0], points[1][1] if len(points) > 1 else 0.0, points[0][2])
     with open(a.file, "w", encoding="utf-8", newline="\n") as out:
-        out.write(f"# route recorded from opponent {address}: {len(points)} points, "
+        out.write(f"# route recorded from {who} {address}: {len(points)} points, "
                   f"{a.spacing} m apart; x,z,speed (m/s)[,height (m)]\n")
         for (x, z), speed, y in points:
             out.write(f"{x:.2f},{z:.2f},{speed:.1f}" + ("" if y is None else f",{y:.2f}") + "\n")
@@ -140,6 +143,39 @@ def from_log(a):
     write_route(a, tracks, heights)
 
 
+def from_pos(a):
+    """The player's drive from a log's `pos` replies (their wall-clock times give the speed). A reading
+    more than 60 m from the one before, or 8 m above or below it (a reset, the car falling through the
+    world), splits the drive; the longest piece is the route, as follow could not drive across it."""
+    import datetime
+    import re
+    pattern = re.compile(r"^\[([\d-]+ [\d:.]+)\].*dev pad: pos -> ok (\S+) (\S+) (\S+)")
+    pieces, start, last = [[]], None, None
+    heights = {}
+    for line in open(a.log, encoding="utf-8", errors="replace"):
+        m = pattern.match(line)
+        if not m:
+            continue
+        when = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f")
+        start = start or when
+        x, y, z = (float(m.group(i)) for i in (2, 3, 4))
+        t = (when - start).total_seconds()
+        if last and (math.dist(last[1], (x, z)) > 60 or abs(y - last[0]) > 8):
+            print(f"a jump at {t:.0f} s, from {last[1]} height {last[0]:.1f} to ({x:.1f}, {z:.1f}) "
+                  f"height {y:.1f}: the drive is split there")
+            pieces.append([])
+        last = (y, (x, z))
+        heights[(x, z)] = y
+        pieces[-1].append((t, 0, (x, z)))
+    track = max(pieces, key=length)
+    # Standing still at the start (before driving off) is not part of the route.
+    while len(track) > 2 and math.dist(track[0][2], track[1][2]) < 0.05:
+        track.pop(0)
+    if len(track) < 2:
+        raise SystemExit("no drive in the log: no `pos` replies, or the car never moved")
+    write_route(a, {"player": track}, heights, who="drive")
+
+
 def show(a):
     points = []
     for line in open(a.file, encoding="utf-8"):
@@ -168,10 +204,14 @@ def main():
     p.add_argument("--spacing", type=float, default=4.0)
     p.add_argument("--fps", type=float, default=60.0, help="the watch ticks per second (the fixed "
                    "time step of the run, 60 by default)")
+    p = sub.add_parser("from-pos")
+    p.add_argument("log", help="the run's log file")
+    p.add_argument("file")
+    p.add_argument("--spacing", type=float, default=4.0)
     p = sub.add_parser("show")
     p.add_argument("file")
     a = parser.parse_args()
-    {"record": record, "from-log": from_log, "show": show}[a.cmd](a)
+    {"record": record, "from-log": from_log, "from-pos": from_pos, "show": show}[a.cmd](a)
 
 
 if __name__ == "__main__":

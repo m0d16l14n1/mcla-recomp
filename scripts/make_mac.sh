@@ -145,6 +145,8 @@ while read -r patch file adds; do
 done <<'MAC'
 rexglue-vulkan-render-pass-breaks.patch src/graphics/vulkan/command_processor.cpp vulkan_hoist_read_granularity_log2
 rexglue-macos-audio-threads.patch src/audio/audio_thread.cpp ApplyAppleAudioScheduling
+rexglue-ppc-barriers-arm64.patch src/codegen/builders/system.cpp REX_LWSYNC
+rexglue-fence-hook.patch include/rex/graphics/command_processor.h WriteFenceValue
 rexglue-metal-backend.patch src/graphics/plugin_main.cpp CreateMetalGraphicsSystem
 MAC
 

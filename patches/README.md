@@ -95,6 +95,8 @@ On macOS (`scripts/make_mac.sh`) both Linux patches go on as well (the Linux-onl
 ```
 git apply ../../patches/rexglue-vulkan-render-pass-breaks.patch
 git apply ../../patches/rexglue-macos-audio-threads.patch
+git apply ../../patches/rexglue-ppc-barriers-arm64.patch
+git apply ../../patches/rexglue-fence-hook.patch
 git apply ../../patches/rexglue-metal-backend.patch
 ```
 
@@ -2137,6 +2139,26 @@ The game sets, on macOS only (`src/mcla_app.cpp`), `audio_thread_priority` and `
 | Device buffer + queue (delay) | 21 + 43 ms | 21 + 43 ms | 5 + 21 ms |
 
 At start-up 20 underruns (before) went to none in the last run. Built and run on macOS only; nothing changes elsewhere (the macOS code is under `__APPLE__`, the new option defaults to SDL's own buffer).
+
+## rexglue-ppc-barriers-arm64.patch
+
+macOS fork. The recompiler emitted PowerPC's memory barriers (`sync`, `lwsync`, `eieio`) as nothing, which holds
+on x86, where stores stay in order, but not on ARM64, which reorders loads and stores as PowerPC does: the guest
+releases a lock with `lwsync; stw 0, lock`, and without the barrier the stores it protected may be seen after the
+release. The generated code now calls `REX_SYNC()`, `REX_LWSYNC()` and `REX_EIEIO()`, defined in the precompiled
+header's template as `__atomic_thread_fence` (`dmb ish`) on ARM64 and as nothing elsewhere, so x86 builds compile
+to what they did. In Midnight Club: Los Angeles: 58 `lwsync`, 9 `sync`, 14 `eieio`. The recompiler has to be
+rebuilt and the game's code generated again for it to take effect (`scripts/make_mac.sh` does both).
+
+Found while chasing the Metal backend's car that falls through the city (`launcher/dev/metal-car-falls-2026-11-01.md`
+in the fork); it did not fix that, and is kept because the code is wrong without it.
+
+## rexglue-fence-hook.patch
+
+macOS fork. `CommandProcessor::WriteFenceValue(address, value)`, virtual, called where the `EVENT_WRITE_SHD`
+packet stores the guest's fence value, which it still does by default. The Metal backend overrides it to write the
+fence on the GPU after the work encoded before it (`--metal_gpu_fences=true`, off by default). Nothing changes for
+the other backends.
 
 ## rexglue-metal-backend.patch
 
