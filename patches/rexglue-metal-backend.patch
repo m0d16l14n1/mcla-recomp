@@ -629,7 +629,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,332 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -716,8 +716,15 @@ new file mode 100644
 +  uint64_t pass_first_draw_ = 0;
 +  // Commits the pending commands; with wait, also waits for all GPU work and starts the snapshots afresh.
 +  void Submit(bool wait = true);
-+  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples = 1);
-+  static void TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples);
++  // samples: EDRAM samples a texel holds (1: the texture is in samples, supersampling; 2 or 4: in pixels), and
++  // multisample whether those are the texture's own samples (metal_msaa) or one texel stands for all of them
++  // (metal_4x_as_1x).
++  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples = 1,
++                        bool multisample = false);
++  static void TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples,
++                        bool multisample);
++  // How a surface with this MSAA mode is kept: samples a texel holds and whether as a multisample texture.
++  static void SurfaceSamples(xenos::MsaaSamples msaa, uint32_t& samples, bool& multisample);
 +  id<MTLTexture> Texture(const MetalTextureBinding& binding);
 +  id<MTLTexture> TextureSlow(const MetalTextureBinding& binding);
 +  // What Texture gave for a fetch constant (all six dwords, the dimension and signedness) since textures_ and
@@ -959,7 +966,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2489 @@
+@@ -0,0 +1,2508 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1007,6 +1014,9 @@ new file mode 100644
 +    "Watch the guest memory of loaded textures for CPU writes and hash a texture again only after one (false: every frame)");
 +REXCVAR_DEFINE_BOOL(metal_msaa, false, "GPU/Metal",
 +    "MSAA 2x and 4x surfaces as Metal multisample textures (shaded once a pixel) instead of 1x2 and 2x2 supersampling");
++REXCVAR_DEFINE_BOOL(metal_4x_as_1x, true, "GPU/Metal",
++    "MSAA 4x surfaces (the reflections) drawn at one sample a pixel instead of 2x2 supersampling: a quarter of their "
++    "pixel work, without their anti-aliasing (+5% FPS with MSAA 2x, +16% with MetalFX Performance)");
 +REXCVAR_DEFINE_BOOL(metal_pass_merge, true, "GPU/Metal",
 +    "A draw that uses some of the open render pass's targets (no depth, or fewer colors) goes into that pass instead of starting its own");
 +REXCVAR_DEFINE_BOOL(metal_compose_resolves, true, "GPU/Metal",
@@ -1093,8 +1103,9 @@ new file mode 100644
 +  float scale = 1.0f; uint32_t padding = 0;
 +  uint32_t samples_x = 1, samples_y = 1, sample_select = 0, extent_start = 0, extent_end = 0, stretch = 0;
 +  uint32_t stretch_num[2] = {}, stretch_den[2] = {};  // temporal_aa_upscale: the render and output sizes
++  uint32_t tex_ss[2] = {1, 1};  // samples a texel of a single-sample source holds (metal_4x_as_1x)
 +};
-+static_assert(sizeof(ResolveConstants) == 96);
++static_assert(sizeof(ResolveConstants) == 104);
 +// TransferConstants in metal_resolve.h.
 +struct TransferConstants {
 +  uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind;
@@ -1436,24 +1447,32 @@ new file mode 100644
 +  if (buffer) uploads_.push_back(buffer);
 +  return buffer;
 +}
-+void MetalDraw::TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples) {
-+  key.clear(); Key(key, base); Key(key, format); Key(key, width);
-+  if (samples > 1) Key(key, samples);
++void MetalDraw::SurfaceSamples(xenos::MsaaSamples msaa, uint32_t& samples, bool& multisample) {
++  const uint32_t n = msaa >= xenos::MsaaSamples::k4X ? 4 : msaa >= xenos::MsaaSamples::k2X ? 2 : 1;
++  samples = 1; multisample = false;
++  if (n > 1 && REXCVAR_GET(metal_msaa)) { samples = n; multisample = true; }
++  else if (n == 4 && REXCVAR_GET(metal_4x_as_1x)) samples = 4;
 +}
-+id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples) {
++void MetalDraw::TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples,
++                          bool multisample) {
++  key.clear(); Key(key, base); Key(key, format); Key(key, width);
++  if (samples > 1) Key(key, samples | (multisample ? 0x100u : 0u));
++}
++id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples,
++                                 bool multisample) {
 +  // EDRAM is kept in samples (MSAA 2x as 1x2, 4x as 2x2), so that the views of the same tiles
 +  // with another sample count and pitch (a 4x clear at half the pitch of a 2x scene) meet in one
 +  // texture. Its height is what is left of EDRAM after the base, so it does not depend on the draw.
 +  // With metal_msaa a 2x or 4x surface is a multisample texture of `width` pixels instead (`samples` 2 or 4),
 +  // and EDRAM transfers carry its tiles to and from the others sample by sample.
-+  std::string key; TargetKey(key, base, format, width, samples);
++  std::string key; TargetKey(key, base, format, width, samples, multisample);
 +  auto found = targets_.find(key);
 +  if (found != targets_.end()) return found->second;
 +  const uint32_t ssx = samples >= 4 ? 2 : 1, ssy = samples >= 2 ? 2 : 1;
 +  uint32_t pitch_tiles = std::max(1u, (width * ssx + (is_64bpp ? 39 : 79)) / (is_64bpp ? 40 : 80));
 +  uint32_t height = std::min(8192u, (edram_tiles_ - std::min(base, edram_tiles_ - 1) + pitch_tiles - 1) / pitch_tiles * 16) / ssy;
 +  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
-+  if (samples > 1) { desc.textureType = MTLTextureType2DMultisample; desc.sampleCount = samples; }
++  if (multisample) { desc.textureType = MTLTextureType2DMultisample; desc.sampleCount = samples; }
 +  desc.storageMode = MTLStorageModePrivate;
 +  desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +  id<MTLTexture> result = [device_ newTextureWithDescriptor:desc];
@@ -1527,9 +1546,11 @@ new file mode 100644
 +    uint32_t mask = draw_util::GetNormalizedColorMask(regs_, ps ? ps->writes_color_targets() : 0);
 +    auto msaa = regs_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
 +    uint32_t ssx = msaa >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = msaa >= xenos::MsaaSamples::k2X ? 2 : 1;
-+    // Real MSAA: the samples are in the texture, and the host draws in pixels.
-+    const uint32_t samples = REXCVAR_GET(metal_msaa) && msaa != xenos::MsaaSamples::k1X ? ssx * ssy : 1;
++    // Real MSAA (the samples in the texture) or 4x as 1x (a texel for the 2x2 samples): the host draws in pixels.
++    uint32_t samples; bool multisample;
++    SurfaceSamples(msaa, samples, multisample);
 +    if (samples > 1) ssx = ssy = 1;
++    const uint32_t raster_samples = multisample ? samples : 1;
 +    draw_util::ViewportInfo viewport{};
 +    draw_util::GetHostViewportInfo(regs_, ssx, ssy, false, 16384, 16384, true, dc, false, true,
 +                                   ps && ps->writes_depth(), viewport);
@@ -1551,7 +1572,7 @@ new file mode 100644
 +        format = ColorFormat(color.color_format);
 +        if (format == MTLPixelFormatInvalid) { ++failures_; return false; }
 +        next[i] = Target(color.GetBaseTiles(edram_tiles_), format, width,
-+                         xenos::IsColorRenderTargetFormat64bpp(color.color_format), samples);
++                         xenos::IsColorRenderTargetFormat64bpp(color.color_format), samples, multisample);
 +        kinds[i] = ColorKind(color.color_format);
 +        if (!next[i]) return false;
 +      }
@@ -1561,7 +1582,7 @@ new file mode 100644
 +    bool depth = dc.z_enable || dc.stencil_enable;
 +    if (depth) {
 +      next[4] = Target(regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), MTLPixelFormatDepth32Float_Stencil8, width, false,
-+                       samples);
++                       samples, multisample);
 +      kinds[4] = DepthKind();
 +      if (!next[4]) return false;
 +    }
@@ -1766,7 +1787,7 @@ new file mode 100644
 +      key[4 + i / 2] |= uint64_t(((mask >> (4 * i)) & 15) ? blends[i] : 0u) << (32 * (i & 1));
 +    }
 +    if (attachments_[4]) key[2] |= uint64_t(1) << 32;
-+    key[2] |= uint64_t(samples) << 33;
++    key[2] |= uint64_t(raster_samples) << 33;
 +    id<MTLRenderPipelineState> pipeline;
 +    auto pi = pipelines_.find(key);
 +    if (pi != pipelines_.end()) pipeline = pi->second;
@@ -1775,7 +1796,7 @@ new file mode 100644
 +      auto pd = [MTLRenderPipelineDescriptor new];
 +      pd.vertexFunction = [vl newFunctionWithName:vl.functionNames.firstObject];
 +      if (pl) pd.fragmentFunction = [pl newFunctionWithName:pl.functionNames.firstObject];
-+      pd.rasterSampleCount = samples;
++      pd.rasterSampleCount = raster_samples;
 +      for (uint32_t i = 0; i < 4; ++i) {
 +        reg::RB_BLENDCONTROL bc; bc.value = blends[i];
 +        auto a = pd.colorAttachments[i]; a.pixelFormat = formats[i];
@@ -2582,12 +2603,13 @@ new file mode 100644
 +    uint32_t ssx = ei.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = ei.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
 +    // Real MSAA: the source is a multisample texture of the surface's pitch in pixels; the resolve still works in
 +    // EDRAM samples (sx, sy, resolve_rows and clear_rect below), and dvx, dvy take them to the texture's texels.
-+    const uint32_t samples = REXCVAR_GET(metal_msaa) && ei.msaa_samples != xenos::MsaaSamples::k1X ? ssx * ssy : 1;
++    uint32_t samples; bool multisample;
++    SurfaceSamples(ei.msaa_samples, samples, multisample);
 +    const uint32_t dvx = samples > 1 ? ssx : 1, dvy = samples > 1 ? ssy : 1;
 +    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx / dvx;
 +    MTLPixelFormat format = depth ? MTLPixelFormatDepth32Float_Stencil8 : ColorFormat(xenos::ColorRenderTargetFormat(ei.format));
 +    id<MTLTexture> source = nil;
-+    std::string identity; TargetKey(identity, original, format, pitch, samples);
++    std::string identity; TargetKey(identity, original, format, pitch, samples, multisample);
 +    auto current = targets_.find(identity);
 +    if (current != targets_.end()) source = current->second;
 +    uint32_t width = info.coordinate_info.width_div_8 * 8, height = info.height_div_8 * 8;
@@ -2654,7 +2676,8 @@ new file mode 100644
 +        auto compute = [commands_ computeCommandEncoder];
 +        if (REXCVAR_GET(metal_debug_labels))
 +          compute.label = [NSString stringWithFormat:@"resolve %s %ux%u", depth ? "depth" : "color", width, height];
-+        [compute setComputePipelineState:samples > 1 ? (depth ? resolve_depth_ms_ : resolve_color_ms_)
++        if (!multisample) { constants.tex_ss[0] = dvx; constants.tex_ss[1] = dvy; }
++        [compute setComputePipelineState:multisample ? (depth ? resolve_depth_ms_ : resolve_color_ms_)
 +                                                     : (depth ? resolve_depth_ : resolve_color_)];
 +        [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
 +        if (depth) {
@@ -2704,10 +2727,13 @@ new file mode 100644
 +      for (auto& [key, target] : targets_) {
 +        uint32_t base; std::memcpy(&base, key.data(), sizeof(base));
 +        const auto depth_msaa = info.depth_edram_info.msaa_samples;
-+        const uint32_t depth_samples = REXCVAR_GET(metal_msaa) && depth_msaa != xenos::MsaaSamples::k1X
-+            ? (depth_msaa >= xenos::MsaaSamples::k4X ? 4u : 2u) : 1u;
++        uint32_t depth_samples; bool depth_multisample;
++        SurfaceSamples(depth_msaa, depth_samples, depth_multisample);
++        const auto depth_layout = target_layouts_.find(reinterpret_cast<uintptr_t>((__bridge void*)target));
 +        if (base != info.depth_original_base || target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 ||
-+            target.sampleCount != depth_samples ||
++            depth_layout == target_layouts_.end() ||
++            depth_layout->second.ssx * depth_layout->second.ssy != depth_samples ||
++            (target.sampleCount > 1) != depth_multisample ||
 +            target.width != regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch *
 +                (depth_samples == 1 && depth_msaa >= xenos::MsaaSamples::k4X ? 2 : 1)) continue;
 +        ClearRect(target, true, {}, (info.depth_edram_info.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)
@@ -3950,7 +3976,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,464 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -3969,6 +3995,9 @@ new file mode 100644
 +  // target (from its origin) at ((2q + 1) * num) / (2 * den), at most num - 1. Single-sampled only.
 +  uint stretch;
 +  uint2 stretch_num, stretch_den;
++  // EDRAM samples a texel of a single-sample source holds across and down: 1x1, or 2x2 for a 4x surface drawn at
++  // one sample a pixel (metal_4x_as_1x).
++  uint2 tex_ss;
 +};
 +uint2 stretched(uint2 q, constant ResolveConstants& c) {
 +  return min(((2u * q + 1u) * c.stretch_num) / (2u * c.stretch_den), c.stretch_num - 1u);
@@ -4061,10 +4090,10 @@ new file mode 100644
 +  if (c.stretch) {
 +    value = source.read(base);
 +  } else if (c.sample_select < 4) {
-+    value = source.read(base + sample_offset(c.sample_select, c.samples));
++    value = source.read((base + sample_offset(c.sample_select, c.samples)) / c.tex_ss);
 +  } else {
 +    value = float4(0);
-+    for (uint y = 0; y < c.samples.y; ++y) for (uint x = 0; x < c.samples.x; ++x) value += source.read(base + uint2(x, y));
++    for (uint y = 0; y < c.samples.y; ++y) for (uint x = 0; x < c.samples.x; ++x) value += source.read((base + uint2(x, y)) / c.tex_ss);
 +    value /= float(c.samples.x * c.samples.y);
 +  }
 +  value *= c.scale;
@@ -4078,7 +4107,8 @@ new file mode 100644
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
 +    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
-+  uint2 at = c.stretch ? stretched(c.origin + p, c) : c.origin + p * c.samples + sample_offset(c.sample_select, c.samples);
++  uint2 at = c.stretch ? stretched(c.origin + p, c)
++                       : (c.origin + p * c.samples + sample_offset(c.sample_select, c.samples)) / c.tex_ss;
 +  float depth = source.read(at) * c.scale;
 +  destination.write(float4(depth), p);
 +  // Depth resolves write the EDRAM depth format whatever the destination format says: 24-bit
@@ -4284,13 +4314,14 @@ new file mode 100644
 +  return out;
 +}
 +// Reading a source at a sample-space position, single-sample or multisample.
-+float4 read_color(texture2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s); }
++float4 read_color(texture2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss); }
 +float4 read_color(texture2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
-+float read_depth(depth2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s); }
++float read_depth(depth2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss); }
 +float read_depth(depth2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
-+uint read_stencil(texture2d<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s).r; }
++uint read_stencil(texture2d<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss).r; }
 +uint read_stencil(texture2d_ms<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)).r; }
 +template <typename T> uint2 sample_size(T t, uint2 ss) { return uint2(t.get_width(), t.get_height()) * ss; }
++// A single-sample texture's texel may hold several samples (metal_4x_as_1x: 2x2): it is drawn as its first.
 +// Variants: _sm a multisample source, _dm a multisample destination (run per sample).
 +#define SRC_COLOR_P texture2d<float, access::read>
 +#define SRC_COLOR_M texture2d_ms<float, access::read>
@@ -4300,7 +4331,7 @@ new file mode 100644
 +#define SRC_STENCIL_M texture2d_ms<uint, access::read>
 +#define DST_ARGS_P
 +#define DST_ARGS_M , uint sid [[sample_id]]
-+#define DST_COORD_P uint2(position.xy)
++#define DST_COORD_P (uint2(position.xy) * c.dst_ss)
 +#define DST_COORD_M (uint2(position.xy) * c.dst_ss + guest_sub(sid, c.dst_ss))
 +#define TRANSFERS(SUFFIX, S, D) \
 +fragment float4 transfer_color_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \

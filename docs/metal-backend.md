@@ -21,14 +21,16 @@ Mac with a virtual machine running beside it; MoltenVK for comparison:
 | Off | 31.3 FPS | about 80 FPS |
 | MetalFX temporal AA at 720p (`--mcla_anti_aliasing=fsr`) | — | about 77 FPS |
 | MetalFX upscaling, Quality, 853x480 to 720p (`--mcla_upscaling=quality`) | — | 86 FPS |
-| MetalFX upscaling, Performance, 640x360 to 720p (`--mcla_upscaling=performance`) | — | 91 to 93 FPS |
+| MetalFX upscaling, Performance, 640x360 to 720p (`--mcla_upscaling=performance`) | — | 91 to 93 FPS; 94 with the tenth pass |
 
 The picture at the spawn point matches MoltenVK's (shadows, colour grading, minimap, HUD), and the game plays
 from boot to free roam and drives. A warm or busy Mac loses up to a third of these frame rates. At MetalFX
 Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a frame, 3.4 of it waiting for the GPU.
-What is still missing: EDRAM transfers of 64-bit formats, 3D textures, the UI overlays (ImGui), EDR, frame pacing
-with `CAMetalDisplayLink`. Known bug: the player's car sometimes falls through the road on Metal
-([BACKLOG](BACKLOG.md) 27). The passes below, first to ninth, record how it got here.
+The rows above are before the tenth pass (the 4x reflections at one sample a pixel, now the default), which adds
+5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: EDRAM transfers
+of 64-bit formats, 3D textures, the UI overlays (ImGui), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
+the tenth pass). Known bug: the player's car sometimes falls through the road on Metal
+([BACKLOG](BACKLOG.md) 27). The passes below, first to tenth, record how it got here.
 
 ## Why
 
@@ -452,6 +454,30 @@ busy about 75 to 104 ms a frame against 41: the 160x128 4x reflection passes cos
 
 So supersampling stays. The 4x passes could get cheaper by drawing fewer passes or smaller ones, not with
 multisample textures.
+
+**4x surfaces at one sample a pixel, tenth pass (2026-11-01): on by default, `--metal_4x_as_1x=false` turns it
+off.** The game's MSAA 4x targets (the 160x128 reflections and a few others) are drawn as plain textures of
+their size in pixels, one texel for the pixel's 2x2 EDRAM samples, instead of 2x2 supersampling: a quarter of
+their pixel work, and the reflections lose only their own anti-aliasing. The pieces: `SurfaceSamples` picks the
+texture's samples a texel (`Target(..., samples, multisample)`, keyed with both); draws take the pipeline's
+raster samples from it; resolves divide their reads by `tex_ss` (`ResolveConstants`, 104 bytes); EDRAM transfers
+read a sample's texel at `s / ss` and write each texel once (`DST_COORD_P` scaled by `dst_ss`); a depth clear
+matches its target by samples and multisampling. Same Mac, same hour, VM running:
+
+| Mode | Off | On |
+|---|---|---|
+| MSAA 2x | 56.5 FPS, GPU busy 45.8 ms | 59.6 FPS, GPU busy 41.6 ms |
+| MetalFX Performance | 81.0 FPS, GPU busy 24.5 ms | 94.4 FPS, GPU busy 19.4 ms |
+
+The spawn point's mean colour is 1.22 from the reference against 0.63 (the car and the street look the same;
+the difference is in the reflections), the minimap is steady (ten shots 150 ms apart, 52.0 to 52.2), and the
+route test passes at MetalFX Performance uncapped.
+
+**Frame pacing:** `CAMetalDisplayLink` is put off. The Mac here has a 60 Hz panel, the presenter's layer has
+display sync on, and the game already holds each frame to its target at the swap with a precise clock
+(`mcla_pace_at_swap`, src/frame_timing.cpp). Uncapped, the frames over 60 a second are drawn and not shown, and
+the shown ones are unevenly spaced; `--mcla_fps=60` gives even frames. A display link would matter for 120 Hz
+ProMotion panels and for lower latency; it stays in [BACKLOG](BACKLOG.md) 16.
 
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
