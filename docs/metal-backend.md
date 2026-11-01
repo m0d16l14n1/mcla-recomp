@@ -408,6 +408,27 @@ at 640x360 is about 1 ms; the largest item is the game's 4x MSAA targets, drawn 
 25 passes of 160x128 reflections a frame, 320x256 here, about 1.8 ms; a 520-pitch surface about 1 ms; others),
 about 4 ms together. Real MSAA (Metal multisample textures, shaded once a pixel) is the next GPU step.
 
+**Real MSAA, tried (2026-11-01): slower; kept as `--metal_msaa=true`, off by default.** 2x and 4x surfaces become
+multisample textures of their pitch in pixels (`Target(..., samples)`, keyed with the sample count); draws use a
+host scale of 1 and pipelines the target's sample count; the EDRAM bookkeeping keeps texture rows and converts
+them to tile rows through the target's samples down (`TargetLayout.ssx`, `ssy`); EDRAM transfers work in sample
+space as before, with variants that read a multisample source (`_sm`) and write a multisample destination per
+sample (`_dm`; guest 2x sample 0 is Metal's sample 1, the upper left; 4x is in the same order); resolves read
+samples (`resolve_color_ms`, `resolve_depth_ms`); clears and their pipelines take the sample count. The spawn
+point's picture matches MSAA as supersampling. But free roam runs at **30 to 31 FPS against 62.6**, the GPU
+busy about 75 to 104 ms a frame against 41: the 160x128 4x reflection passes cost 5.9 ms a frame against 1.8 as
+320x256 supersampling, the scene's 1280x512 2x passes 9.3 ms against about 5. Two causes:
+
+- The translator's `sample_rate_shading` makes every pixel shader write a sample mask, so SPIRV-Cross reads
+  `[[sample_id]]` and the shader runs once per sample. Turning it off removed that and changed nothing in speed,
+  but it turns the spawn point's colour grading purple (some shader depends on it), so it stays on.
+- Each of the frame's 60-odd passes loads and stores its multisample targets in full: an EDRAM emulation cannot
+  keep MSAA in tile memory and resolve at the end of a pass, which is where Apple's GPUs make MSAA cheap, and
+  loading and storing multisample textures costs far more than the same samples in a plain texture.
+
+So supersampling stays. The 4x passes could get cheaper by drawing fewer passes or smaller ones, not with
+multisample textures.
+
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
 resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM. With it:

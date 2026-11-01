@@ -79,6 +79,7 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
 | `--metal_shader_storage=false` | No shader storage and warm-up at boot |
 | `--metal_taa_upscale=false` | No MetalFX upscaling (the scene drawn at full size whatever `mcla_upscaling` says) |
+| `--metal_msaa=true` | MSAA surfaces as Metal multisample textures instead of supersampling (correct, but about half the frame rate; for testing) |
 | `--metal_shader_math=1` or `2` | Relaxed or fast math in the shader compiler (shifts the colour grading; for testing) |
 
 Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, texture loads, copies, transfers, render passes) and a `Metal command processor` line with the GPU command thread's CPU time. Diagnostics (frame dumps, GPU traces with `--metal_debug_labels=true`): [docs/metal-backend.md](docs/metal-backend.md).
@@ -87,7 +88,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 
 - **On Metal, the player's car sometimes falls through the road.** This is a race between the game's own threads that the Metal backend's timing exposes; MoltenVK never shows it. It is parked for now: [launcher/dev/metal-car-falls-2026-11-01.md](launcher/dev/metal-car-falls-2026-11-01.md).
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
-- The Metal backend still lacks MSAA proper (2x is drawn as 1x2 supersampling), EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
+- The Metal backend draws MSAA as supersampling (2x as 1x2, 4x as 2x2): real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 
 ## More documentation

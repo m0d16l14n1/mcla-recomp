@@ -629,7 +629,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,325 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -716,7 +716,8 @@ new file mode 100644
 +  uint64_t pass_first_draw_ = 0;
 +  // Commits the pending commands; with wait, also waits for all GPU work and starts the snapshots afresh.
 +  void Submit(bool wait = true);
-+  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp);
++  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples = 1);
++  static void TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples);
 +  id<MTLTexture> Texture(const MetalTextureBinding& binding);
 +  id<MTLTexture> TextureSlow(const MetalTextureBinding& binding);
 +  // What Texture gave for a fetch constant (all six dwords, the dimension and signedness) since textures_ and
@@ -779,6 +780,7 @@ new file mode 100644
 +  std::unique_ptr<SharedMemory> shared_;
 +  std::unique_ptr<MetalPrimitiveProcessor> primitives_;
 +  id<MTLComputePipelineState> resolve_color_ = nil, resolve_depth_ = nil, present_ = nil, load_texture_ = nil;
++  id<MTLComputePipelineState> resolve_color_ms_ = nil, resolve_depth_ms_ = nil;  // metal_msaa sources
 +  uint64_t memexport_skipped_ = 0;
 +  // Fence values for the GPU to copy into guest memory, a slot each (many frames' worth before reuse).
 +  id<MTLBuffer> fence_values_ = nil;
@@ -896,6 +898,7 @@ new file mode 100644
 +    // checks for draws in an open pass look only there, not at every tile the draw's rows cover.
 +    uint32_t stale_lo = 0, stale_hi = UINT32_MAX;
 +    uint32_t clean_lo = 0, clean_hi = 0;  // the last tiles checked or taken over and not written by others since
++    uint32_t ssx = 1, ssy = 1;  // EDRAM samples a texel holds across and down (a metal_msaa multisample texture)
 +  };
 +  std::unordered_map<uintptr_t, TargetLayout> target_layouts_;
 +  // Per EDRAM tile: a version bumped by every pass writing it, the writer and its format kind.
@@ -956,7 +959,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2440 @@
+@@ -0,0 +1,2489 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1002,6 +1005,8 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_pass_rows, true, "GPU/Metal", "Render passes cover only the rows their draws reach (false: the whole target)");
 +REXCVAR_DEFINE_BOOL(metal_texture_watches, true, "GPU/Metal",
 +    "Watch the guest memory of loaded textures for CPU writes and hash a texture again only after one (false: every frame)");
++REXCVAR_DEFINE_BOOL(metal_msaa, false, "GPU/Metal",
++    "MSAA 2x and 4x surfaces as Metal multisample textures (shaded once a pixel) instead of 1x2 and 2x2 supersampling");
 +REXCVAR_DEFINE_BOOL(metal_pass_merge, true, "GPU/Metal",
 +    "A draw that uses some of the open render pass's targets (no depth, or fewer colors) goes into that pass instead of starting its own");
 +REXCVAR_DEFINE_BOOL(metal_compose_resolves, true, "GPU/Metal",
@@ -1090,6 +1095,11 @@ new file mode 100644
 +  uint32_t stretch_num[2] = {}, stretch_den[2] = {};  // temporal_aa_upscale: the render and output sizes
 +};
 +static_assert(sizeof(ResolveConstants) == 96);
++// TransferConstants in metal_resolve.h.
++struct TransferConstants {
++  uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind;
++  uint32_t dst_ss[2], src_ss[2];
++};
 +template <typename T> void Key(std::string& key, T value) {
 +  key.append(reinterpret_cast<const char*>(&value), sizeof(value));
 +}
@@ -1143,6 +1153,8 @@ new file mode 100644
 +  if (library) {
 +    resolve_color_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_color"] error:&error];
 +    resolve_depth_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_depth"] error:&error];
++    resolve_color_ms_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_color_ms"] error:&error];
++    resolve_depth_ms_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_depth_ms"] error:&error];
 +    present_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"present_color"] error:&error];
 +    load_texture_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"load_texture"] error:&error];
 +  }
@@ -1161,7 +1173,7 @@ new file mode 100644
 +    keep.depthCompareFunction = MTLCompareFunctionAlways; keep.depthWriteEnabled = NO;
 +    transfer_color_depth_state_ = [device_ newDepthStencilStateWithDescriptor:keep];
 +  }
-+  if (!resolve_color_ || !resolve_depth_ || !present_ || !load_texture_) {
++  if (!resolve_color_ || !resolve_depth_ || !resolve_color_ms_ || !resolve_depth_ms_ || !present_ || !load_texture_) {
 +    REXGPU_ERROR("Metal resolve shader failed: {}", error.localizedDescription.UTF8String); return false;
 +  }
 +  shared_ = std::make_unique<UnifiedMemory>(memory_);
@@ -1424,16 +1436,24 @@ new file mode 100644
 +  if (buffer) uploads_.push_back(buffer);
 +  return buffer;
 +}
-+id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp) {
++void MetalDraw::TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples) {
++  key.clear(); Key(key, base); Key(key, format); Key(key, width);
++  if (samples > 1) Key(key, samples);
++}
++id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples) {
 +  // EDRAM is kept in samples (MSAA 2x as 1x2, 4x as 2x2), so that the views of the same tiles
 +  // with another sample count and pitch (a 4x clear at half the pitch of a 2x scene) meet in one
 +  // texture. Its height is what is left of EDRAM after the base, so it does not depend on the draw.
-+  std::string key; Key(key, base); Key(key, format); Key(key, width);
++  // With metal_msaa a 2x or 4x surface is a multisample texture of `width` pixels instead (`samples` 2 or 4),
++  // and EDRAM transfers carry its tiles to and from the others sample by sample.
++  std::string key; TargetKey(key, base, format, width, samples);
 +  auto found = targets_.find(key);
 +  if (found != targets_.end()) return found->second;
-+  uint32_t pitch_tiles = std::max(1u, (width + (is_64bpp ? 39 : 79)) / (is_64bpp ? 40 : 80));
-+  uint32_t height = std::min(8192u, (edram_tiles_ - std::min(base, edram_tiles_ - 1) + pitch_tiles - 1) / pitch_tiles * 16);
++  const uint32_t ssx = samples >= 4 ? 2 : 1, ssy = samples >= 2 ? 2 : 1;
++  uint32_t pitch_tiles = std::max(1u, (width * ssx + (is_64bpp ? 39 : 79)) / (is_64bpp ? 40 : 80));
++  uint32_t height = std::min(8192u, (edram_tiles_ - std::min(base, edram_tiles_ - 1) + pitch_tiles - 1) / pitch_tiles * 16) / ssy;
 +  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
++  if (samples > 1) { desc.textureType = MTLTextureType2DMultisample; desc.sampleCount = samples; }
 +  desc.storageMode = MTLStorageModePrivate;
 +  desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +  id<MTLTexture> result = [device_ newTextureWithDescriptor:desc];
@@ -1443,6 +1463,8 @@ new file mode 100644
 +    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)] =
 +        {base, pitch_tiles, is_64bpp, format == MTLPixelFormatDepth32Float_Stencil8, result,
 +         std::vector<uint32_t>(edram_tiles_, 0)};
++    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)].ssx = ssx;
++    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)].ssy = ssy;
 +    if (tile_version_.size() != edram_tiles_) {
 +      tile_version_.assign(edram_tiles_, 0); tile_kind_.assign(edram_tiles_, kNoTransfer); tile_owner_.assign(edram_tiles_, 0);
 +    }
@@ -1505,6 +1527,9 @@ new file mode 100644
 +    uint32_t mask = draw_util::GetNormalizedColorMask(regs_, ps ? ps->writes_color_targets() : 0);
 +    auto msaa = regs_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
 +    uint32_t ssx = msaa >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = msaa >= xenos::MsaaSamples::k2X ? 2 : 1;
++    // Real MSAA: the samples are in the texture, and the host draws in pixels.
++    const uint32_t samples = REXCVAR_GET(metal_msaa) && msaa != xenos::MsaaSamples::k1X ? ssx * ssy : 1;
++    if (samples > 1) ssx = ssy = 1;
 +    draw_util::ViewportInfo viewport{};
 +    draw_util::GetHostViewportInfo(regs_, ssx, ssy, false, 16384, 16384, true, dc, false, true,
 +                                   ps && ps->writes_depth(), viewport);
@@ -1526,7 +1551,7 @@ new file mode 100644
 +        format = ColorFormat(color.color_format);
 +        if (format == MTLPixelFormatInvalid) { ++failures_; return false; }
 +        next[i] = Target(color.GetBaseTiles(edram_tiles_), format, width,
-+                         xenos::IsColorRenderTargetFormat64bpp(color.color_format));
++                         xenos::IsColorRenderTargetFormat64bpp(color.color_format), samples);
 +        kinds[i] = ColorKind(color.color_format);
 +        if (!next[i]) return false;
 +      }
@@ -1535,7 +1560,8 @@ new file mode 100644
 +    }
 +    bool depth = dc.z_enable || dc.stencil_enable;
 +    if (depth) {
-+      next[4] = Target(regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), MTLPixelFormatDepth32Float_Stencil8, width, false);
++      next[4] = Target(regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), MTLPixelFormatDepth32Float_Stencil8, width, false,
++                       samples);
 +      kinds[4] = DepthKind();
 +      if (!next[4]) return false;
 +    }
@@ -1740,6 +1766,7 @@ new file mode 100644
 +      key[4 + i / 2] |= uint64_t(((mask >> (4 * i)) & 15) ? blends[i] : 0u) << (32 * (i & 1));
 +    }
 +    if (attachments_[4]) key[2] |= uint64_t(1) << 32;
++    key[2] |= uint64_t(samples) << 33;
 +    id<MTLRenderPipelineState> pipeline;
 +    auto pi = pipelines_.find(key);
 +    if (pi != pipelines_.end()) pipeline = pi->second;
@@ -1748,6 +1775,7 @@ new file mode 100644
 +      auto pd = [MTLRenderPipelineDescriptor new];
 +      pd.vertexFunction = [vl newFunctionWithName:vl.functionNames.firstObject];
 +      if (pl) pd.fragmentFunction = [pl newFunctionWithName:pl.functionNames.firstObject];
++      pd.rasterSampleCount = samples;
 +      for (uint32_t i = 0; i < 4; ++i) {
 +        reg::RB_BLENDCONTROL bc; bc.value = blends[i];
 +        auto a = pd.colorAttachments[i]; a.pixelFormat = formats[i];
@@ -2552,10 +2580,14 @@ new file mode 100644
 +    auto ei = depth ? info.depth_edram_info : info.color_edram_info;
 +    uint32_t original = depth ? info.depth_original_base : info.color_original_base;
 +    uint32_t ssx = ei.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = ei.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
-+    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx;
++    // Real MSAA: the source is a multisample texture of the surface's pitch in pixels; the resolve still works in
++    // EDRAM samples (sx, sy, resolve_rows and clear_rect below), and dvx, dvy take them to the texture's texels.
++    const uint32_t samples = REXCVAR_GET(metal_msaa) && ei.msaa_samples != xenos::MsaaSamples::k1X ? ssx * ssy : 1;
++    const uint32_t dvx = samples > 1 ? ssx : 1, dvy = samples > 1 ? ssy : 1;
++    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx / dvx;
 +    MTLPixelFormat format = depth ? MTLPixelFormatDepth32Float_Stencil8 : ColorFormat(xenos::ColorRenderTargetFormat(ei.format));
 +    id<MTLTexture> source = nil;
-+    std::string identity; Key(identity, original); Key(identity, format); Key(identity, pitch);
++    std::string identity; TargetKey(identity, original, format, pitch, samples);
 +    auto current = targets_.find(identity);
 +    if (current != targets_.end()) source = current->second;
 +    uint32_t width = info.coordinate_info.width_div_8 * 8, height = info.height_div_8 * 8;
@@ -2568,12 +2600,13 @@ new file mode 100644
 +      uint32_t sx = (delta % std::max(1u, uint32_t(ei.pitch_tiles))) * (ei.format_is_64bpp ? 40 : 80) +
 +                    info.coordinate_info.edram_offset_x_div_8 * 8 * ssx;
 +      uint32_t sy = (delta / std::max(1u, uint32_t(ei.pitch_tiles))) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8 * ssy;
-+      if (sx < source.width && sy < source.height) {
-+        width = std::min(width, (uint32_t(source.width) - sx) / ssx); height = std::min(height, (uint32_t(source.height) - sy) / ssy);
++      const uint32_t source_width = uint32_t(source.width) * dvx, source_height = uint32_t(source.height) * dvy;
++      if (sx < source_width && sy < source_height) {
++        width = std::min(width, (source_width - sx) / ssx); height = std::min(height, (source_height - sy) / ssy);
 +      }
-+      if (sx < source.width && sy < source.height && width && height) {
-+        resolve_rows[0] = sy; resolve_rows[1] = sy + height * ssy;
-+        clear_rect[0] = sx; clear_rect[1] = width * ssx;
++      if (sx < source_width && sy < source_height && width && height) {
++        resolve_rows[0] = sy / dvy; resolve_rows[1] = (sy + height * ssy) / dvy;
++        clear_rect[0] = sx / dvx; clear_rect[1] = width * ssx / dvx;
 +        FlushClears(source);
 +        if (REXCVAR_GET(metal_edram_transfers)) SyncTarget(source, source_kind, resolve_rows[0], resolve_rows[1]);
 +        MTLPixelFormat dest_format = MTLPixelFormatRGBA8Unorm;
@@ -2621,7 +2654,8 @@ new file mode 100644
 +        auto compute = [commands_ computeCommandEncoder];
 +        if (REXCVAR_GET(metal_debug_labels))
 +          compute.label = [NSString stringWithFormat:@"resolve %s %ux%u", depth ? "depth" : "color", width, height];
-+        [compute setComputePipelineState:depth ? resolve_depth_ : resolve_color_];
++        [compute setComputePipelineState:samples > 1 ? (depth ? resolve_depth_ms_ : resolve_color_ms_)
++                                                     : (depth ? resolve_depth_ : resolve_color_)];
 +        [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
 +        if (depth) {
 +          // The stencil half of the depth target, for the 24-bit depth over 8-bit stencil in memory.
@@ -2669,9 +2703,13 @@ new file mode 100644
 +    if (!depth && info.IsClearingDepth()) {
 +      for (auto& [key, target] : targets_) {
 +        uint32_t base; std::memcpy(&base, key.data(), sizeof(base));
++        const auto depth_msaa = info.depth_edram_info.msaa_samples;
++        const uint32_t depth_samples = REXCVAR_GET(metal_msaa) && depth_msaa != xenos::MsaaSamples::k1X
++            ? (depth_msaa >= xenos::MsaaSamples::k4X ? 4u : 2u) : 1u;
 +        if (base != info.depth_original_base || target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 ||
++            target.sampleCount != depth_samples ||
 +            target.width != regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch *
-+                (info.depth_edram_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1)) continue;
++                (depth_samples == 1 && depth_msaa >= xenos::MsaaSamples::k4X ? 2 : 1)) continue;
 +        ClearRect(target, true, {}, (info.depth_edram_info.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)
 +            ? xenos::Float20e4To32(info.rb_depth_clear >> 8) * 0.5 : double(info.rb_depth_clear >> 8) / 16777215.0),
 +            info.rb_depth_clear & 255, clear_rect[0], resolve_rows[0], clear_rect[1], resolve_rows[1]);
@@ -2753,8 +2791,9 @@ new file mode 100644
 +bool MetalDraw::TileRange(const TargetLayout& l, uint32_t height, uint32_t y0, uint32_t y1, uint32_t& lo, uint32_t& hi) const {
 +  y1 = std::min(y1, height);
 +  if (y0 >= y1 || l.base >= edram_tiles_) return false;
-+  lo = l.base + (y0 / 16) * l.pitch_tiles;
-+  hi = std::min(edram_tiles_, l.base + ((y1 + 15) / 16) * l.pitch_tiles);
++  // Texture rows to EDRAM tile rows (16 sample rows; a multisample texture's row holds ssy of them).
++  lo = l.base + (y0 * l.ssy / 16) * l.pitch_tiles;
++  hi = std::min(edram_tiles_, l.base + ((y1 * l.ssy + 15) / 16) * l.pitch_tiles);
 +  return lo < hi;
 +}
 +void MetalDraw::MarkWritten(id<MTLTexture> target, uint32_t kind, uint32_t y0, uint32_t y1,
@@ -2911,12 +2950,14 @@ new file mode 100644
 +    uint64_t key = uint64_t(index) | (uint64_t(attachments_[4] ? 1 : 0) << 3);
 +    for (uint32_t a = 0; a < 4; ++a)
 +      key |= uint64_t(attachments_[a] ? uint32_t(attachments_[a].pixelFormat) & 0x3FF : 0) << (4 + 10 * a);
++    key |= uint64_t(c.target.sampleCount) << 48;
 +    __strong id<MTLRenderPipelineState>& pipeline = in_pass_clear_pipelines_[key];
 +    if (!pipeline) {
 +      auto pd = [MTLRenderPipelineDescriptor new];
 +      pd.vertexFunction = [helper_library_ newFunctionWithName:@"transfer_vs"];
 +      pd.fragmentFunction = [helper_library_ newFunctionWithName:index == 4 ? @"clear_depth_fs"
 +          : [NSString stringWithFormat:@"clear_color_fs_%u", index]];
++      pd.rasterSampleCount = c.target.sampleCount;
 +      for (uint32_t a = 0; a < 4; ++a) {
 +        pd.colorAttachments[a].pixelFormat = attachments_[a] ? attachments_[a].pixelFormat : MTLPixelFormatInvalid;
 +        pd.colorAttachments[a].writeMask = a == index ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
@@ -2953,12 +2994,13 @@ new file mode 100644
 +  id<MTLTexture> target = pc.target; bool depth = pc.depth;
 +  uint32_t x = pc.x, y0 = pc.y0, width = pc.width, y1 = pc.y1, stencil = pc.stencil;
 +  auto color = pc.color; double depth_value = pc.depth_value;
-+  uint32_t key = (depth ? 1u : 0u) | (uint32_t(target.pixelFormat) << 1);
++  uint32_t key = (depth ? 1u : 0u) | (uint32_t(target.pixelFormat) << 1) | (uint32_t(target.sampleCount) << 16);
 +  __strong id<MTLRenderPipelineState>& pipeline = clear_pipelines_[key];
 +  if (!pipeline) {
 +    auto pd = [MTLRenderPipelineDescriptor new];
 +    pd.vertexFunction = [helper_library_ newFunctionWithName:@"transfer_vs"];
 +    pd.fragmentFunction = [helper_library_ newFunctionWithName:depth ? @"clear_depth_fs" : @"clear_color_fs"];
++    pd.rasterSampleCount = target.sampleCount;
 +    if (depth) pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = target.pixelFormat;
 +    else pd.colorAttachments[0].pixelFormat = target.pixelFormat;
 +    NSError* error = nil;
@@ -3004,7 +3046,7 @@ new file mode 100644
 +  if (hi <= dl.base) return;
 +  uint32_t first_row = lo > dl.base ? (lo - dl.base) / dl.pitch_tiles : 0;
 +  uint32_t end_row = (hi - dl.base + dl.pitch_tiles - 1) / dl.pitch_tiles;
-+  uint32_t y0 = first_row * 16, y1 = std::min<uint32_t>(end_row * 16, uint32_t(target.height));
++  uint32_t y0 = first_row * 16 / dl.ssy, y1 = std::min<uint32_t>(end_row * 16 / dl.ssy, uint32_t(target.height));
 +  if (y0 >= y1) return;
 +  if (!pending_clears_.empty()) FlushClears(sl.texture);
 +  PendingTransfer t{&sl, source_kind, target, kind, lo, hi, y0, y1};
@@ -3018,14 +3060,18 @@ new file mode 100644
 +  id<MTLTexture> target = t.target, source_texture = sl.texture;
 +  if (!pending_clears_.empty()) FlushClears(target);  // cleared before the transfer came
 +  uint32_t source_kind = t.source_kind, kind = t.kind, lo = t.lo, hi = t.hi, y0 = t.y0, y1 = t.y1;
-+  uint32_t pipeline_key = (sl.is_depth ? 1u : 0u) | (dl.is_depth ? 2u : 0u) | (uint32_t(target.pixelFormat) << 2);
++  const bool source_ms = source_texture.sampleCount > 1, target_ms = target.sampleCount > 1;
++  uint32_t pipeline_key = (sl.is_depth ? 1u : 0u) | (dl.is_depth ? 2u : 0u) | (uint32_t(target.pixelFormat) << 2) |
++                          (source_ms ? 1u << 14 : 0u) | (uint32_t(target.sampleCount) << 16);
 +  id<MTLRenderPipelineState> pipeline = transfer_pipelines_[pipeline_key];
 +  if (!pipeline) {
 +    static const char* names[] = {"transfer_color_from_color", "transfer_color_from_depth", "transfer_depth_from_color",
 +                                  "transfer_depth_from_depth"};
 +    auto pd = [MTLRenderPipelineDescriptor new];
 +    pd.vertexFunction = [helper_library_ newFunctionWithName:@"transfer_vs"];
-+    pd.fragmentFunction = [helper_library_ newFunctionWithName:[NSString stringWithUTF8String:names[pipeline_key & 3]]];
++    pd.fragmentFunction = [helper_library_ newFunctionWithName:[NSString stringWithFormat:@"%s%s%s",
++        names[pipeline_key & 3], source_ms ? "_sm" : "", target_ms ? "_dm" : ""]];
++    pd.rasterSampleCount = target.sampleCount;
 +    if (dl.is_depth) pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = target.pixelFormat;
 +    else pd.colorAttachments[0].pixelFormat = target.pixelFormat;
 +    NSError* error = nil;
@@ -3054,8 +3100,8 @@ new file mode 100644
 +  [encoder setRenderPipelineState:pipeline];
 +  if (dl.is_depth) [encoder setDepthStencilState:transfer_depth_state_];
 +  [encoder setScissorRect:MTLScissorRect{0, y0, target.width, y1 - y0}];
-+  struct { uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind; } c{
-+      dl.base, dl.pitch_tiles, sl.base, sl.pitch_tiles, lo, hi, source_kind, kind};
++  TransferConstants c{dl.base, dl.pitch_tiles, sl.base, sl.pitch_tiles, lo, hi, source_kind, kind,
++                      {dl.ssx, dl.ssy}, {sl.ssx, sl.ssy}};
 +  [encoder setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +  [encoder setFragmentTexture:source_texture atIndex:0];
 +  if (sl.is_depth) {
@@ -3078,9 +3124,11 @@ new file mode 100644
 +    uint32_t index = 5;
 +    for (uint32_t i = 0; i < 5; ++i) if (attachments_[i] == t.target) { index = i; break; }
 +    if (index == 5) continue;
++    const bool source_ms = t.source->texture.sampleCount > 1, target_ms = t.target.sampleCount > 1;
 +    uint64_t key = uint64_t(t.source->is_depth ? 1 : 0) | (uint64_t(index) << 1) | (uint64_t(attachments_[4] ? 1 : 0) << 4);
 +    for (uint32_t i = 0; i < 4; ++i)
 +      key |= uint64_t(attachments_[i] ? uint32_t(attachments_[i].pixelFormat) & 0x3FF : 0) << (5 + 10 * i);
++    key |= (uint64_t(source_ms) << 46) | (uint64_t(t.target.sampleCount) << 48);
 +    __strong id<MTLRenderPipelineState>& pipeline = in_pass_transfer_pipelines_[key];
 +    if (!pipeline) {
 +      auto pd = [MTLRenderPipelineDescriptor new];
@@ -3088,7 +3136,9 @@ new file mode 100644
 +      NSString* name = index == 4
 +          ? (t.source->is_depth ? @"transfer_depth_from_depth" : @"transfer_depth_from_color")
 +          : [NSString stringWithFormat:@"transfer_color_from_%s_%u", t.source->is_depth ? "depth" : "color", index];
++      name = [name stringByAppendingFormat:@"%s%s", source_ms ? "_sm" : "", target_ms ? "_dm" : ""];
 +      pd.fragmentFunction = [helper_library_ newFunctionWithName:name];
++      pd.rasterSampleCount = t.target.sampleCount;
 +      for (uint32_t i = 0; i < 4; ++i) {
 +        pd.colorAttachments[i].pixelFormat = attachments_[i] ? attachments_[i].pixelFormat : MTLPixelFormatInvalid;
 +        pd.colorAttachments[i].writeMask = i == index ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
@@ -3109,8 +3159,8 @@ new file mode 100644
 +    [encoder_ setViewport:MTLViewport{0, 0, double(pass_width_), double(pass_height_), 0, 1}];
 +    [encoder_ setScissorRect:MTLScissorRect{0, t.y0, width, y1 - t.y0}];
 +    const auto& dl = target_layouts_.find(reinterpret_cast<uintptr_t>((__bridge void*)t.target))->second;
-+    struct { uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind; } c{
-+        dl.base, dl.pitch_tiles, t.source->base, t.source->pitch_tiles, t.lo, t.hi, t.source_kind, t.kind};
++    TransferConstants c{dl.base, dl.pitch_tiles, t.source->base, t.source->pitch_tiles, t.lo, t.hi, t.source_kind,
++                        t.kind, {dl.ssx, dl.ssy}, {t.source->ssx, t.source->ssy}};
 +    [encoder_ setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +    [encoder_ setFragmentTexture:t.source->texture atIndex:0];
 +    if (t.source->is_depth) {
@@ -3283,6 +3333,7 @@ new file mode 100644
 +}
 +
 +void MetalDraw::DumpDepth(id<MTLTexture> texture, const std::string& name) {
++  if (texture.sampleCount > 1) return;  // debug dumps read single-sample textures
 +  FlushClears(texture);
 +  const auto dir = REXCVAR_GET(metal_debug_dir);
 +  if (dir.empty() || !texture) return;
@@ -3314,6 +3365,7 @@ new file mode 100644
 +}
 +
 +void MetalDraw::DumpTexture(id<MTLTexture> texture, const std::string& name) {
++  if (texture.sampleCount > 1) return;  // debug dumps read single-sample textures
 +  FlushClears(texture);
 +  const auto dir = REXCVAR_GET(metal_debug_dir);
 +  if (dir.empty()) return;
@@ -3898,7 +3950,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,459 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -3921,6 +3973,12 @@ new file mode 100644
 +uint2 stretched(uint2 q, constant ResolveConstants& c) {
 +  return min(((2u * q + 1u) * c.stretch_num) / (2u * c.stretch_den), c.stretch_num - 1u);
 +}
++// Real MSAA (metal_msaa): a guest sample is a position in EDRAM sample space (MSAA 2x 1x2 samples a pixel, 4x
++// 2x2); a host multisample texture holds it at pixel position / ss, sample index host_sample(position % ss).
++// Metal's standard positions: 2x sample 0 is the lower right, 1 the upper left (guest 2x: 0 top, 1 bottom); 4x
++// 0 to 3 go top, right, left, bottom, the guest's 2x2 order (top left, top right, bottom left, bottom right).
++uint host_sample(uint2 sub, uint2 ss) { return ss.x == 2u ? sub.y * 2u + sub.x : (ss.y == 2u ? 1u - sub.y : 0u); }
++uint2 guest_sub(uint i, uint2 ss) { return ss.x == 2u ? uint2(i & 1u, i >> 1) : (ss.y == 2u ? uint2(0u, 1u - i) : uint2(0u)); }
 +uint2 sample_offset(uint i, uint2 samples) {
 +  return samples.x == 2 ? uint2(i & 1, i >> 1) : uint2(0, min(i, samples.y - 1));
 +}
@@ -4029,6 +4087,41 @@ new file mode 100644
 +  uint d24 = c.format == 23 ? float32_to_20e4(depth) : uint(rint(saturate(depth) * 16777215.0f));
 +  store_raw(uint4((d24 << 8) | (stencil.read(at).r & 0xFFu), 0, 0, 0), 2, p, c, memory, rejected);
 +}
++kernel void resolve_color_ms(texture2d_ms<float, access::read> source [[texture(0)]],
++    texture2d<float, access::write> destination [[texture(1)]],
++    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
++    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
++  if (any(p >= c.size)) return;
++  uint2 base = c.origin + p * c.samples;
++  float4 value;
++  if (c.sample_select < 4) {
++    uint2 at = base + sample_offset(c.sample_select, c.samples);
++    value = source.read(at / c.samples, host_sample(at % c.samples, c.samples));
++  } else {
++    value = float4(0);
++    uint n = c.samples.x * c.samples.y;
++    for (uint i = 0; i < n; ++i) value += source.read(base / c.samples, i);
++    value /= float(n);
++  }
++  value *= c.scale;
++  if (c.swap) value = value.bgra;
++  destination.write(value, p);
++  store_guest(value, p, c, memory, rejected);
++}
++kernel void resolve_depth_ms(depth2d_ms<float, access::read> source [[texture(0)]],
++    texture2d<float, access::write> destination [[texture(1)]],
++    texture2d_ms<uint, access::read> stencil [[texture(2)]],
++    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
++    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
++  if (any(p >= c.size)) return;
++  uint2 at = c.origin + p * c.samples + sample_offset(c.sample_select, c.samples);
++  uint2 pixel = at / c.samples; uint index = host_sample(at % c.samples, c.samples);
++  float depth = source.read(pixel, index) * c.scale;
++  destination.write(float4(depth), p);
++  if (!c.write_memory) return;
++  uint d24 = c.format == 23 ? float32_to_20e4(depth) : uint(rint(saturate(depth) * 16777215.0f));
++  store_raw(uint4((d24 << 8) | (stencil.read(pixel, index).r & 0xFFu), 0, 0, 0), 2, p, c, memory, rejected);
++}
 +// Guest texture memory to linear blocks, for a blit into the texture (any format, compressed too).
 +struct LoadConstants {
 +  uint src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
@@ -4126,6 +4219,7 @@ new file mode 100644
 +  uint dst_base, dst_pitch, src_base, src_pitch;  // tiles; a tile is 80x16 samples (32bpp)
 +  uint lo, hi;  // the EDRAM tiles taken over
 +  uint src_kind, dst_kind;
++  uint2 dst_ss, src_ss;  // samples a texel of each holds (1x1 for a single-sample texture; metal_msaa)
 +};
 +// Resolve clears: a scissored full-screen triangle over only the resolved rectangle.
 +struct ClearConstants { float4 color; float depth; };
@@ -4171,9 +4265,8 @@ new file mode 100644
 +  uint d24 = kind == 7 ? float32_to_20e4(depth * 2.0f) : uint(rint(saturate(depth) * 16777215.0f));
 +  return (d24 << 8) | (stencil & 0xFFu);
 +}
-+// The source sample for this destination sample, through the EDRAM tile both cover.
-+bool transfer_source(float4 position, constant TransferConstants& c, uint2 source_size, thread uint2& s) {
-+  uint2 d = uint2(position.xy);
++// The source sample for this destination sample (both in EDRAM sample space), through the EDRAM tile both cover.
++bool transfer_source(uint2 d, constant TransferConstants& c, uint2 source_size, thread uint2& s) {
 +  uint column = d.x / 80u;
 +  if (column >= c.dst_pitch) return false;
 +  uint tile = c.dst_base + (d.y >> 4) * c.dst_pitch + column;
@@ -4190,52 +4283,79 @@ new file mode 100644
 +  out.stencil = b & 0xFFu;
 +  return out;
 +}
-+fragment float4 transfer_color_from_color(float4 position [[position]], constant TransferConstants& c [[buffer(0)]],
-+    texture2d<float, access::read> source [[texture(0)]]) {
-+  uint2 s;
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment();
-+  return unpack_color(pack_color(source.read(s), c.src_kind), c.dst_kind);
++// Reading a source at a sample-space position, single-sample or multisample.
++float4 read_color(texture2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s); }
++float4 read_color(texture2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
++float read_depth(depth2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s); }
++float read_depth(depth2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
++uint read_stencil(texture2d<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s).r; }
++uint read_stencil(texture2d_ms<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)).r; }
++template <typename T> uint2 sample_size(T t, uint2 ss) { return uint2(t.get_width(), t.get_height()) * ss; }
++// Variants: _sm a multisample source, _dm a multisample destination (run per sample).
++#define SRC_COLOR_P texture2d<float, access::read>
++#define SRC_COLOR_M texture2d_ms<float, access::read>
++#define SRC_DEPTH_P depth2d<float, access::read>
++#define SRC_DEPTH_M depth2d_ms<float, access::read>
++#define SRC_STENCIL_P texture2d<uint, access::read>
++#define SRC_STENCIL_M texture2d_ms<uint, access::read>
++#define DST_ARGS_P
++#define DST_ARGS_M , uint sid [[sample_id]]
++#define DST_COORD_P uint2(position.xy)
++#define DST_COORD_M (uint2(position.xy) * c.dst_ss + guest_sub(sid, c.dst_ss))
++#define TRANSFERS(SUFFIX, S, D) \
++fragment float4 transfer_color_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
++    SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
++  uint2 s; \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
++  return unpack_color(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); \
++} \
++fragment float4 transfer_color_from_depth##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
++    SRC_DEPTH_##S source [[texture(0)]], SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
++  uint2 s; \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
++  return unpack_color(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
++} \
++fragment TransferDepthOut transfer_depth_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
++    SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
++  uint2 s; \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
++  return unpack_depth(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); \
++} \
++fragment TransferDepthOut transfer_depth_from_depth##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
++    SRC_DEPTH_##S source [[texture(0)]], SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
++  uint2 s; \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
++  return unpack_depth(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
 +}
-+fragment float4 transfer_color_from_depth(float4 position [[position]], constant TransferConstants& c [[buffer(0)]],
-+    depth2d<float, access::read> source [[texture(0)]], texture2d<uint, access::read> stencil [[texture(1)]]) {
-+  uint2 s;
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment();
-+  return unpack_color(pack_depth(source.read(s), stencil.read(s).r, c.src_kind), c.dst_kind);
-+}
-+fragment TransferDepthOut transfer_depth_from_color(float4 position [[position]], constant TransferConstants& c [[buffer(0)]],
-+    texture2d<float, access::read> source [[texture(0)]]) {
-+  uint2 s;
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment();
-+  return unpack_depth(pack_color(source.read(s), c.src_kind), c.dst_kind);
-+}
-+fragment TransferDepthOut transfer_depth_from_depth(float4 position [[position]], constant TransferConstants& c [[buffer(0)]],
-+    depth2d<float, access::read> source [[texture(0)]], texture2d<uint, access::read> stencil [[texture(1)]]) {
-+  uint2 s;
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment();
-+  return unpack_depth(pack_depth(source.read(s), stencil.read(s).r, c.src_kind), c.dst_kind);
-+}
++TRANSFERS(, P, P)
++TRANSFERS(_sm, M, P)
++TRANSFERS(_dm, P, M)
++TRANSFERS(_sm_dm, M, M)
 +// The same into color attachment N of a draw's own pass (EDRAM transfers drawn first in the pass that
 +// needs them, instead of a pass of their own that loads and stores the target once more).
-+#define TRANSFER_INTO_COLOR(N) \
-+struct TransferColorOut##N { float4 color [[color(N)]]; }; \
-+fragment TransferColorOut##N transfer_color_from_color_##N(float4 position [[position]], \
-+    constant TransferConstants& c [[buffer(0)]], texture2d<float, access::read> source [[texture(0)]]) { \
++#define TRANSFER_INTO_COLOR(N, SUFFIX, S, D) \
++fragment TransferColorOut##N transfer_color_from_color_##N##SUFFIX(float4 position [[position]], \
++    constant TransferConstants& c [[buffer(0)]], SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
 +  uint2 s; \
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment(); \
-+  TransferColorOut##N o; o.color = unpack_color(pack_color(source.read(s), c.src_kind), c.dst_kind); return o; \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
++  TransferColorOut##N o; o.color = unpack_color(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); return o; \
 +} \
-+fragment TransferColorOut##N transfer_color_from_depth_##N(float4 position [[position]], \
-+    constant TransferConstants& c [[buffer(0)]], depth2d<float, access::read> source [[texture(0)]], \
-+    texture2d<uint, access::read> stencil [[texture(1)]]) { \
++fragment TransferColorOut##N transfer_color_from_depth_##N##SUFFIX(float4 position [[position]], \
++    constant TransferConstants& c [[buffer(0)]], SRC_DEPTH_##S source [[texture(0)]], \
++    SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
 +  uint2 s; \
-+  if (!transfer_source(position, c, uint2(source.get_width(), source.get_height()), s)) discard_fragment(); \
++  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
 +  TransferColorOut##N o; \
-+  o.color = unpack_color(pack_depth(source.read(s), stencil.read(s).r, c.src_kind), c.dst_kind); return o; \
++  o.color = unpack_color(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
++  return o; \
 +}
-+TRANSFER_INTO_COLOR(0)
-+TRANSFER_INTO_COLOR(1)
-+TRANSFER_INTO_COLOR(2)
-+TRANSFER_INTO_COLOR(3)
++#define TRANSFER_OUT(N) struct TransferColorOut##N { float4 color [[color(N)]]; };
++#define TRANSFERS_INTO_COLOR(N) TRANSFER_OUT(N) TRANSFER_INTO_COLOR(N, , P, P) TRANSFER_INTO_COLOR(N, _sm, M, P) \
++    TRANSFER_INTO_COLOR(N, _dm, P, M) TRANSFER_INTO_COLOR(N, _sm_dm, M, M)
++TRANSFERS_INTO_COLOR(0)
++TRANSFERS_INTO_COLOR(1)
++TRANSFERS_INTO_COLOR(2)
++TRANSFERS_INTO_COLOR(3)
 +// Resolve clears drawn first in the next pass on their target, into its color attachment N.
 +#define CLEAR_INTO_COLOR(N) \
 +struct ClearColorOut##N { float4 color [[color(N)]]; }; \
@@ -4294,7 +4414,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,226 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -4336,6 +4456,9 @@ new file mode 100644
 +  features.cull_distance = false;
 +  features.image_view_format_swizzle = true;
 +  features.demote_to_helper_invocation = true;
++  // On (2026-11-01): off, the colour grading turns purple at the spawn point (no speed gained). With it the
++  // translator writes a sample mask, so SPIRV-Cross reads the sample ID and pixel shaders run once per sample:
++  // costly only on multisample targets (metal_msaa).
 +  features.sample_rate_shading = true;
 +  return features;
 +}
