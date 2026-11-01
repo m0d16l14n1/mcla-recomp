@@ -129,7 +129,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,450 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -159,11 +159,13 @@ new file mode 100644
 +
 +#include <rex/chrono/clock.h>
 +#include <rex/cvar.h>
++#include <rex/memory/utils.h>
 +#include <rex/graphics/shared_memory.h>
 +#include <rex/system/xmemory.h>
 +#include <rex/graphics/registers.h>
 +#include <rex/logging.h>
 +
++REXCVAR_DECLARE(bool, gpu_regwrite_bulk);
 +REXCVAR_DEFINE_INT32(metal_cp_qos, 4, "GPU/Metal",
 +    "The command processor thread's QoS (0 unchanged, 1 background, 2 utility, 3 user initiated, 4 user interactive). "
 +    "It paces the frame: at the default QoS it shares the performance cores with everything else and moves to "
@@ -388,6 +390,43 @@ new file mode 100644
 +  return draw_ ? draw_->Resolve() : false;
 +}
 +
++void MetalCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  CommandProcessor::WriteRegister(index, value);
++  if (draw_ && index - uint32_t(XE_GPU_REG_SHADER_CONSTANT_000_X) <=
++                   uint32_t(XE_GPU_REG_SHADER_CONSTANT_LOOP_31 - XE_GPU_REG_SHADER_CONSTANT_000_X))
++    draw_->ConstantsWritten(index, index + 1);
++}
++
++void MetalCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) {
++  if (!REXCVAR_GET(gpu_regwrite_bulk)) {
++    CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);  // through WriteRegister
++    return;
++  }
++  // Ordinary registers are copied in bulk; the few with side effects go one by one through WriteRegister.
++  uint32_t index = start_index;
++  const uint32_t end = start_index + num_registers;
++  while (index < end) {
++    if (index >= RegisterFile::kRegisterCount) {
++      CommandProcessor::WriteRegistersFromMem(index, base, end - index);
++      return;
++    }
++    uint32_t segment_end;
++    if (IsSpecialRegister(index)) {
++      segment_end = index + 1;
++      WriteRegister(index, memory::load_and_swap<uint32_t>(base));
++    } else {
++      segment_end = std::min(end, uint32_t(RegisterFile::kRegisterCount));
++      for (uint32_t special : {uint32_t(XE_GPU_REG_SCRATCH_REG0), uint32_t(XE_GPU_REG_COHER_STATUS_HOST),
++                               uint32_t(XE_GPU_REG_DC_LUT_RW_INDEX)})
++        if (special > index) segment_end = std::min(segment_end, special);
++      memory::copy_and_swap(register_file_->values + index, base, segment_end - index);
++      if (draw_) draw_->ConstantsWritten(index, segment_end);
++    }
++    base += segment_end - index;
++    index = segment_end;
++  }
++}
++
 +void MetalCommandProcessor::WriteFenceValue(uint32_t address, uint32_t value) {
 +  if (int32_t us = REXCVAR_GET(metal_fence_spin_us)) SpinMicroseconds(us);
 +  // The guest's fence: written by the GPU after everything encoded before it, as the game may reuse the
@@ -545,7 +584,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,241 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include "metal_shaders.h"
@@ -573,6 +612,13 @@ new file mode 100644
 +  // false: the caller stores it.
 +  bool WriteFence(uint32_t address, uint32_t value);
 +  void EndFrame();
++  // Shader constant registers [first, end) were written (float, fetch, bool and loop constants).
++  void ConstantsWritten(uint32_t first, uint32_t end) {
++    if (first < XE_GPU_REG_SHADER_CONSTANT_256_X && end > XE_GPU_REG_SHADER_CONSTANT_000_X) ++constant_generation_[0];
++    if (first <= XE_GPU_REG_SHADER_CONSTANT_511_W && end > XE_GPU_REG_SHADER_CONSTANT_256_X) ++constant_generation_[1];
++    if (first <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5 && end > XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) ++constant_generation_[2];
++    if (first <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31 && end > XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031) ++constant_generation_[3];
++  }
 +  // The guest's display gamma ramp, applied at the swap as the console's display controller does: the
 +  // 256-entry table (DC_LUT_30_COLOR) for 8-bit front buffers, the piecewise-linear one (DC_LUT_PWL_DATA,
 +  // 128 x RGB) for 10-bit ones.
@@ -603,8 +649,21 @@ new file mode 100644
 +  // What Texture gave for a fetch constant (all six dwords, the dimension and signedness) since textures_ and
 +  // resolved_ last changed (texture_epoch_, also new every frame): a draw asks twice (the loads before its
 +  // pass, then the bindings), and draws mostly repeat their neighbours' textures.
-+  struct FastTexture { std::array<uint32_t, 7> key{}; uint64_t epoch = 0; id<MTLTexture> view = nil; };
-+  std::array<FastTexture, 1024> fast_textures_;
++  // An entry is good for the frame it was looked up in, and in later frames while the write watch of its
++  // texture (if it has one armed) has seen no CPU write.
++  struct TextureWatch;
++  struct FastTexture {
++    std::array<uint32_t, 7> key{}; uint64_t epoch = 0, frame = 0; id<MTLTexture> view = nil; uint32_t start = 0, end = 0;
++    TextureWatch* watch = nullptr;
++  };
++  TextureWatch* last_texture_watch_ = nullptr;
++  // The memory range of the texture TextureSlow last returned: a resolve or a new texture over it drops only
++  // the lookups of textures there (a resolve dropped them all, some 50 times a frame).
++  std::pair<uint32_t, uint32_t> last_texture_range_{};
++  void DropFastTextures(uint32_t start, uint64_t end);
++  std::array<FastTexture, 8192> fast_textures_;
++  // The entries' memory ranges apart (end 0: none), so a resolve's scan for overlaps reads 64 KB, not 512.
++  std::array<uint32_t, 8192> fast_start_{}, fast_end_{};  // 1,024 thrashed: free roam has about 2,000 fetch constants a frame
 +  uint64_t texture_epoch_ = 1;
 +  // A texture seen through a fetch constant's swizzle (views cached per texture and swizzle).
 +  id<MTLTexture> View(id<MTLTexture> texture, uint32_t swizzle, bool cube);
@@ -659,6 +718,14 @@ new file mode 100644
 +  // The inline constants each stage's slots hold in the current encoder (Bind skips resending them).
 +  void* bound_encoder_ = nullptr;
 +  std::array<std::array<std::vector<uint8_t>, 6>, 2> bound_bytes_;
++  std::array<std::array<void*, 32>, 2> bound_textures_{}, bound_samplers_{};
++  std::array<std::array<id<MTLTexture>, 32>, 2> draw_textures_{};  // this draw's textures, VS then PS
++  std::array<uint32_t, 2> draw_texture_count_{};
++  // Generations of the vertex floats, pixel floats, fetch and bool/loop constants, and per stage what the
++  // open encoder was last given: the float constants' gather and compare are skipped when neither the
++  // shader nor its constants changed.
++  std::array<uint64_t, 4> constant_generation_{1, 1, 1, 1};
++  std::array<std::pair<const void*, uint64_t>, 2> bound_floats_{}; std::array<uint64_t, 2> bound_bools_{}, bound_fetch_{};
 +  std::unordered_map<std::string, id<MTLTexture>> targets_, textures_;
 +  // X32_Stencil8 views of depth targets, for depth resolves (targets live as long as the backend).
 +  std::unordered_map<uintptr_t, id<MTLTexture>> stencil_views_;
@@ -698,12 +765,12 @@ new file mode 100644
 +  uint32_t pooled_textures_ = 0;
 +  id<MTLTexture> PooledTexture(MTLTextureDescriptor* desc);
 +  void Recycle(id<MTLTexture> texture);
-+  std::unordered_map<uint32_t, ResolvedTexture> resolved_;
++  std::map<uint32_t, ResolvedTexture> resolved_;  // ordered: ComposeResolves looks in an address range
 +  // The guest memory each cached texture was made from, to drop it when a resolve writes there.
 +  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> texture_ranges_;
 +  // The same ranges ordered by start, so a resolve looks only at textures near what it wrote
 +  // (scanning them all was 10% of the command processor thread).
-+  std::multimap<uint32_t, std::string> range_index_;
++  std::multimap<uint32_t, std::pair<uint32_t, std::string>> range_index_;  // start -> length, key
 +  uint32_t max_range_length_ = 0;
 +  void SetTextureRange(const std::string& key, uint32_t start, uint32_t length);
 +  void InvalidateRange(uint32_t start, uint32_t length);
@@ -763,7 +830,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,1929 @@
+@@ -0,0 +1,2018 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -818,6 +885,10 @@ new file mode 100644
 +    "EDRAM transfers into a draw's targets are drawn in the draw's pass, not in passes of their own");
 +REXCVAR_DEFINE_BOOL(metal_texture_pool, true, "GPU/Metal",
 +    "Resolve destination textures are reused once nothing holds them, instead of made and freed each resolve");
++REXCVAR_DEFINE_BOOL(metal_fast_texture_frames, true, "GPU/Metal",
++    "A texture lookup stays good across frames while the texture's write watch has seen no CPU write");
++REXCVAR_DEFINE_BOOL(metal_constant_generations, true, "GPU/Metal",
++    "Shader constants are resent to an encoder only when their registers (or the shader) changed since");
 +REXCVAR_DEFINE_BOOL(metal_debug_labels, false, "GPU/Metal",
 +    "Label every encoder with what it does (render pass targets, texture loads, resolves, clears) for GPU traces");
 +REXCVAR_DEFINE_BOOL(metal_debug_capture, false, "GPU/Metal", "Dump the next swap frame like metal_debug_frame (for pad scripts: set metal_debug_capture true)");
@@ -1072,7 +1143,7 @@ new file mode 100644
 +    debug_snapshots_.clear();
 +  }
 +  snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0;
-+  ++frame_; ++texture_epoch_;
++  ++frame_;
 +  if (REXCVAR_GET(metal_debug_capture)) {
 +    capture_frame_ = frame_;
 +    rex::cvar::SetFlagByName("metal_debug_capture", "false");
@@ -1088,8 +1159,8 @@ new file mode 100644
 +}
 +void MetalDraw::InvalidateRange(uint32_t start, uint32_t length) {
 +  if (!length) return;
-+  ++texture_epoch_;  // resolved_ and textures_ change here.
 +  uint64_t end = uint64_t(start) + length;
++  DropFastTextures(start, end);  // resolved_ and textures_ change here.
 +  for (auto it = resolved_.begin(); it != resolved_.end();) {
 +    if (it->second.start < end && uint64_t(it->second.start) + it->second.length > start) {
 +      Recycle(it->second.texture);
@@ -1100,11 +1171,11 @@ new file mode 100644
 +  }
 +  auto it = range_index_.lower_bound(start > max_range_length_ ? start - max_range_length_ : 0);
 +  while (it != range_index_.end() && it->first < end) {
-+    auto r = texture_ranges_.find(it->second);
-+    if (r == texture_ranges_.end() || uint64_t(r->second.first) + r->second.second <= start) { ++it; continue; }
-+    if (auto t = textures_.find(it->second); t != textures_.end()) { DropViews(t->second); textures_.erase(t); }
-+    texture_hashes_.erase(it->second); texture_checked_frame_.erase(it->second);
-+    texture_ranges_.erase(r);
++    if (uint64_t(it->first) + it->second.first <= start) { ++it; continue; }
++    const std::string& key = it->second.second;
++    if (auto t = textures_.find(key); t != textures_.end()) { DropViews(t->second); textures_.erase(t); }
++    texture_hashes_.erase(key); texture_checked_frame_.erase(key);
++    texture_ranges_.erase(key);
 +    it = range_index_.erase(it);
 +  }
 +}
@@ -1132,15 +1203,22 @@ new file mode 100644
 +  if (free.size() >= 12) return;
 +  free.push_back(texture); ++pooled_textures_;
 +}
++void MetalDraw::DropFastTextures(uint32_t start, uint64_t end) {
++  for (size_t i = 0; i < fast_textures_.size(); ++i)
++    if (fast_start_[i] < end && fast_end_[i] > start) {
++      fast_end_[i] = 0; fast_textures_[i].epoch = 0; fast_textures_[i].view = nil;
++    }
++}
 +void MetalDraw::SetTextureRange(const std::string& key, uint32_t start, uint32_t length) {
++  last_texture_range_ = {start, length};
 +  auto [r, inserted] = texture_ranges_.try_emplace(key, start, length);
 +  if (!inserted) {
 +    if (r->second.first == start && r->second.second == length) return;
 +    for (auto [i, e] = range_index_.equal_range(r->second.first); i != e; ++i)
-+      if (i->second == key) { range_index_.erase(i); break; }
++      if (i->second.second == key) { range_index_.erase(i); break; }
 +    r->second = {start, length};
 +  }
-+  range_index_.emplace(start, key);
++  range_index_.emplace(start, std::make_pair(length, key));
 +  max_range_length_ = std::max(max_range_length_, length);
 +}
 +id<MTLBuffer> MetalDraw::Staging(size_t size, size_t& offset) {
@@ -1283,7 +1361,15 @@ new file mode 100644
 +    if (!mask && !depth) return true;
 +    // Texture loads are compute work and cannot run inside a render pass: do them first (a load
 +    // needed while a pass is open ends it).
-+    for (auto* t : {vt, pt}) if (t) for (auto& b : shaders_.translator().bindings(t).textures) Texture(b);
++    // Bind uses what these return (the lookups were made twice a draw).
++    for (uint32_t stage = 0; stage < 2; ++stage) {
++      draw_texture_count_[stage] = 0;
++      auto* t = stage ? pt : vt;
++      if (!t) continue;
++      for (auto& b : shaders_.translator().bindings(t).textures)
++        if (draw_texture_count_[stage] < draw_textures_[stage].size()) draw_textures_[stage][draw_texture_count_[stage]++] = Texture(b);
++        else Texture(b);
++    }
 +    if (REXCVAR_GET(metal_draw_stop) == 4) return true;
 +    if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
 +    // The EDRAM rows (in samples) this draw can touch.
@@ -1705,6 +1791,9 @@ new file mode 100644
 +  if (bound_encoder_ != (__bridge void*)encoder_) {
 +    bound_encoder_ = (__bridge void*)encoder_;
 +    for (auto& stage : bound_bytes_) for (auto& slot : stage) slot.clear();
++    for (auto& stage : bound_textures_) stage.fill(nullptr);
++    bound_floats_ = {}; bound_bools_ = {}; bound_fetch_ = {};
++    for (auto& stage : bound_samplers_) stage.fill(nullptr);
 +  }
 +  auto bytes = [&](const void* data, size_t size, uint32_t slot) {
 +    if (size > 4096) { bound_bytes_[vertex][slot].clear(); buffer(Upload(data, size), slot); return; }
@@ -1715,6 +1804,12 @@ new file mode 100644
 +    else [encoder_ setFragmentBytes:data length:size atIndex:slot];
 +  };
 +  bytes(system.data(), system.size(), 0);
++  bool generations = REXCVAR_GET(metal_constant_generations);
++  // The same shader with no float constant of its stage written since: what the encoder has is current.
++  auto& bound_floats = bound_floats_[vertex];
++  uint64_t float_generation = constant_generation_[vertex ? 0 : 1];
++  if (!generations || bound_floats.first != translation || bound_floats.second != float_generation) {
++  bound_floats = {translation, float_generation};
 +  std::array<uint32_t, 1024> floats; size_t count = 0;
 +  std::memset(floats.data(), 0, 16);
 +  uint32_t base = vertex ? XE_GPU_REG_SHADER_CONSTANT_000_X : XE_GPU_REG_SHADER_CONSTANT_256_X;
@@ -1726,12 +1821,23 @@ new file mode 100644
 +    }
 +  }
 +  bytes(floats.data(), std::max(count, size_t(1)) * 16, vertex ? 1 : 2);
-+  bytes(&regs_[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 40 * 4, 3);
-+  bytes(vertex && REXCVAR_GET(metal_snapshot_vertices) ? draw_fetch_.data() : &regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4, 4);
++  }
++  if (!generations || bound_bools_[vertex] != constant_generation_[3]) {
++    bound_bools_[vertex] = constant_generation_[3];
++    bytes(&regs_[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 40 * 4, 3);
++  }
++  // The vertex stage's fetch constants are rewritten per draw for the vertex snapshots: compared each time.
++  if (vertex && REXCVAR_GET(metal_snapshot_vertices)) bytes(draw_fetch_.data(), 32 * 6 * 4, 4);
++  else if (!generations || bound_fetch_[vertex] != constant_generation_[2]) {
++    bound_fetch_[vertex] = constant_generation_[2];
++    bytes(&regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4, 4);
++  }
 +  buffer(REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_, 5);
 +  const auto& bindings = shaders_.translator().bindings(translation);
++  uint32_t stage = vertex ? 0 : 1, texture_index = 0;
 +  for (auto& t : bindings.textures) {
-+    auto texture = Texture(t);
++    id<MTLTexture> texture = texture_index < draw_texture_count_[stage] ? draw_textures_[stage][texture_index] : Texture(t);
++    ++texture_index;
 +    if (DebugFrame() && debug_draw_log_) {
 +      auto f = regs_.GetTextureFetch(t.fetch_constant);
 +      uint32_t a = (f.base_address << 12) & 0x1FFFFFFF;
@@ -1742,11 +1848,22 @@ new file mode 100644
 +          texture.width, texture.height, uint32_t(texture.pixelFormat),
 +          r != resolved_.end() ? fmt::format("resolve {}x{} fmt {}", r->second.width, r->second.height, r->second.format) : std::string("memory"));
 +    }
++    // Textures and samplers already bound in this encoder are not sent again (a tenth of Bind).
++    if (t.index < bound_textures_[vertex].size()) {
++      auto& bound = bound_textures_[vertex][t.index];
++      if (bound == (__bridge void*)texture) continue;
++      bound = (__bridge void*)texture;
++    }
 +    if (vertex) [encoder_ setVertexTexture:texture atIndex:t.index];
 +    else [encoder_ setFragmentTexture:texture atIndex:t.index];
 +  }
 +  for (auto& s : bindings.samplers) {
 +    auto sampler = Sampler(s);
++    if (s.index < bound_samplers_[vertex].size()) {
++      auto& bound = bound_samplers_[vertex][s.index];
++      if (bound == (__bridge void*)sampler) continue;
++      bound = (__bridge void*)sampler;
++    }
 +    if (vertex) [encoder_ setVertexSamplerState:sampler atIndex:s.index];
 +    else [encoder_ setFragmentSamplerState:sampler atIndex:s.index];
 +  }
@@ -1779,8 +1896,8 @@ new file mode 100644
 +  struct Piece { const ResolvedTexture* r; uint32_t y; };
 +  std::vector<Piece> pieces;
 +  MTLPixelFormat pixel_format = MTLPixelFormatInvalid;
-+  for (auto& [piece_address, r] : resolved_) {
-+    if (piece_address < address || piece_address - address >= range) continue;
++  for (auto it = resolved_.lower_bound(address); it != resolved_.end() && it->first - address < range; ++it) {
++    uint32_t piece_address = it->first; const ResolvedTexture& r = it->second;
 +    uint32_t delta = piece_address - address;
 +    if (delta % macro_row_bytes || r.width != width || r.pitch != pitch || !ResolveFormatMatches(r.format, format)) continue;
 +    if (pixel_format != MTLPixelFormatInvalid && r.texture.pixelFormat != pixel_format) return nil;
@@ -1869,10 +1986,31 @@ new file mode 100644
 +  key[6] = uint32_t(binding.dimension) | (binding.is_signed ? 0x100u : 0u);
 +  uint32_t h = 2166136261u;
 +  for (uint32_t v : key) h = (h ^ v) * 16777619u;
-+  auto& entry = fast_textures_[(h ^ (h >> 15)) & (fast_textures_.size() - 1)];
-+  if (entry.epoch == texture_epoch_ && entry.key == key) return entry.view;
++  // Four ways a set: a direct-mapped table lost a fifth of the lookups to collisions.
++  FastTexture* set = &fast_textures_[((h ^ (h >> 15)) & (fast_textures_.size() / 4 - 1)) * 4];
++  FastTexture* victim = set;
++  for (uint32_t way = 0; way < 4; ++way) {
++    FastTexture& entry = set[way];
++    if (entry.epoch == texture_epoch_ && entry.key == key) {
++      if (entry.frame == frame_) return entry.view;
++      if (entry.watch && entry.watch->pending.load(std::memory_order_acquire) &&
++          !entry.watch->dirty.load(std::memory_order_acquire)) {
++        entry.frame = frame_; ++texture_watch_hits_;
++        return entry.view;
++      }
++      victim = &entry;  // known but due for a look: the same slot
++      break;
++    }
++    if (victim->epoch == texture_epoch_ && (entry.epoch != texture_epoch_ || entry.frame < victim->frame)) victim = &entry;
++  }
++  FastTexture& entry = *victim;
++  last_texture_range_ = {0, 0}; last_texture_watch_ = nullptr;
 +  id<MTLTexture> view = TextureSlow(binding);
-+  entry.key = key; entry.epoch = texture_epoch_; entry.view = view;
++  entry.key = key; entry.epoch = texture_epoch_; entry.frame = frame_; entry.view = view;
++  entry.watch = REXCVAR_GET(metal_fast_texture_frames) ? last_texture_watch_ : nullptr;
++  entry.start = last_texture_range_.first;
++  entry.end = last_texture_range_.first + std::max(1u, last_texture_range_.second);
++  fast_start_[&entry - fast_textures_.data()] = entry.start; fast_end_[&entry - fast_textures_.data()] = entry.end;
 +  return view;
 +}
 +
@@ -1885,7 +2023,18 @@ new file mode 100644
 +  Key(key, binding.dimension); Key(key, binding.is_signed);
 +  bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
 +  auto cached = textures_.find(key);
-+  if (cached != textures_.end() && texture_checked_frame_[key] == frame_) return View(cached->second, fetch.swizzle, cube);
++  // What the fast lookup keeps with its entry: the texture's memory, and its write watch if it is armed and
++  // clean (a texture without one, or made from resolves, is looked at again every frame).
++  auto remember_range = [&] {
++    if (auto r = texture_ranges_.find(key); r != texture_ranges_.end()) last_texture_range_ = r->second;
++    if (auto w = texture_watches_.find(key); w != texture_watches_.end() &&
++        w->second->pending.load(std::memory_order_acquire) && !w->second->dirty.load(std::memory_order_acquire))
++      last_texture_watch_ = w->second.get();
++  };
++  if (cached != textures_.end() && texture_checked_frame_[key] == frame_) {
++    remember_range();
++    return View(cached->second, fetch.swizzle, cube);
++  }
 +  TextureWatch* watch = nullptr;
 +  if (REXCVAR_GET(metal_texture_watches)) {
 +    auto& slot = texture_watches_[key];
@@ -1896,6 +2045,7 @@ new file mode 100644
 +        !watch->dirty.load(std::memory_order_acquire)) {
 +      texture_checked_frame_[key] = frame_;
 +      ++texture_watch_hits_;
++      remember_range();
 +      return View(cached->second, fetch.swizzle, cube);
 +    }
 +  }
@@ -1951,8 +2101,10 @@ new file mode 100644
 +  }
 +  texture_checked_frame_[key] = frame_;
 +  SetTextureRange(key, address, resolved ? resolved->length : range);
-+  if (cached != textures_.end() && content_hash != kUnknownHash && texture_hashes_[key] == content_hash)
++  if (cached != textures_.end() && content_hash != kUnknownHash && texture_hashes_[key] == content_hash) {
++    if (!resolved && !composite && content_hash != kComposedHash) remember_range();
 +    return View(cached->second, fetch.swizzle, cube);
++  }
 +  if (DebugFrame())
 +    REXGPU_INFO("Metal texture load debug: addr {:08X} fmt {} {}x{} range {} - {}", address, uint32_t(fetch.format),
 +        uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1, range,
@@ -2060,7 +2212,11 @@ new file mode 100644
 +      [texture replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:i withBytes:&zero bytesPerRow:4 bytesPerImage:4];
 +  }
 +  if (cached != textures_.end()) DropViews(cached->second);
-+  ++texture_epoch_; textures_[key] = texture; return View(texture, fetch.swizzle, cube);
++  // Lookups of the texture this replaces (other swizzles) cover its address.
++  DropFastTextures(address, uint64_t(address) + std::max(1u, last_texture_range_.second));
++  textures_[key] = texture;
++  if (!resolved && !composite) remember_range();
++  return View(texture, fetch.swizzle, cube);
 +}
 +
 +id<MTLTexture> MetalDraw::View(id<MTLTexture> texture, uint32_t swizzle_bits, bool cube) {
@@ -2697,7 +2853,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,193 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -2851,6 +3007,10 @@ new file mode 100644
 +                 IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
 +  bool IssueCopy() override;
 +  void WriteFenceValue(uint32_t address, uint32_t value) override;
++  // Register writes: blocks copied in bulk (as D3D12 and xenia-canary do), and the shader constant blocks
++  // written reported to the draw path, which then resends only those (metal_constant_generations).
++  void WriteRegister(uint32_t index, uint32_t value) override;
++  void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
 +  // The Metal shader storage: the microcode and modifications of every shader translated before, warmed up
 +  // (translated and compiled on worker threads) before the title starts.
 +  void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id, bool blocking) override;

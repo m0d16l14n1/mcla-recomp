@@ -265,6 +265,31 @@ GPU time about 17 ms a frame, from 19 to 20).
   freed (an IOKit call apiece on the command thread). Freed ones go to a pool and are taken again when the pool
   holds the last reference (no cached view of them, no command buffer using them still running).
 
+**Sixth pass (2026-11-01): the command thread, for a warm Mac.** On a cool Mac the GPU is the limit (the command
+thread waits for it 3 to 5 ms a frame); once the Mac is warm, macOS reports heavy thermal pressure
+(`notifyutil -g com.apple.system.thermalpressurelevel` gives 2, which `scripts/mac_bench.sh` now prints with each
+result) and the same work on the command thread takes about three times as long, so it sets the frame rate.
+
+- *Texture lookups* (`metal_fast_texture_frames`): the lookup cache was emptied by every resolve and every frame,
+  and with 1,024 direct-mapped entries for about 2,000 fetch constants a frame it also lost a fifth of its
+  lookups to collisions: 2,270 lookups a frame took the slow path (string keys, several hash maps). Now a resolve
+  drops only the lookups of textures in its memory, an entry stays good across frames while the texture's write
+  watch has seen no CPU write, and the cache has 8,192 entries in sets of four: about 180 slow lookups a frame.
+  The textures a draw looks up before its pass (for loads) are the ones `Bind` binds, not looked up again.
+- *Bindings*: textures and samplers already bound in the encoder are not set again; the float, bool and fetch
+  constants are not gathered and compared when no register of theirs was written since the encoder got them
+  (`metal_constant_generations`): the Metal command processor now writes register blocks in bulk, as the D3D12
+  one does (`gpu_regwrite_bulk`), and counts writes to each constant block.
+- *Resolves*: the scan for cached lookups over a resolved range reads a compact array, and the texture range index
+  keeps lengths, so textures outside the range cost no hash lookup. `resolved_` is ordered, so making a surface
+  from resolves looks only at resolves inside it.
+
+In a paired run with the Mac hot, the command thread's busy time was 25.7 ms a frame against 26.4 with these off;
+cool, it is about 8 ms busy of a 17 ms frame. Anti-aliasing off (`--mcla_anti_aliasing=off`): 80.8 FPS on a cool
+Mac, GPU 13.6 ms a frame, since the game then draws its scene in one EDRAM tile (fewer passes, resolves and
+transfers) and shades half the samples. Real MSAA is deferred: EDRAM is kept in sample-space textures that a
+multisampled Metal texture cannot alias, so it needs either a new EDRAM model or conversions at every scene pass.
+
 How these were measured matters: this Mac heats up, and in a series of back-to-back benchmark runs each run is
 slower than the one before (the command thread's CPU time per frame goes from about 13 ms to 25 for the same
 build), so a variant always run first in its pair wins. Use a pause of a couple of minutes between runs, or

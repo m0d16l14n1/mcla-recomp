@@ -15,6 +15,9 @@ out="$root/out/bench"; mkdir -p "$out"
 n=0
 for variant in "$@"; do
   n=$((n + 1))
+  # macOS thermal pressure (0 nominal, 1 moderate, 2 heavy, 3 trapping): a warm Mac moves the game's
+  # threads to slower cores, and back-to-back runs slow down by a third or more.
+  thermal=$(notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null | awk '{print $2}')
   : > "$build/run.log"
   # shellcheck disable=SC2086 # the variant is a list of options
   sh "$root/scripts/play_mac.sh" --fullscreen=false --mcla_fps=0 \
@@ -24,7 +27,7 @@ for variant in "$@"; do
   f0=$(sed -n 's/.*mark bench_start at engine frame \([0-9]*\).*/\1/p' "$out/$n.log" | head -1)
   f1=$(sed -n 's/.*mark bench_end at engine frame \([0-9]*\).*/\1/p' "$out/$n.log" | head -1)
   if [ -n "$f0" ] && [ -n "$f1" ]; then
-    echo "$n: $(echo "scale=1; ($f1 - $f0) / 10" | bc) FPS  [${variant:-baseline}]"
+    echo "$n: $(echo "scale=1; ($f1 - $f0) / 10" | bc) FPS  [${variant:-baseline}]  (thermal pressure ${thermal:-?} at start)"
   else
     echo "$n: no result (the script did not reach the benchmark; see out/bench/$n.log)  [${variant:-baseline}]"
   fi

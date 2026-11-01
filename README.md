@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 FPS** on a cool, quiet Mac; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 FPS** on a cool, quiet Mac (80 with anti-aliasing off); 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -69,6 +69,8 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_compose_resolves=false` | Load surfaces the game assembles from resolves from guest memory instead of copying the resolves' textures (`--metal_compose_gaps=false`: only when the resolves cover the whole surface) |
 | `--metal_transfers_in_pass=false` | Give each EDRAM transfer a render pass of its own instead of drawing it in the draw's pass |
 | `--metal_texture_pool=false` | Make a new texture for every resolve instead of reusing freed ones |
+| `--metal_fast_texture_frames=false` | Look every texture up again each frame instead of trusting its write watch |
+| `--metal_constant_generations=false` | Compare all shader constants at every draw instead of only the blocks written since |
 | `--metal_cp_qos=0` | Leave the GPU command thread at the default QoS class (4: user interactive) |
 | `--mcla_fence_sleep_us=0` | Spin while the game waits for the GPU, as before |
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
