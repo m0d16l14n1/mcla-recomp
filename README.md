@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 91 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -50,7 +50,7 @@ bash scripts/play_mac.sh --mcla_gpu_backend=metal     # the native Metal backend
 | | |
 |---|---|
 | Macs | Apple Silicon (M1 and later), arm64 only. Intel Macs are not a target. |
-| Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR setting (`--mcla_anti_aliasing=fsr`) is MetalFX temporal anti-aliasing. Planned: EDR (HDR) and MetalFX upscaling. |
+| Graphics | Vulkan through MoltenVK, or the native Metal backend. On Metal, the game's FSR settings are MetalFX: `--mcla_anti_aliasing=fsr` temporal anti-aliasing, with `--mcla_upscaling=quality`, `balanced` or `performance` upscaling to the window's 720p. Planned: EDR (HDR). |
 | Input, audio | SDL3: Xbox and DualSense controllers, keyboard. |
 | Not on macOS | Direct3D 12, FSR 3.1 and frame generation, NVIDIA Reflex, AMD Anti-Lag 2, the Windows launcher and installer. |
 
@@ -78,6 +78,7 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--mcla_fence_sleep_us=0` | Spin while the game waits for the GPU, as before |
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
 | `--metal_shader_storage=false` | No shader storage and warm-up at boot |
+| `--metal_taa_upscale=false` | No MetalFX upscaling (the scene drawn at full size whatever `mcla_upscaling` says) |
 | `--metal_shader_math=1` or `2` | Relaxed or fast math in the shader compiler (shifts the colour grading; for testing) |
 
 Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, texture loads, copies, transfers, render passes) and a `Metal command processor` line with the GPU command thread's CPU time. Diagnostics (frame dumps, GPU traces with `--metal_debug_labels=true`): [docs/metal-backend.md](docs/metal-backend.md).

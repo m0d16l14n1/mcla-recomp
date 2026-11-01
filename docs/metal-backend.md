@@ -357,8 +357,7 @@ on Metal means MetalFX; MSAA 2x stays the default).
   62.6 with MSAA 2x** (+22%), the command thread 8 against 10.5 ms. The still picture matches, and in motion
   there are no trails; objects that move with the camera (the player's car) are a little softer than with MSAA,
   since the motion vectors know only the camera's motion. The jitter keeps FSR's sign convention
-  (`temporal_aa_flip_jitter` flips it). Next: upscaling from below native (`temporal_aa_upscale` needs a
-  resolution scale in the Metal render targets) and MetalFX spatial upscaling in the presenter.
+  (`temporal_aa_flip_jitter` flips it). Upscaling from below native: the ninth pass, below.
 - *Texture work before the pass* (`metal_texture_work_before_pass`): a texture load, a surface made from
   resolves or the TAA run that a draw needs while a pass is open used to end the pass (compute and blit work
   cannot run in a render pass) and reopen it, which stores and reloads its targets. The backend now remembers,
@@ -373,6 +372,33 @@ on Metal means MetalFX; MSAA 2x stays the default).
   against 67.3 FPS). Kept safe.
 - The stats line counts passes ended for texture work (`ended for texture loads`) and loads encoded before
   their pass (`loads before their pass`).
+
+**Ninth pass (2026-11-01): MetalFX upscaling, 86 to 91 FPS** (`--mcla_anti_aliasing=fsr` with
+`--mcla_upscaling=quality` or `performance`, the game's FSR upscaling settings, which set the SDK's
+`temporal_aa_upscale`; `--metal_taa_upscale=false` turns it off on Metal).
+
+The SDK's upscaling path (written for FSR 3.1 on Vulkan and D3D12) is used as it is: the scene's draws go into the
+top-left render-size corner of the output-size render targets (`TaaSqueeze` on the host viewport and scissor, and
+`ps_param_gen` scaled), the scene's resolves read that corner through a nearest-neighbour stretch back to the
+output size so that every texture the game makes of the scene is a full-size one, and at the motion blur draw the
+render-size samples are gathered out of those textures (render pixel i is output pixel
+`(2 * output * i + render - 1) / (2 * render)`, the first to show it). On Metal:
+
+- `MetalDraw::taa_draw_` (every draw: the jitter, then the squeeze) and `taa_resolve_stretch_` (every resolve
+  while the scene may be squeezed); the resolve kernels read `min(((2q + 1) * render) / (2 * output), render - 1)`
+  for a stretched resolve (`ResolveConstants.stretch`, single-sampled sources).
+- The motion vector kernel gathers too (the depth, the stencil and, when upscaling, the colour into a
+  render-size texture), and so does the depth copy for MetalFX; at the native size the gather is the identity.
+- The `MTLFXTemporalScaler` is made for the render size and the output (`TaaReady` compares both); a frame that
+  asks for upscaling and was not squeezed makes the scaler and returns `u`, the next one is squeezed.
+- Rectangle lists do not go to the jitter: the scene's first draw is a 4x MSAA rectangle clear of the EDRAM, which
+  the Vulkan backend turns into a clear without a draw, and which here decided that no frame was squeezed.
+
+Free roam, uncapped, 150 s pauses: MetalFX at the native size 77.3 and 76.9 FPS, Quality (853x480 to
+1280x720) **86.0**, Performance (640x360) **91.3**. The command thread stays at 8 ms a frame, so it is the next
+limit (about 125 FPS). The spawn point's picture at Performance has the same mean colour as MSAA 2x to a tenth,
+and the minimap is stable over 10 frames.
+No mips are sampled on Metal yet, so the SDK's LOD bias for the squeezed scene (`TaaLodBias`) is not applied.
 
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),

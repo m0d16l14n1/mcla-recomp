@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,494 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -171,6 +171,9 @@ new file mode 100644
 +    "The command processor thread's QoS (0 unchanged, 1 background, 2 utility, 3 user initiated, 4 user interactive). "
 +    "It paces the frame: at the default QoS it shares the performance cores with everything else and moves to "
 +    "the efficiency cores under load (user interactive: about 10% more frames on a busy M4)");
++REXCVAR_DEFINE_BOOL(metal_taa_upscale, true, "GPU/Metal",
++                    "MetalFX upscaling with temporal_aa_upscale above 1 (the game's FSR upscaling setting): the scene drawn "
++                    "into the render-size corner of its targets and stretched back by its resolves");
 +REXCVAR_DEFINE_BOOL(metal_resolves, true, "GPU/Metal", "Resolves (diagnostic: false skips them)");
 +REXCVAR_DEFINE_INT32(metal_resolve_spin_us, 0, "GPU/Metal", "Diagnostic: the command processor spins this long at every resolve");
 +REXCVAR_DEFINE_INT32(metal_fence_spin_us, 0, "GPU/Metal", "Diagnostic: the command processor spins this long before every fence write");
@@ -235,8 +238,30 @@ new file mode 100644
 +  if (!draw_->Initialize()) return false;
 +  // The scene's draws jittered for temporal AA (Vulkan's convention: the SPIR-V NDC is +y down, and the Metal
 +  // system constants flip it with the rest).
-+  draw_->taa_jitter_ = [this](const uint32_t extent[2], float ndc_offset[3]) {
-+    TaaJitterNdcOffset(register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type, false, extent, ndc_offset);
++  // With upscaling, the scene's draws then squeezed into the render-size corner (the jitter decides that at the
++  // scene's first draw, so it comes first, with the full-size extent).
++  draw_->taa_draw_ = [this](draw_util::ViewportInfo& viewport, draw_util::Scissor& scissor, float& param_gen_scale) {
++    // Rectangle lists are never jittered, and the scene's first one (a 4x MSAA clear of the EDRAM, which the
++    // Vulkan backend turns into a clear without a draw) must not decide whether the frame is squeezed.
++    auto prim_type = register_file_->Get<reg::VGT_DRAW_INITIATOR>().prim_type;
++    if (prim_type != xenos::PrimitiveType::kRectangleList)
++      TaaJitterNdcOffset(prim_type, false, viewport.xy_extent, viewport.ndc_offset);
++    if (taa_frame_.up_state == 1) {
++      TaaSqueeze(viewport.xy_offset, viewport.xy_extent, scissor.offset, scissor.extent);
++      param_gen_scale = TaaPsParamGenScale();
++    }
++  };
++  draw_->taa_resolve_stretch_ = [this](uint32_t pitch_px, uint32_t samples, uint32_t format, bool depth,
++                                       uint32_t num[2], uint32_t den[2]) {
++    if (!TaaSqueezingScene()) return false;
++    TaaResolveInfo info;
++    info.pitch_px = pitch_px; info.msaa_samples = samples; info.format = format; info.is_depth = depth;
++    info.direct_source = true; info.copy_ok = samples == 1;  // the resolve kernels stretch single-sampled sources
++    TaaStretch stretch;
++    TaaResolveStretch(info, stretch);
++    if (!stretch.active) return false;
++    num[0] = stretch.num[0]; num[1] = stretch.num[1]; den[0] = stretch.den[0]; den[1] = stretch.den[1];
++    return true;
 +  };
 +  REXGPU_INFO("Metal backend: native drawing (in development; MSAA is drawn as supersampling)");
 +  stats_since_ms_ = chrono::Clock::QueryHostUptimeMillis();
@@ -354,7 +379,10 @@ new file mode 100644
 +  return shader_ptr;
 +}
 +
-+bool MetalCommandProcessor::TaaReady() const { return draw_ && draw_->TaaReady(); }
++bool MetalCommandProcessor::TaaReady() const {
++  return draw_ && draw_->TaaReady(taa_up_.out_width, taa_up_.out_height, taa_up_.render_width, taa_up_.render_height);
++}
++bool MetalCommandProcessor::TaaUpscaleSupported() const { return REXCVAR_GET(metal_taa_upscale); }
 +bool MetalCommandProcessor::TaaCheckAvailable() { return device_ && MetalDraw::TaaSupported(device_); }
 +
 +bool MetalCommandProcessor::IssueDraw([[maybe_unused]] xenos::PrimitiveType prim_type,
@@ -370,7 +398,8 @@ new file mode 100644
 +  if (!REXCVAR_GET(metal_draw)) return true;
 +  // Temporal AA: the anti-aliasing pass before the draw that reads the scene (the game's motion blur).
 +  if (taa_pending_ && active_pixel_shader() && draw_) {
-+    MetalDraw::TaaInputs inputs{&taa_vector_constants_, sizeof(taa_vector_constants_), {}, taa_camera_.reset};
++    MetalDraw::TaaInputs inputs{&taa_vector_constants_, sizeof(taa_vector_constants_), {}, taa_camera_.reset,
++        taa_up_.out_width, taa_up_.out_height, taa_up_.render_width, taa_up_.render_height, taa_frame_.up_state == 1};
 +    TaaFsrJitter(inputs.jitter);
 +    taa_frame_.status = draw_->TaaRun(inputs);
 +    if (taa_frame_.status == '+') taa_frame_.done = true;
@@ -600,7 +629,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,310 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -632,15 +661,29 @@ new file mode 100644
 +  // Temporal anti-aliasing with MetalFX (the SDK's temporal_aa, which the fork's mcla_anti_aliasing = fsr
 +  // turns on): the jitter of the scene's draws (the command processor's TaaJitterNdcOffset), and the pass
 +  // before the game's motion blur draw. TaaRun returns the status for temporal_aa_debug 4 ('+' when it ran).
-+  std::function<void(const uint32_t extent[2], float ndc_offset[3])> taa_jitter_;
++  // For every draw, with its host viewport and scissor: the jitter (into the NDC offset), then, when the frame's
++  // scene is squeezed for upscaling (temporal_aa_upscale above 1), the viewport and scissor squeezed into the
++  // top-left render size of the target, and the ps_param_gen scale.
++  std::function<void(draw_util::ViewportInfo& viewport, draw_util::Scissor& scissor, float& param_gen_scale)> taa_draw_;
++  // For a resolve while the scene may be squeezed: whether to read the source through the stretch (num the render
++  // size, den the output size); copy_ok is whether this resolve can stretch.
++  std::function<bool(uint32_t pitch_px, uint32_t samples, uint32_t format, bool depth, uint32_t num[2], uint32_t den[2])>
++      taa_resolve_stretch_;
 +  struct TaaInputs {
 +    const void* vector_constants;  // CommandProcessor::TaaVectorConstants (size and stencil component set here)
 +    size_t vector_constants_size;
-+    float jitter[2];  // host pixels, +y down (FSR's convention)
++    float jitter[2];  // render pixels, +y down (FSR's convention)
 +    bool reset;
++    // The output size (the scene textures') and the size the scene was drawn at; squeezed: this frame's scene
++    // was drawn at the render size (else a render size below the output only makes the scaler for it).
++    uint32_t out_width, out_height, render_width, render_height;
++    bool squeezed;
 +  };
 +  static bool TaaSupported(id<MTLDevice> device);
-+  bool TaaReady() const { return taa_scaler_ != nil; }
++  bool TaaReady(uint32_t out_width, uint32_t out_height, uint32_t render_width, uint32_t render_height) const {
++    return taa_scaler_ != nil && taa_width_ == out_width && taa_height_ == out_height &&
++           taa_render_width_ == render_width && taa_render_height_ == render_height;
++  }
 +  char TaaRun(TaaInputs& inputs);
 +  // Shader constant registers [first, end) were written (float, fetch, bool and loop constants).
 +  void ConstantsWritten(uint32_t first, uint32_t end) {
@@ -875,7 +918,8 @@ new file mode 100644
 +                 uint32_t x, uint32_t y0, uint32_t width, uint32_t y1);
 +  id<MTLLibrary> helper_library_ = nil;
 +  id taa_scaler_ = nil;  // id<MTLFXTemporalScaler>
-+  uint32_t taa_width_ = 0, taa_height_ = 0;
++  uint32_t taa_width_ = 0, taa_height_ = 0, taa_render_width_ = 0, taa_render_height_ = 0;
++  id<MTLTexture> taa_color_ = nil;  // upscaling: the render-size colour gathered from the stretched scene
 +  id<MTLTexture> taa_motion_ = nil, taa_depth_ = nil, taa_output_ = nil;
 +  id<MTLComputePipelineState> taa_vectors_pipeline_ = nil;
 +  id<MTLRenderPipelineState> taa_depth_pipeline_ = nil;
@@ -900,7 +944,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2414 @@
+@@ -0,0 +1,2441 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1030,9 +1074,10 @@ new file mode 100644
 +  uint32_t sx = 0, sy = 0, width = 0, height = 0, dx = 0, dy = 0, pitch = 0, address = 0, format = 0, endian = 0,
 +      swap = 0, write_memory = 0;
 +  float scale = 1.0f; uint32_t padding = 0;
-+  uint32_t samples_x = 1, samples_y = 1, sample_select = 0, extent_start = 0, extent_end = 0, padding2 = 0;
++  uint32_t samples_x = 1, samples_y = 1, sample_select = 0, extent_start = 0, extent_end = 0, stretch = 0;
++  uint32_t stretch_num[2] = {}, stretch_den[2] = {};  // temporal_aa_upscale: the render and output sizes
 +};
-+static_assert(sizeof(ResolveConstants) == 80);
++static_assert(sizeof(ResolveConstants) == 96);
 +template <typename T> void Key(std::string& key, T value) {
 +  key.append(reinterpret_cast<const char*>(&value), sizeof(value));
 +}
@@ -1454,6 +1499,8 @@ new file mode 100644
 +    draw_util::Scissor scissor{}; draw_util::GetScissor(regs_, scissor);
 +    scissor.offset[0] *= ssx; scissor.extent[0] *= ssx; scissor.offset[1] *= ssy; scissor.extent[1] *= ssy;
 +    if (!scissor.extent[0] || !scissor.extent[1] || !viewport.xy_extent[0] || !viewport.xy_extent[1]) return true;
++    float param_gen_scale = 1.0f;
++    if (taa_draw_) taa_draw_(viewport, scissor, param_gen_scale);
 +    const uint32_t width = pitch * ssx;
 +    std::array<id<MTLTexture>, 5> next{};
 +    std::string key; Key(key, reinterpret_cast<uintptr_t>(vt)); Key(key, reinterpret_cast<uintptr_t>(pt));
@@ -1759,14 +1806,7 @@ new file mode 100644
 +    [encoder_ setCullMode:!polygonal ? MTLCullModeNone : raster.cull_front ? MTLCullModeFront : raster.cull_back ? MTLCullModeBack : MTLCullModeNone];
 +    [encoder_ setBlendColorRed:regs_.Get<float>(XE_GPU_REG_RB_BLEND_RED) green:regs_.Get<float>(XE_GPU_REG_RB_BLEND_GREEN)
 +                        blue:regs_.Get<float>(XE_GPU_REG_RB_BLEND_BLUE) alpha:regs_.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)];
-+    if (taa_jitter_) {
-+      // Temporal anti-aliasing: the scene's draws moved by this frame's jitter (in their NDC offset only).
-+      draw_util::ViewportInfo jittered = viewport;
-+      taa_jitter_(viewport.xy_extent, jittered.ndc_offset);
-+      BuildMetalSystemConstants(regs_, primitive, jittered, system_bytes_, signs_.data());
-+    } else {
-+      BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data());
-+    }
++    BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data(), param_gen_scale);
 +    const auto& system = system_bytes_;
 +    debug_draw_log_ = DebugFrame() && primitive.host_draw_vertex_count <= 6;
 +    Bind(*vs, vt, true, system); if (ps) Bind(*ps, pt, false, system);
@@ -2557,6 +2597,13 @@ new file mode 100644
 +        // Depth resolves write the EDRAM depth format (xenos.h: no format conversion for depth).
 +        constants.extent_start = info.copy_dest_extent_start & 0x1FFFFFFF;
 +        constants.extent_end = std::min(constants.extent_start + info.copy_dest_extent_length, 0x20000000u);
++        // Upscaling: a resolve of the squeezed scene reads its render-size corner stretched to the output size.
++        if (taa_resolve_stretch_) {
++          uint32_t pitch_px = (ei.pitch_tiles * xenos::kEdramTileWidthSamples) >> uint32_t(ei.format_is_64bpp);
++          if (taa_resolve_stretch_(pitch_px, 1u << uint32_t(ei.msaa_samples), ei.format, depth,
++                                   constants.stretch_num, constants.stretch_den))
++            constants.stretch = 1;
++        }
 +        if (depth) constants.format = depth_float ? uint32_t(xenos::TextureFormat::k_24_8_FLOAT) : uint32_t(xenos::TextureFormat::k_24_8);
 +        if (depth && DebugFrame() && REXCVAR_GET(metal_debug_depth_dumps))
 +          DumpDepth(source, fmt::format("depth_before_resolve_{}_{}_{}", resolves_ + 1, sx, sy));
@@ -3088,10 +3135,15 @@ new file mode 100644
 +    if (!scene || !stencil || !depth) return 't';
 +    auto root = [](id<MTLTexture> t) { while (t.parentTexture) t = t.parentTexture; return t; };
 +    id<MTLTexture> scene_base = root(scene), depth_base = root(depth);
-+    const uint32_t width = uint32_t(scene_base.width), height = uint32_t(scene_base.height);
++    // The output (the scene textures' size) and the size the scene was drawn at.
++    const uint32_t width = inputs.out_width, height = inputs.out_height;
++    const uint32_t render_width = inputs.render_width, render_height = inputs.render_height;
 +    if (scene_base.pixelFormat != MTLPixelFormatRGBA16Float || depth_base.pixelFormat != MTLPixelFormatR32Float ||
-+        depth_base.width != width || depth_base.height != height || stencil.width != width || stencil.height != height)
++        scene_base.width != width || scene_base.height != height || depth_base.width != width ||
++        depth_base.height != height || stencil.width != width || stencil.height != height ||
++        !render_width || !render_height || render_width > width || render_height > height)
 +      return 'r';
++    const bool upscale = render_width != width || render_height != height;
 +    if (!taa_vectors_pipeline_) {
 +      NSError* error = nil;
 +      taa_vectors_pipeline_ = [device_ newComputePipelineStateWithFunction:
@@ -3110,57 +3162,75 @@ new file mode 100644
 +        return 'x';
 +      }
 +    }
-+    if (!taa_scaler_ || taa_width_ != width || taa_height_ != height) {
-+      // MetalFX's temporal scaler at native size: anti-aliasing, not upscaling (the scene is drawn at the
-+      // output size; with the game's MSAA off it is drawn in one EDRAM tile).
++    if (!TaaReady(width, height, render_width, render_height)) {
++      // MetalFX's temporal scaler from the render size to the output: at the native size anti-aliasing only;
++      // with upscaling (temporal_aa_upscale) the scene is drawn into the render-size corner of its targets.
++      taa_scaler_ = nil;
 +      auto desc = [MTLFXTemporalScalerDescriptor new];
 +      desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
 +      desc.depthTextureFormat = MTLPixelFormatDepth32Float;
 +      desc.motionTextureFormat = MTLPixelFormatRG16Float;
 +      desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
-+      desc.inputWidth = desc.outputWidth = width;
-+      desc.inputHeight = desc.outputHeight = height;
++      desc.inputWidth = render_width; desc.inputHeight = render_height;
++      desc.outputWidth = width; desc.outputHeight = height;
 +      desc.autoExposureEnabled = YES;  // the scene before the tone map
 +      id<MTLFXTemporalScaler> scaler = [desc newTemporalScalerWithDevice:device_];
 +      if (!scaler) {
-+        REXGPU_ERROR("Metal temporal AA: no MetalFX temporal scaler for {}x{}", width, height);
++        REXGPU_ERROR("Metal temporal AA: no MetalFX temporal scaler for {}x{} to {}x{}", render_width, render_height,
++                     width, height);
 +        taa_failed_ = true;
 +        return 'x';
 +      }
 +      scaler.depthReversed = YES;  // 1 near, 0 far
-+      auto texture = [&](MTLPixelFormat format, MTLTextureUsage usage) {
-+        auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
++      auto texture = [&](MTLPixelFormat format, MTLTextureUsage usage, uint32_t w, uint32_t h) {
++        auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:w height:h mipmapped:NO];
 +        d.storageMode = MTLStorageModePrivate; d.usage = usage;
 +        return [device_ newTextureWithDescriptor:d];
 +      };
-+      taa_motion_ = texture(MTLPixelFormatRG16Float, scaler.motionTextureUsage | MTLTextureUsageShaderWrite);
-+      taa_depth_ = texture(MTLPixelFormatDepth32Float, scaler.depthTextureUsage | MTLTextureUsageRenderTarget);
-+      taa_output_ = texture(MTLPixelFormatRGBA16Float, scaler.outputTextureUsage);
-+      if (!taa_motion_ || !taa_depth_ || !taa_output_) { taa_failed_ = true; return 'x'; }
++      taa_motion_ = texture(MTLPixelFormatRG16Float, scaler.motionTextureUsage | MTLTextureUsageShaderWrite,
++                            render_width, render_height);
++      taa_depth_ = texture(MTLPixelFormatDepth32Float, scaler.depthTextureUsage | MTLTextureUsageRenderTarget,
++                           render_width, render_height);
++      taa_color_ = upscale ? texture(MTLPixelFormatRGBA16Float, scaler.colorTextureUsage | MTLTextureUsageShaderWrite,
++                                     render_width, render_height) : nil;
++      taa_output_ = texture(MTLPixelFormatRGBA16Float, scaler.outputTextureUsage, width, height);
++      if (!taa_motion_ || !taa_depth_ || !taa_output_ || (upscale && !taa_color_)) { taa_failed_ = true; return 'x'; }
 +      taa_scaler_ = scaler; taa_width_ = width; taa_height_ = height;
-+      REXGPU_INFO("Metal temporal AA: MetalFX temporal scaler ready for {}x{}", width, height);
++      taa_render_width_ = render_width; taa_render_height_ = render_height;
++      REXGPU_INFO("Metal temporal AA: MetalFX temporal scaler ready for {}x{} to {}x{}", render_width, render_height,
++                  width, height);
 +      inputs.reset = true;
 +    }
++    // The scaler is made for the render size; a frame whose scene was not squeezed to it has nothing to give it.
++    if (upscale && !inputs.squeezed) return 'u';
 +    id<MTLFXTemporalScaler> scaler = taa_scaler_;
 +    // The stencil is the stencil view's first byte (red): where the fetch constant's swizzle puts it.
 +    auto stencil_fetch = regs_.GetTextureFetch(1);
-+    auto* constants = static_cast<float*>(const_cast<void*>(inputs.vector_constants));
-+    float* size = constants + 24 * 16;
-+    float* jitter = size + 4;
-+    size[0] = float(width); size[1] = float(height);
-+    size[2] = float(width) / float(regs_.GetTextureFetch(0).size_2d.width + 1);
-+    size[3] = float(height) / float(regs_.GetTextureFetch(0).size_2d.height + 1);
-+    jitter[2] = 0.0f;
++    struct {
++      float previous[24 * 16];
++      float size[4], jitter[4];
++      uint32_t map[4];
++    } constants;
++    static_assert(sizeof(constants.previous) + 8 * sizeof(float) == sizeof(float) * (24 * 16 + 8));
++    std::memcpy(&constants, inputs.vector_constants, sizeof(float) * (24 * 16 + 8));
++    constants.size[0] = float(render_width); constants.size[1] = float(render_height);
++    constants.size[2] = float(render_width) / float(regs_.GetTextureFetch(0).size_2d.width + 1);
++    constants.size[3] = float(render_height) / float(regs_.GetTextureFetch(0).size_2d.height + 1);
++    constants.jitter[0] = inputs.jitter[0]; constants.jitter[1] = inputs.jitter[1];
++    constants.jitter[2] = 0.0f;
++    constants.jitter[3] = upscale ? 1.0f : 0.0f;  // the colour gathered too
 +    for (uint32_t i = 0; i < 4; ++i)
-+      if (((stencil_fetch.swizzle >> (3 * i)) & 7) == xenos::XE_GPU_TEXTURE_SWIZZLE_R) { jitter[2] = float(i); break; }
++      if (((stencil_fetch.swizzle >> (3 * i)) & 7) == xenos::XE_GPU_TEXTURE_SWIZZLE_R) { constants.jitter[2] = float(i); break; }
++    constants.map[0] = width; constants.map[1] = height; constants.map[2] = render_width; constants.map[3] = render_height;
 +
 +    id<MTLCommandBuffer> cb = TextureWorkCommands();
 +    auto compute = [cb computeCommandEncoder];
 +    if (REXCVAR_GET(metal_debug_labels)) compute.label = @"temporal AA motion vectors";
 +    [compute setComputePipelineState:taa_vectors_pipeline_];
-+    [compute setBytes:inputs.vector_constants length:inputs.vector_constants_size atIndex:0];
++    [compute setBytes:&constants length:sizeof(constants) atIndex:0];
 +    [compute setTexture:depth atIndex:0]; [compute setTexture:stencil atIndex:1]; [compute setTexture:taa_motion_ atIndex:2];
-+    [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++    [compute setTexture:scene atIndex:3]; [compute setTexture:taa_color_ atIndex:4];
++    [compute dispatchThreads:MTLSizeMake(render_width, render_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
 +    [compute endEncoding];
 +    {
 +      auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -3172,18 +3242,19 @@ new file mode 100644
 +      [encoder setRenderPipelineState:taa_depth_pipeline_];
 +      [encoder setDepthStencilState:taa_depth_state_];
 +      [encoder setFragmentTexture:depth atIndex:0];
++      [encoder setFragmentBytes:constants.map length:sizeof(constants.map) atIndex:0];
 +      [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 +      [encoder endEncoding];
 +    }
-+    // MetalFX reads 2D textures: a 2D view of the scene's first layer.
-+    id<MTLTexture> color = scene_base.textureType == MTLTextureType2D ? scene_base
++    // MetalFX reads 2D textures: a 2D view of the scene's first layer (or the colour gathered at the render size).
++    id<MTLTexture> color = upscale ? taa_color_ : scene_base.textureType == MTLTextureType2D ? scene_base
 +        : [scene_base newTextureViewWithPixelFormat:MTLPixelFormatRGBA16Float textureType:MTLTextureType2D
 +                                             levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
 +    scaler.colorTexture = color;
 +    scaler.depthTexture = taa_depth_;
 +    scaler.motionTexture = taa_motion_;
 +    scaler.outputTexture = taa_output_;
-+    scaler.inputContentWidth = width; scaler.inputContentHeight = height;
++    scaler.inputContentWidth = render_width; scaler.inputContentHeight = render_height;
 +    scaler.jitterOffsetX = inputs.jitter[0]; scaler.jitterOffsetY = inputs.jitter[1];
 +    scaler.motionVectorScaleX = 1.0f; scaler.motionVectorScaleY = 1.0f;
 +    scaler.reset = inputs.reset;
@@ -3319,7 +3390,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,201 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -3483,6 +3554,10 @@ new file mode 100644
 +  // Temporal anti-aliasing with MetalFX's temporal scaler (the SDK's temporal_aa: jitter, motion vectors from
 +  // the game's motion blur constants), at native size.
 +  bool TaaReady() const override;
++  // Upscaling (temporal_aa_upscale): the scene squeezed into the host render targets' corner and resolves that
++  // stretch it back (metal_taa_upscale).
++  bool TaaUpscaleSupported() const override;
++  bool HdrHostRenderTargets() const override { return true; }
 +  bool TaaCheckAvailable() override;
 +
 + private:
@@ -3812,7 +3887,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,391 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -3827,7 +3902,14 @@ new file mode 100644
 +  uint2 samples;  // EDRAM samples a pixel covers: 1x1, 1x2 (MSAA 2x) or 2x2 (4x).
 +  uint sample_select;  // 0 to 3: that sample; 4: the average.
 +  uint extent_start, extent_end;  // the guest memory the resolve may write (its copy_dest_extent)
++  // Upscaling (temporal_aa_upscale): the squeezed scene read through a nearest-neighbour stretch, pixel q of the
++  // target (from its origin) at ((2q + 1) * num) / (2 * den), at most num - 1. Single-sampled only.
++  uint stretch;
++  uint2 stretch_num, stretch_den;
 +};
++uint2 stretched(uint2 q, constant ResolveConstants& c) {
++  return min(((2u * q + 1u) * c.stretch_num) / (2u * c.stretch_den), c.stretch_num - 1u);
++}
 +uint2 sample_offset(uint i, uint2 samples) {
 +  return samples.x == 2 ? uint2(i & 1, i >> 1) : uint2(0, min(i, samples.y - 1));
 +}
@@ -3905,8 +3987,11 @@ new file mode 100644
 +    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
 +  uint2 base = c.origin + p * c.samples;
++  if (c.stretch) base = stretched(c.origin + p, c);
 +  float4 value;
-+  if (c.sample_select < 4) {
++  if (c.stretch) {
++    value = source.read(base);
++  } else if (c.sample_select < 4) {
 +    value = source.read(base + sample_offset(c.sample_select, c.samples));
 +  } else {
 +    value = float4(0);
@@ -3924,7 +4009,7 @@ new file mode 100644
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
 +    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
-+  uint2 at = c.origin + p * c.samples + sample_offset(c.sample_select, c.samples);
++  uint2 at = c.stretch ? stretched(c.origin + p, c) : c.origin + p * c.samples + sample_offset(c.sample_select, c.samples);
 +  float depth = source.read(at) * c.scale;
 +  destination.write(float4(depth), p);
 +  // Depth resolves write the EDRAM depth format whatever the destination format says: 24-bit
@@ -4154,13 +4239,21 @@ new file mode 100644
 +// reprojection (taa_motion_vectors_mcla.cs.xesl of rexglue-temporal-aa.patch, the same maths): per pixel, the
 +// unjittered centre and the depth (1 near, 0 far) make the clip position, which the matrix of the pixel's
 +// vehicle ID (the stencil >> 2) takes to the previous frame's guest pixels. Previous minus current, in pixels.
-+struct TaaMvConstants { float4 previous[96]; float4 size; float4 jitter; };
++// With upscaling (taa_upscale_gather_mcla.cs.xesl of rexglue-fsr-upscaling.patch) the scene was drawn into the
++// render-size corner and resolved stretched to the output size: render pixel i is output pixel
++// (2 * output * i + render - 1) / (2 * render), the first to show it, where the depth, the stencil and (when
++// asked) the colour are taken from. At the native size that is pixel i itself.
++struct TaaMvConstants { float4 previous[96]; float4 size; float4 jitter; uint4 map; };  // map: output w, h, render w, h
++uint2 taa_source(uint2 i, uint4 map) { return min((i * map.xy * 2u + map.zw - 1u) / (map.zw * 2u), map.xy - 1u); }
 +kernel void taa_motion_vectors(constant TaaMvConstants& c [[buffer(0)]],
 +    texture2d_array<float, access::read> depth [[texture(0)]], texture2d_array<float, access::read> stencil [[texture(1)]],
-+    texture2d<float, access::write> dest [[texture(2)]], uint2 p [[thread_position_in_grid]]) {
++    texture2d<float, access::write> dest [[texture(2)]], texture2d_array<float, access::read> scene [[texture(3)]],
++    texture2d<float, access::write> color [[texture(4)]], uint2 p [[thread_position_in_grid]]) {
 +  if (p.x >= uint(c.size.x) || p.y >= uint(c.size.y)) return;
-+  float d = depth.read(p, 0).x;
-+  float s = stencil.read(p, 0)[uint(c.jitter.z)];
++  uint2 source = taa_source(p, c.map);
++  if (c.jitter.w != 0.0f) color.write(scene.read(source, 0), p);
++  float d = depth.read(source, 0).x;
++  float s = stencil.read(source, 0)[uint(c.jitter.z)];
 +  uint id = uint(s * 255.0f + 0.5f) >> 2u;
 +  if (id >= 24u) id = 0u;
 +  float2 position = float2(p) + 0.5f - c.jitter.xy;
@@ -4178,10 +4271,11 @@ new file mode 100644
 +  }
 +  dest.write(float4(motion, 0.0f, 0.0f), p);
 +}
-+// The depth for MetalFX, which takes a depth format.
++// The depth for MetalFX, which takes a depth format (at the render size, from the same pixels as the vectors).
 +struct TaaDepthOut { float depth [[depth(any)]]; };
-+fragment TaaDepthOut taa_depth_fs(float4 position [[position]], texture2d_array<float, access::read> source [[texture(0)]]) {
-+  TaaDepthOut o; o.depth = source.read(uint2(position.xy), 0).x; return o;
++fragment TaaDepthOut taa_depth_fs(float4 position [[position]], texture2d_array<float, access::read> source [[texture(0)]],
++    constant uint4& map [[buffer(0)]]) {
++  TaaDepthOut o; o.depth = source.read(taa_source(uint2(position.xy), map), 0).x; return o;
 +}
 +)MSL";
 +}
@@ -4189,7 +4283,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,223 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -4358,7 +4452,8 @@ new file mode 100644
 +}
 +
 +void BuildMetalSystemConstants(const RegisterFile& regs, const PrimitiveProcessor::ProcessingResult& p,
-+    const draw_util::ViewportInfo& v, std::vector<uint8_t>& out, const uint32_t* texture_signs) {
++    const draw_util::ViewportInfo& v, std::vector<uint8_t>& out, const uint32_t* texture_signs,
++    float ps_param_gen_scale) {
 +  using T = SpirvShaderTranslator;
 +  T::SystemConstants c{};
 +  auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -4390,7 +4485,7 @@ new file mode 100644
 +  // SPIR-V uses Vulkan's downwards viewport. Metal's viewport flips Y.
 +  c.ndc_scale[1] = -c.ndc_scale[1]; c.ndc_offset[1] = -c.ndc_offset[1];
 +  c.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
-+  c.ps_param_gen_scale = 1.0f;
++  c.ps_param_gen_scale = ps_param_gen_scale;
 +  static_assert(sizeof(c.texture_swizzled_signs) == 8 * sizeof(uint32_t));
 +  if (texture_signs) std::memcpy(c.texture_swizzled_signs, texture_signs, sizeof(c.texture_swizzled_signs));
 +  else MetalTextureSwizzledSigns(regs, c.texture_swizzled_signs);
@@ -4416,7 +4511,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.h b/src/graphics/metal/m
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,93 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.h
 + * @brief       Guest microcode to MSL: the SDK's SPIR-V translator, then SPIRV-Cross (plain C++)
@@ -4470,7 +4565,8 @@ new file mode 100644
 +// Into `out` (kept by the caller, so no allocation a draw). `texture_signs` (8 words), when given, are the
 +// texture fetches' swizzled signs computed for the current fetch constants, else they are computed here.
 +void BuildMetalSystemConstants(const RegisterFile& regs, const PrimitiveProcessor::ProcessingResult& primitive,
-+    const draw_util::ViewportInfo& viewport, std::vector<uint8_t>& out, const uint32_t* texture_signs = nullptr);
++    const draw_util::ViewportInfo& viewport, std::vector<uint8_t>& out, const uint32_t* texture_signs = nullptr,
++    float ps_param_gen_scale = 1.0f);
 +void MetalTextureSwizzledSigns(const RegisterFile& regs, uint32_t* signs);
 +
 +class MetalShaderTranslator {
