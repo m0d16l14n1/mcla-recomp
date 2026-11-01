@@ -968,7 +968,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2539 @@
+@@ -0,0 +1,2546 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1037,6 +1037,9 @@ new file mode 100644
 +    "A resolve's clear is drawn first in the next pass on its target (or is its load action), not in a pass of its own");
 +REXCVAR_DEFINE_BOOL(metal_texture_pool, true, "GPU/Metal",
 +    "Resolve destination textures are reused once nothing holds them, instead of made and freed each resolve");
++REXCVAR_DEFINE_BOOL(metal_hash_linear_textures, true, "GPU/Metal",
++    "Linear (untiled) textures, the CPU's per-frame pictures such as Bink movies, are hashed once a frame instead of "
++    "trusting their write watch (which missed the story intro's frames)");
 +REXCVAR_DEFINE_BOOL(metal_fast_texture_frames, true, "GPU/Metal",
 +    "A texture lookup stays good across frames while the texture's write watch has seen no CPU write");
 +REXCVAR_DEFINE_BOOL(metal_constant_generations, true, "GPU/Metal",
@@ -2373,7 +2376,11 @@ new file mode 100644
 +    return View(entry.texture, fetch.swizzle, cube);
 +  }
 +  TextureWatch* watch = nullptr;
-+  if (REXCVAR_GET(metal_texture_watches)) {
++  // Linear (untiled) textures are the CPU's per-frame pictures, the game's Bink movies above all (the story's
++  // intro: a 1280x720 luma plane and two 640x360 chroma planes): their writes don't always reach the write
++  // watch, which left the intro black, so they are hashed once a frame instead (about 1.4 MB while a movie
++  // plays, nothing otherwise).
++  if (REXCVAR_GET(metal_texture_watches) && (fetch.tiled || !REXCVAR_GET(metal_hash_linear_textures))) {
 +    if (!entry.watch) entry.watch = std::make_unique<TextureWatch>();
 +    watch = entry.watch.get();
 +    // Unwritten since it was last hashed (and a resolve over it would have dropped it).

@@ -98,6 +98,7 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | Option | What it does |
 |---|---|
 | `--metal_texture_watches=false` | Hash every texture once a frame instead of watching its memory for CPU writes |
+| `--metal_hash_linear_textures=false` | Watch linear textures too instead of hashing them each frame (the story mode's movies go black) |
 | `--metal_persistent_vertex_size=0` | Copy every vertex range every frame instead of keeping unwritten ones |
 | `--metal_snapshot_trust_size=0xFFFFFFFF` | Check every vertex range at every draw (and count the ones that changed) |
 | `--metal_pass_merge=false` | Start a render pass for every change of targets |

@@ -30,7 +30,7 @@ The rows above are before the tenth pass (the 4x reflections at one sample a pix
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
 sampled in free roam, drives or races so far), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to twelfth, record how it got here.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to thirteenth, record how it got here.
 
 ## Why
 
@@ -212,7 +212,8 @@ machine. The changes:
   (`SharedMemory::WatchMemoryRange`, one per texture key, then `RequestRange` to protect the pages, then the hash, in
   that order so no write is missed) and is hashed again only after a CPU write to them. A texture loaded anyway
   (new, or dropped by a resolve over its memory) isn't hashed at all: its hash would only be compared after a write,
-  and an unknown one then reloads it. 0 MB of textures hashed a frame, about 1,150 checks skipped.
+  and an unknown one then reloads it. 0 MB of textures hashed a frame, about 1,150 checks skipped. (Since the thirteenth
+  pass only tiled textures are watched; linear ones, the movie planes among them, are hashed every frame.)
 - *Large vertex ranges copied without a hash.* The hash of a range of 64 KB or more was never compared (the snapshot
   map starts empty every frame and later uses in the frame return before hashing).
 - *Inline constants not resent.* `Bind` sent every constant block of both stages at every draw (up to 4 KB each,
@@ -496,6 +497,18 @@ Controller page lists every button's keys with Rebind and Reset, and "Save to co
 `--metal_present_capture=<file.ppm>` writes what the presenter painted (overlays included) at most every 2
 seconds, for checking overlays without screen recording (it makes the layer's drawables readable). The F4
 picture over free roam was checked that way, and the FPS with the overlays closed is unchanged.
+
+**Story videos, thirteenth pass (2026-11-01): the Bink movies of the story mode.** The story's intro movie (after
+a new save is made: Carney's garage, the race through the hills) played as a black picture with sound on Metal, while the
+boot logos and the attract movie looked right. The Bink decoder writes each frame's planes (Y at 1280x720, U and V
+at 640x360, 8-bit, linear, not tiled) with the CPU, and those writes don't always reach the texture write watches
+(the decoder reuses the same pages for every frame, written in ways the watch doesn't see), so the first upload
+of each plane stayed in the cache: the black of the first frame. `--metal_texture_watches=false` showed it. Now
+linear textures are hashed once a frame instead of watched (`metal_hash_linear_textures`, default on): the game's
+own textures are tiled and keep their watches, and the few linear ones (the movie planes and some small UI
+textures) cost about 8 MB of hashing a frame in free roam and 3 MB during a movie. The intro now plays, and
+the in-engine cutscene after it (the characters at Carney's) draws as it should; free roam at MetalFX
+Performance is unchanged (93.4 FPS).
 
 **Frame pacing:** `CAMetalDisplayLink` is put off. The Mac here has a 60 Hz panel, the presenter's layer has
 display sync on, and the game already holds each frame to its target at the swap with a precise clock
