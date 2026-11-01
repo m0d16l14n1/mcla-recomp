@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD); plays from boot to free roam. **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 91 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD); plays from boot to free roam. **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 94 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
@@ -58,26 +58,33 @@ Every step, building by hand, and debugging: [docs/macos.md](docs/macos.md).
 
 ### Keyboard
 
-A controller (Xbox, DualSense) works as it is. For the keyboard, add `--mnk_mode=true`. The keys are the SDK's
-default controller layout for now: a driving layout (W for gas) and a controls setup in a settings app are planned
-([BACKLOG](docs/BACKLOG.md) 29). Each key can be changed with a `--keybind_<button>=<keys>` option, for example
-`--keybind_right_trigger=W`.
+A controller (Xbox, DualSense) works as it is. For the keyboard, add `--mnk_mode=true`. The keys are a driving
+layout (`--mcla_keyboard_layout=driving`, the default); `--mcla_keyboard_layout=controller` gives the SDK's own
+layout instead (gas on E, W A S D the left stick). Each key can be changed with a `--keybind_<button>=<keys>`
+option, for example `--keybind_x=Shift+N`, and a key changed that way stays when the layout is applied. A controls
+page in a settings app is planned ([BACKLOG](docs/BACKLOG.md) 29).
 
-| Xbox 360 | Keys | In the game |
+| Keys | Xbox 360 | In the game |
 |---|---|---|
-| Right trigger | E, O | Gas |
-| Left trigger | Q, I | Brake, reverse |
-| Left stick | W A S D | Steer (A, D) |
-| Right stick | Arrow keys | Camera |
-| A | Space, ; | Confirm (menus) |
-| B | Backspace, ' | Back (menus) |
-| X | L | |
-| Y | P | |
-| Left, right shoulder | 1, 3 | |
-| Left, right stick press | F, K | |
-| D-pad | Shift + arrow keys | |
-| Start | Return, X | Pause |
-| Back | Tab, Z | |
+| W, Up arrow | Right trigger and left stick up | Gas; up in menus |
+| S, Down arrow | Left trigger and left stick down | Brake, reverse; down in menus |
+| A, D, Left and Right arrows | Left stick | Steer; left and right in menus |
+| Space | A | Handbrake; confirm in menus |
+| B, Backspace | B | Back in menus |
+| X, N | X | Nitrous |
+| Y | Y | Headlights |
+| Q | Left shoulder | Special ability |
+| E, C | Right shoulder | Camera view |
+| I J K L | Right stick | Look around |
+| H | Right stick press | Horn |
+| F | Left stick press | |
+| M | D-pad up | Map |
+| Shift + arrow keys | D-pad | |
+| Escape, Return | Start | Pause |
+| Tab | Back | |
+
+The actions come from this project's scripted drives; not all of them have been checked by hand. The menus show
+the controller's prompts, and for X, Y and B the key is the letter on the prompt.
 
 ## Metal backend options
 
@@ -102,6 +109,7 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
 | `--metal_shader_storage=false` | No shader storage and warm-up at boot |
 | `--metal_taa_upscale=false` | No MetalFX upscaling (the scene drawn at full size whatever `mcla_upscaling` says) |
+| `--metal_4x_as_1x=false` | The game's MSAA 4x surfaces (the reflections) drawn as 2x2 supersampling, as before, instead of one sample a pixel (slower: about 16% at MetalFX Performance) |
 | `--metal_msaa=true` | MSAA surfaces as Metal multisample textures instead of supersampling (correct, but about half the frame rate; for testing) |
 | `--metal_shader_math=1` or `2` | Relaxed or fast math in the shader compiler (shifts the colour grading; for testing) |
 
@@ -111,7 +119,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 
 - **On Metal, the player's car sometimes falls through the road.** This is a race between the game's own threads that the Metal backend's timing exposes; MoltenVK never shows it. It is parked for now: [launcher/dev/metal-car-falls-2026-11-01.md](launcher/dev/metal-car-falls-2026-11-01.md).
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
-- The Metal backend draws MSAA as supersampling (2x as 1x2, 4x as 2x2): real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
+- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 
 ## More documentation

@@ -93,6 +93,7 @@ bool MclaPrepareShadersIsRequested();  // src/shader_prepare.cpp
 void MclaShaderStorageAfterPreload(rex::Runtime* runtime);
 void MclaMigrateAntiAliasing();  // src/perf_options.cpp
 void MclaApplyPreset();  // src/perf_options.cpp
+void MclaApplyKeyboardLayout();  // src/keyboard_layout.cpp
 void MclaApplyGraphicsFixDefaults(bool vulkan);  // src/perf_options.cpp
 
 #ifdef _WIN32
@@ -841,6 +842,7 @@ void MclaApp::OnPreSetup(rex::RuntimeConfig& config) {
   ApplyPcDefaults();
   MclaMigrateAntiAliasing();
   MclaApplyPreset();
+  MclaApplyKeyboardLayout();
 #ifdef _WIN32
   // The GPU the game chose (ChooseGpu) is the one the SDK takes, whatever the API: d3d12_adapter
   // for Direct3D 12, vulkan_device for Vulkan (Automatic's or the player's), whose own choice
