@@ -4,6 +4,7 @@
 #include "generated/default/mcla_init.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -27,6 +28,9 @@ REXCVAR_DEFINE_BOOL(mcla_larger_tiles, true, "MCLA",
                     "edram_tiles = 4096");
 REXCVAR_DEFINE_BOOL(mcla_fence_yield, true, "MCLA",
                     "Yield the CPU while the game waits on the GPU instead of spinning");
+REXCVAR_DEFINE_UINT32(mcla_fence_sleep_us, 100, "MCLA",
+                      "A wait for a GPU fence longer than 256 polls sleeps this long between "
+                      "polls (0: polls with a yield, as before)");
 
 namespace {
 
@@ -294,13 +298,30 @@ bool mcla_fence_spin() {
     return false;
   }
   // The caller loops until the GPU thread advances. A short pause keeps the
-  // wake-up latency low; every so often give the core away entirely.
+  // wake-up latency low; every so often give the core away entirely. A wait
+  // that goes on sleeps between polls (mcla_fence_sleep_us): the thread it
+  // waits for is the GPU command processor, and on a CPU with four
+  // performance cores (Apple M4) a spinning thread takes one from it.
+  using clock = std::chrono::steady_clock;
   static thread_local uint32_t spins = 0;
-  if ((++spins & 0x3F) == 0) {
+  static thread_local clock::time_point last{};
+  const auto now = clock::now();
+  if (now - last > std::chrono::microseconds(500)) {
+    spins = 0;  // A new wait.
+  }
+  last = now;
+  ++spins;
+  const uint32_t sleep_us = REXCVAR_GET(mcla_fence_sleep_us);
+  if (sleep_us && spins > 256) {
+    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+    last = clock::now();
+  } else if ((spins & 0x3F) == 0) {
     std::this_thread::yield();
   } else {
 #if defined(_M_X64) || defined(__x86_64__)
     _mm_pause();
+#elif defined(__aarch64__)
+    __builtin_arm_isb(15);
 #endif
   }
   return true;

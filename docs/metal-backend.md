@@ -174,6 +174,47 @@ starts the next run translates all of them on worker threads (a shader's modific
 each): 339 translations in about 105 ms on 9 threads, then 14 new ones in the drive instead of 339.
 `--metal_shader_storage=false` turns it off.
 
+**Third pass (2026-11-01): about +35% in free roam** (paired runs, all of this against the old settings: 41.7
+against 30.5 FPS, then 27.0 against 20.3; uncapped). `sample` on a running free roam showed two threads saturated: the
+command processor (91% busy) and the game's render thread, spinning in `D3DDevice_BlockOnFence` for it; the GPU was
+busy 22 to 25 ms of a frame and the command processor never waited for it. On this Mac (an M4: four performance
+cores, six efficiency cores, with a VM and WindowServer taking a share) both matter more than they would on an idle
+machine. The changes:
+
+- *Texture write watches* (`metal_texture_watches`). Every texture used in a frame was hashed once in that frame,
+  118 MB a frame, 13% of the thread. A texture loaded from guest memory now has a write watch on its pages
+  (`SharedMemory::WatchMemoryRange`, one per texture key, then `RequestRange` to protect the pages, then the hash, in
+  that order so no write is missed) and is hashed again only after a CPU write to them. A texture loaded anyway
+  (new, or dropped by a resolve over its memory) isn't hashed at all: its hash would only be compared after a write,
+  and an unknown one then reloads it. 0 MB of textures hashed a frame, about 1,150 checks skipped.
+- *Large vertex ranges copied without a hash.* The hash of a range of 64 KB or more was never compared (the snapshot
+  map starts empty every frame and later uses in the frame return before hashing).
+- *Inline constants not resent.* `Bind` sent every constant block of both stages at every draw (up to 4 KB each,
+  copied into the command buffer) and zero-filled a 4 KB array first; a block the encoder already holds is skipped.
+- *Texture load staging* from one 64 MB buffer per frame slot instead of a new `MTLBuffer` (an IOKit call) for every
+  load, and the load kernel copies 32-bit words with the endian swap done in the word, not one byte at a time.
+- *The command processor thread at the user-interactive QoS class* (`metal_cp_qos`, now 4 by default; it was a
+  diagnostic): at the default class it shares the performance cores with everything else and moves to the
+  efficiency cores under load. About 10% in paired runs.
+- *The fence wait sleeps* (`mcla_fence_sleep_us`, 100 by default, in `src/render_perf.cpp`): the game's fence poll
+  (hooked by `mcla_fence_spin`) yielded only every 64th poll, so the render thread took a performance core from the
+  command processor it waits for. A wait longer than 256 polls now sleeps between polls. The thread went from 96%
+  busy to 30%.
+- *Render passes only as tall as their draws* (`metal_pass_rows`): host targets are as tall as the EDRAM after
+  their base (8,192 rows for some), and every pass loaded and stored the whole attachment; a pass now sets
+  `renderTargetHeight` to the rows its draws reach (rounded up to 32, restarted taller if a later draw needs more),
+  EDRAM transfer passes to the rows they copy.
+
+The stats line now also gives the megabytes of textures hashed and the checks the watches skipped, and a second
+line the command processor thread's own CPU time a frame (`CLOCK_THREAD_CPUTIME_ID`). On a busy machine FPS swings
+by a third between identical runs, as the threads land on efficiency or performance cores, so changes are measured
+in alternating pairs. `--metal_debug_profile=true` in a dumped frame gives each pass and resolve a command buffer
+of its own with its GPU time logged, but on a shared GPU those times include other processes' work (a one-draw
+64x64 pass showed 4 ms): good for finding passes, not for timing them. Still on the command processor: the small
+vertex ranges (46 MB hashed and 20 MB copied a frame, about 15% of it), texture objects created for every resolve
+(about 6%), and `std::string` keys for the texture, sampler and pipeline maps. The car-falls route test after
+these changes: 0 of 240 samples under the road in 3 of 3 capped drives.
+
 **Diagnosis:** `--metal_debug_dir=<folder>` with `--metal_debug_frame=<n>`, or `set metal_debug_capture true` from a
 pad script for the next frame, logs that frame's passes (render targets, MSAA, viewport, scissor, window offset),
 resolves and clears, the textures of its full-screen draws, and writes each resolve as a PPM. With it:
