@@ -11,7 +11,7 @@ README's status table and [BACKLOG.md](BACKLOG.md).
 |---|---|---|
 | 1. Boot | The SDK and the game build for `mac-arm64`; the game starts, loads, and reaches the menus | Xenos GPU emulation on **Vulkan through MoltenVK** (the SDK builds its pinned MoltenVK and Vulkan loader and puts them next to the game) |
 | 2. Play | Career, races, garage, audio, controller; the fork's settings that make sense on a Mac | MoltenVK, with the fixes it needs (no geometry shaders on Metal: the SDK's vertex-shader expansion of point and rectangle lists is used) |
-| 3. Native Metal | A Metal backend for the SDK's Xenos emulation, next to the Vulkan one, picked with `--mcla_gpu_backend=metal`; design and milestones in [metal-backend.md](metal-backend.md) (M0, the game running on it without drawing, is done) | **Metal**: presentation through `CAMetalLayer`, then `CAMetalDisplayLink` pacing, EDR (HDR), MetalFX upscaling, Metal binary archives in place of the shader pack |
+| 3. Native Metal | A Metal backend for the SDK's Xenos emulation, next to the Vulkan one, picked with `--mcla_gpu_backend=metal`; design, milestones and measurements in [metal-backend.md](metal-backend.md). Plays from boot to free roam at 62 to 63 FPS with MSAA 2x, 86 to 93 with MetalFX upscaling (MoltenVK: about 20) | **Metal**: presentation through `CAMetalLayer`, MetalFX temporal AA and upscaling (done); `CAMetalDisplayLink` pacing and EDR (HDR) to do; Metal binary archives deferred (little to gain) |
 
 Phase 3 is the part meant to be shared. The other Apple Silicon ports of Xbox 360 games all draw through MoltenVK
 ([SpeedBreaker](https://github.com/SpeedBreakerProject/speedbreaker), Need for Speed: Most Wanted, built on

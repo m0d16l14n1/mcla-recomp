@@ -7,7 +7,28 @@ written so that it can be offered upstream: nothing in it is specific to Midnigh
 
 ```bash
 bash scripts/play_mac.sh --mcla_gpu_backend=metal
+bash scripts/play_mac.sh --mcla_gpu_backend=metal --mcla_anti_aliasing=fsr --mcla_upscaling=quality   # MetalFX
 ```
+
+## Where it stands (2026-11-01)
+
+Free roam at native 720p on an M5 (4 performance and 6 efficiency cores), uncapped (`--mcla_fps=0`), on a cool
+Mac with a virtual machine running beside it; MoltenVK for comparison:
+
+| Anti-aliasing | MoltenVK | Metal |
+|---|---|---|
+| MSAA 2x (the game's default; on Metal drawn as 1x2 supersampling) | 19.6 FPS | 62 to 63 FPS |
+| Off | 31.3 FPS | about 80 FPS |
+| MetalFX temporal AA at 720p (`--mcla_anti_aliasing=fsr`) | — | about 77 FPS |
+| MetalFX upscaling, Quality, 853x480 to 720p (`--mcla_upscaling=quality`) | — | 86 FPS |
+| MetalFX upscaling, Performance, 640x360 to 720p (`--mcla_upscaling=performance`) | — | 91 to 93 FPS |
+
+The picture at the spawn point matches MoltenVK's (shadows, colour grading, minimap, HUD), and the game plays
+from boot to free roam and drives. A warm or busy Mac loses up to a third of these frame rates. At MetalFX
+Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a frame, 3.4 of it waiting for the GPU.
+What is still missing: EDRAM transfers of 64-bit formats, 3D textures, the UI overlays (ImGui), EDR, frame pacing
+with `CAMetalDisplayLink`. Known bug: the player's car sometimes falls through the road on Metal
+([BACKLOG](BACKLOG.md) 27). The passes below, first to ninth, record how it got here.
 
 ## Why
 
@@ -40,8 +61,9 @@ the same SPIR-V to MSL step MoltenVK performs (SPIRV-Cross is already built in t
 game correctly. Not the route of [xenia-alloy](https://github.com/DarthMDev/xenia-alloy) and its upstream
 [pull request](https://github.com/xenia-project/xenia/pull/2332) (DXBC to DXIL with Microsoft's DirectX Shader
 Compiler, then Apple's Metal Shader Converter): two large dependencies, one of them Apple's closed converter, and
-its author's own words: "there's a big performance penalty". Pipelines go into `MTLBinaryArchive`s, which take the
-place of the shader pack.
+its author's own words: "there's a big performance penalty". Pipelines were to go into `MTLBinaryArchive`s in place
+of the shader pack; deferred, as the shader storage's warm-up and Apple's per-app shader cache leave little to gain
+(a shader compiles in 0.1 ms on average).
 
 **Tile-based rules, from the start:**
 - One render encoder per run of draws to the same guest render targets. Shared memory uploads, texture loads and
@@ -51,7 +73,9 @@ place of the shader pack.
 - Load actions from what the guest does: `DontCare` when the run begins with a clear or covers the target, `Load`
   only otherwise; store actions `DontCare` for attachments nothing reads later (depth after a scene, MSAA samples
   after a resolve: `StoreAndMultisampleResolve`).
-- Memoryless textures for MSAA and depth that live only inside a pass.
+- Memoryless textures for MSAA and depth that live only inside a pass. (In practice: MSAA is drawn as supersampling,
+  since the EDRAM emulation loads and stores its targets in every pass; real multisample textures, tried as
+  `metal_msaa`, ran at half the frame rate.)
 - The 512 MB shared memory as one `MTLStorageModeShared` buffer: unified memory makes uploads cheap copies, and
   later direct writes where no GPU work in flight reads the range.
 
@@ -65,12 +89,12 @@ positions, the EDRAM layout in MSL). Code taken from it keeps its BSD notice and
 | | What | State |
 |---|---|---|
 | M0 | Provider, presenter (CAMetalLayer, letterboxed bilinear guest output, the presenter's 3-image mailbox), graphics system, a command processor that runs the whole command stream and skips draws and resolves; game runs start to free roam | done 2026-10-31 |
-| M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | doing: **the first picture, 2026-11-01**: the title screen and free roam draw (below), 28 to 30 FPS in free roam, then 45 to 50 uncapped (MoltenVK: 19.6) |
-| M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | todo |
-| M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | todo |
-| M4 | The rest: the immediate drawer (ImGui overlays, the pause menu's settings), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | todo |
+| M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | done 2026-11-01 (the first picture, then 28 to 30 FPS in free roam) |
+| M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | mostly done: EDRAM transfers between formats and depth and color, MSAA as supersampling (real MSAA as an option), float24 depth (D24FS8), the gamma ramp, the spawn point matching MoltenVK. To do: EDRAM transfers of 64bpp formats, 3D textures |
+| M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | mostly done: nine speed passes (below), MetalFX temporal AA and upscaling; binary archives deferred. To do: `CAMetalDisplayLink` pacing |
+| M4 | The rest: the immediate drawer (ImGui overlays, the pause menu's settings), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | captures done (`shot`); the rest to do |
 
-### M1 so far (2026-10-31 and 2026-11-01)
+### M1 to M3, as it went (2026-10-31 and 2026-11-01)
 
 **The shader path works for the whole game so far.** Each draw's vertex and pixel shader, with the modification
 the Vulkan backend would choose for it, goes through the SDK's translator to SPIR-V, SPIRV-Cross to MSL and Metal's

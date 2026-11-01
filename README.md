@@ -29,7 +29,7 @@ Measured on an M5 Mac (4 performance and 6 efficiency cores), free roam at nativ
 | Graphics | State |
 |---|---|
 | Vulkan on MoltenVK (the default) | Plays from boot to free roam: title, menus, the city, HUD, audio, controller. About 20 FPS with MSAA 2x, 31 with anti-aliasing off. GPU-bound. |
-| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD). **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 91 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
+| Native Metal (`--mcla_gpu_backend=metal`) | The same picture as MoltenVK at the spawn point (shadows, colour grading, minimap, HUD); plays from boot to free roam. **About 60 to 63 FPS** on a cool Mac with MSAA 2x, **about 76 with MetalFX anti-aliasing** (`--mcla_anti_aliasing=fsr`), **86 to 91 with MetalFX upscaling** (add `--mcla_upscaling=quality` or `performance`), 80 with anti-aliasing off; 35 to 45 once it has warmed up or is busy. In development. A known bug: the player's car sometimes falls through the road (see below). |
 
 Work in progress, and the measurements behind it: [docs/metal-backend.md](docs/metal-backend.md), [docs/macos.md](docs/macos.md), [docs/BACKLOG.md](docs/BACKLOG.md).
 
