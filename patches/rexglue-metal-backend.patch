@@ -129,7 +129,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,284 @@
+@@ -0,0 +1,286 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -195,6 +195,8 @@ new file mode 100644
 +  }
 +  device_ = provider->device();
 +  command_queue_ = provider->command_queue();
++  // The other backends set this from their render target caches; M1 has the console's EDRAM.
++  if (!graphics_system_->edram_tile_count()) graphics_system_->set_edram_tile_count(xenos::kEdramTileCountConsole);
 +  shader_compiler_ = std::make_unique<MetalShaderCompiler>(device_, graphics_system_->edram_tile_count());
 +  if (REXCVAR_GET(metal_shared_memory_zero_copy)) {
 +    CreateZeroCopySharedMemory();
@@ -418,7 +420,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,94 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include "metal_shaders.h"
@@ -427,6 +429,9 @@ new file mode 100644
 +#include <rex/graphics/pipeline/texture/conversion.h>
 +#include <rex/graphics/shared_memory.h>
 +#include <unordered_set>
++#include <atomic>
++#include <chrono>
++#include <memory>
 +
 +namespace rex::graphics::metal {
 +class MetalPrimitiveProcessor;
@@ -442,13 +447,23 @@ new file mode 100644
 +  bool Present(uint32_t address, id<MTLTexture> destination);
 +  uint64_t draws() const { return draws_; }
 +  uint64_t resolves() const { return resolves_; }
-+  uint64_t failures() const { return failures_; }
++  uint64_t failures() const { return failures_ + gpu_errors_->load(); }
 + private:
++  bool DebugFrame() const;
++  uint64_t capture_frame_ = 0;
++  bool debug_draw_log_ = false;
++  void VerifyResolve(id<MTLTexture> texture, const draw_util::ResolveInfo& info);
++  bool resolve_verified_ = false;
 +  void DumpTexture(id<MTLTexture> texture, const std::string& name);
 +  void EndEncoder();
-+  void Submit();
-+  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t height);
++  // Commits the pending commands; with wait, also waits for all GPU work and starts the snapshots afresh.
++  void Submit(bool wait = true);
++  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp);
 +  id<MTLTexture> Texture(const MetalTextureBinding& binding);
++  // A texture seen through a fetch constant's swizzle (views cached per texture and swizzle).
++  id<MTLTexture> View(id<MTLTexture> texture, uint32_t swizzle, bool cube);
++  void DropViews(id<MTLTexture> texture);
++  std::unordered_map<std::string, id<MTLTexture>> views_;
 +  id<MTLSamplerState> Sampler(const MetalSamplerBinding& binding);
 +  uint32_t Snapshot(uint32_t address, uint32_t size);
 +  bool SnapshotDraw(Shader& vertex, PrimitiveProcessor::ProcessingResult& primitive);
@@ -458,8 +473,18 @@ new file mode 100644
 +  id<MTLCommandQueue> queue_;
 +  id<MTLBuffer> memory_buffer_;
 +  id<MTLBuffer> snapshot_buffer_ = nil;
++  // Two frames in flight: each has its own snapshot buffer, reused once that frame's GPU work is done.
++  std::array<id<MTLBuffer>, 2> snapshot_buffers_{};
++  std::array<id<MTLCommandBuffer>, 2> frame_done_{};
++  uint32_t slot_ = 0;
++  id<MTLCommandBuffer> last_committed_ = nil;
++  std::shared_ptr<std::atomic<uint64_t>> gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
++  std::chrono::steady_clock::time_point stats_start_ = std::chrono::steady_clock::now();
++  uint64_t stats_frames_ = 0, wait_us_ = 0;
++  std::shared_ptr<std::atomic<uint64_t>> gpu_errors_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  size_t snapshot_used_ = 0;
-+  std::unordered_map<std::string, uint32_t> snapshots_;
++  // Offset in the snapshot buffer and the hash of the copied data, by address and size.
++  std::unordered_map<std::string, std::pair<uint32_t, uint64_t>> snapshots_;
 +  std::array<uint32_t, 192> draw_fetch_{};
 +  memory::Memory& memory_;
 +  RegisterFile& regs_;
@@ -467,17 +492,24 @@ new file mode 100644
 +  uint32_t edram_tiles_;
 +  std::unique_ptr<SharedMemory> shared_;
 +  std::unique_ptr<MetalPrimitiveProcessor> primitives_;
-+  id<MTLComputePipelineState> resolve_color_ = nil, resolve_depth_ = nil;
++  id<MTLComputePipelineState> resolve_color_ = nil, resolve_depth_ = nil, present_ = nil, load_texture_ = nil;
++  uint64_t texture_loads_ = 0;
 +  id<MTLCommandBuffer> commands_ = nil;
 +  id<MTLRenderCommandEncoder> encoder_ = nil;
 +  std::array<id<MTLTexture>, 5> attachments_{};
-+  std::unordered_map<std::string, id<MTLTexture>> targets_, textures_, latest_targets_;
++  std::unordered_map<std::string, id<MTLTexture>> targets_, textures_;
 +  std::unordered_map<std::string, uint64_t> texture_hashes_, texture_checked_frame_;
 +  uint64_t frame_ = 1;
 +  std::unordered_map<std::string, id<MTLSamplerState>> samplers_;
 +  std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines_;
 +  std::unordered_map<std::string, id<MTLDepthStencilState>> depth_states_;
-+  std::unordered_map<uint32_t, id<MTLTexture>> resolved_;
++  // A resolve's own texture, used in place of a load from guest memory only by a fetch of exactly
++  // what it wrote (same address, size and format). Guest memory is the truth for everything else.
++  struct ResolvedTexture { id<MTLTexture> texture; uint32_t start, length, width, height, format; };
++  std::unordered_map<uint32_t, ResolvedTexture> resolved_;
++  // The guest memory each cached texture was made from, to drop it when a resolve writes there.
++  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> texture_ranges_;
++  void InvalidateRange(uint32_t start, uint32_t length);
 +  std::unordered_set<uint32_t> unsupported_formats_;
 +  std::vector<id<MTLBuffer>> uploads_;
 +  uint64_t draws_ = 0, resolves_ = 0, failures_ = 0;
@@ -487,7 +519,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,714 @@
+@@ -0,0 +1,935 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -502,7 +534,9 @@ new file mode 100644
 +#include <filesystem>
 +#include <fstream>
 +#include <rex/cvar.h>
++REXCVAR_DEFINE_BOOL(metal_snapshot_vertices, true, "GPU/Metal", "Snapshot guest vertices and indices at draw time (disable only for diagnosis)");
 +REXCVAR_DEFINE_UINT32(metal_debug_frame, 0, "GPU/Metal", "Dump every resolve in this swap frame (0 disables)");
++REXCVAR_DEFINE_BOOL(metal_debug_capture, false, "GPU/Metal", "Dump the next swap frame like metal_debug_frame (for pad scripts: set metal_debug_capture true)");
 +REXCVAR_DEFINE_STRING(metal_debug_dir, "", "GPU/Metal", "Folder for native Metal resolve diagnostics");
 +
 +namespace rex::graphics::metal {
@@ -557,6 +591,14 @@ new file mode 100644
 +    MTLStencilOperationInvert, MTLStencilOperationIncrementWrap, MTLStencilOperationDecrementWrap};
 +  return ops[op & 7];
 +}
++// ResolveConstants in metal_resolve.h (MSL layout: uint2 x3, uint x6, float, then uint2 at offset 56).
++struct ResolveConstants {
++  uint32_t sx = 0, sy = 0, width = 0, height = 0, dx = 0, dy = 0, pitch = 0, address = 0, format = 0, endian = 0,
++      swap = 0, write_memory = 0;
++  float scale = 1.0f; uint32_t padding = 0;
++  uint32_t samples_x = 1, samples_y = 1, sample_select = 0, padding2 = 0;
++};
++static_assert(sizeof(ResolveConstants) == 72);
 +template <typename T> void Key(std::string& key, T value) {
 +  key.append(reinterpret_cast<const char*>(&value), sizeof(value));
 +}
@@ -598,16 +640,21 @@ new file mode 100644
 +      shaders_(shaders), edram_tiles_(edram_tiles) {}
 +MetalDraw::~MetalDraw() { Submit(); primitives_.reset(); shared_.reset(); }
 +bool MetalDraw::Initialize() {
-+  snapshot_buffer_ = [device_ newBufferWithLength:64 * 1024 * 1024 options:MTLResourceStorageModeShared];
-+  if (!snapshot_buffer_) return false;
-+  snapshot_buffer_.label = @"Xenos draw-time vertex and index snapshots";
++  for (auto& buffer : snapshot_buffers_) {
++    buffer = [device_ newBufferWithLength:64 * 1024 * 1024 options:MTLResourceStorageModeShared];
++    if (!buffer) return false;
++    buffer.label = @"Xenos draw-time vertex and index snapshots";
++  }
++  snapshot_buffer_ = snapshot_buffers_[0];
 +  NSError* error = nil;
 +  auto library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:kMetalResolveSource] options:nil error:&error];
 +  if (library) {
 +    resolve_color_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_color"] error:&error];
 +    resolve_depth_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"resolve_depth"] error:&error];
++    present_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"present_color"] error:&error];
++    load_texture_ = [device_ newComputePipelineStateWithFunction:[library newFunctionWithName:@"load_texture"] error:&error];
 +  }
-+  if (!resolve_color_ || !resolve_depth_) {
++  if (!resolve_color_ || !resolve_depth_ || !present_ || !load_texture_) {
 +    REXGPU_ERROR("Metal resolve shader failed: {}", error.localizedDescription.UTF8String); return false;
 +  }
 +  shared_ = std::make_unique<UnifiedMemory>(memory_);
@@ -615,39 +662,100 @@ new file mode 100644
 +  return primitives_->Initialize();
 +}
 +void MetalDraw::EndEncoder() { if (encoder_) { [encoder_ endEncoding]; encoder_ = nil; } attachments_ = {}; }
-+void MetalDraw::Submit() {
++void MetalDraw::Submit(bool wait) {
 +  EndEncoder();
-+  if (!commands_) { uploads_.clear(); snapshots_.clear(); snapshot_used_ = 0; return; }
-+  [commands_ commit];
-+  // M1 correctness baseline: resources and guest writes may be reused only after completion.
-+  [commands_ waitUntilCompleted];
-+  if (commands_.status == MTLCommandBufferStatusError) {
-+    ++failures_; REXGPU_ERROR("Metal draw command buffer failed: {}", commands_.error.localizedDescription.UTF8String);
++  if (commands_) {
++    auto errors = gpu_errors_; auto gpu_us = gpu_us_;
++    [commands_ addCompletedHandler:^(id<MTLCommandBuffer> done) {
++      if (done.GPUEndTime > done.GPUStartTime) gpu_us->fetch_add(uint64_t((done.GPUEndTime - done.GPUStartTime) * 1e6));
++      if (done.status == MTLCommandBufferStatusError && errors->fetch_add(1) < 16)
++        REXGPU_ERROR("Metal draw command buffer failed: {}", done.error.localizedDescription.UTF8String);
++    }];
++    [commands_ commit];
++    last_committed_ = commands_; commands_ = nil;
 +  }
-+  commands_ = nil; uploads_.clear();
-+  snapshots_.clear(); snapshot_used_ = 0;
++  // Command buffers keep what they use alive; the uploads list only has to outlive the encoding.
++  uploads_.clear();
++  if (wait) {
++    // One queue: its last command buffer completes after the ones before it.
++    if (last_committed_) [last_committed_ waitUntilCompleted];
++    snapshots_.clear(); snapshot_used_ = 0;
++  }
++}
++bool MetalDraw::DebugFrame() const {
++  return frame_ == REXCVAR_GET(metal_debug_frame) || frame_ == capture_frame_;
 +}
 +void MetalDraw::EndFrame() {
-+  Submit(); ++frame_;
-+  if (textures_.size() > 4096) { textures_.clear(); texture_hashes_.clear(); texture_checked_frame_.clear(); }
++  // The frame goes to the GPU without waiting for it; the next one is encoded meanwhile, into the other
++  // snapshot buffer, once the frame before last (its previous user) is done.
++  Submit(false);
++  frame_done_[slot_] = last_committed_;
++  slot_ ^= 1;
++  snapshot_buffer_ = snapshot_buffers_[slot_];
++  if (frame_done_[slot_]) {
++    auto wait_start = std::chrono::steady_clock::now();
++    [frame_done_[slot_] waitUntilCompleted]; frame_done_[slot_] = nil;
++    wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count());
++  }
++  if (++stats_frames_ == 150) {
++    double wall = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - stats_start_).count();
++    REXGPU_INFO("Metal frame time: {:.1f} ms a frame, GPU busy {:.1f} ms, CPU waiting for the GPU {:.1f} ms; {} texture loads",
++        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_);
++    stats_frames_ = 0; wait_us_ = 0; texture_loads_ = 0; stats_start_ = std::chrono::steady_clock::now();
++  }
++  snapshots_.clear(); snapshot_used_ = 0;
++  ++frame_;
++  if (REXCVAR_GET(metal_debug_capture)) {
++    capture_frame_ = frame_;
++    rex::cvar::SetFlagByName("metal_debug_capture", "false");
++    REXGPU_INFO("Metal debug capture: frame {}", frame_);
++  }
++  if (textures_.size() > 4096) {
++    textures_.clear(); texture_hashes_.clear(); texture_checked_frame_.clear(); texture_ranges_.clear(); views_.clear();
++  }
++}
++void MetalDraw::DropViews(id<MTLTexture> texture) {
++  if (!texture) return;
++  std::string prefix; Key(prefix, reinterpret_cast<uintptr_t>((__bridge void*)texture));
++  for (auto it = views_.begin(); it != views_.end();)
++    it = it->first.compare(0, prefix.size(), prefix) == 0 ? views_.erase(it) : std::next(it);
++}
++void MetalDraw::InvalidateRange(uint32_t start, uint32_t length) {
++  if (!length) return;
++  uint64_t end = uint64_t(start) + length;
++  for (auto it = resolved_.begin(); it != resolved_.end();) {
++    if (it->second.start < end && uint64_t(it->second.start) + it->second.length > start) it = resolved_.erase(it);
++    else ++it;
++  }
++  for (auto it = texture_ranges_.begin(); it != texture_ranges_.end();) {
++    if (it->second.first < end && uint64_t(it->second.first) + it->second.second > start) {
++      if (auto t = textures_.find(it->first); t != textures_.end()) { DropViews(t->second); textures_.erase(t); }
++      texture_hashes_.erase(it->first); texture_checked_frame_.erase(it->first);
++      it = texture_ranges_.erase(it);
++    } else ++it;
++  }
 +}
 +id<MTLBuffer> MetalDraw::Upload(const void* data, size_t size) {
 +  id<MTLBuffer> buffer = [device_ newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
 +  if (buffer) uploads_.push_back(buffer);
 +  return buffer;
 +}
-+id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t height) {
-+  std::string identity; Key(identity, base); Key(identity, format); Key(identity, width);
-+  std::string key = identity; Key(key, height);
++id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp) {
++  // EDRAM is kept in samples (MSAA 2x as 1x2, 4x as 2x2), so that the views of the same tiles
++  // with another sample count and pitch (a 4x clear at half the pitch of a 2x scene) meet in one
++  // texture. Its height is what is left of EDRAM after the base, so it does not depend on the draw.
++  std::string key; Key(key, base); Key(key, format); Key(key, width);
 +  auto found = targets_.find(key);
-+  if (found != targets_.end()) { latest_targets_[identity] = found->second; return found->second; }
++  if (found != targets_.end()) return found->second;
++  uint32_t pitch_tiles = std::max(1u, (width + (is_64bpp ? 39 : 79)) / (is_64bpp ? 40 : 80));
++  uint32_t height = std::min(8192u, (edram_tiles_ - std::min(base, edram_tiles_ - 1) + pitch_tiles - 1) / pitch_tiles * 16);
 +  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
 +  desc.storageMode = MTLStorageModePrivate;
 +  desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +  id<MTLTexture> result = [device_ newTextureWithDescriptor:desc];
 +  if (result) {
 +    result.label = [NSString stringWithFormat:@"Xenos RT base %u", base];
-+    targets_[key] = result; latest_targets_[identity] = result;
++    targets_[key] = result;
 +    EndEncoder();
 +    if (!commands_) commands_ = [queue_ commandBuffer];
 +    auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -655,7 +763,9 @@ new file mode 100644
 +      pass.depthAttachment.texture = pass.stencilAttachment.texture = result;
 +      pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionClear;
 +      pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
-+      pass.depthAttachment.clearDepth = 1.0;
++      // The initial EDRAM contents are zero. This title uses reversed depth (GreaterEqual),
++      // so a conventional host far-depth clear of 1 rejects its UI and geometry.
++      pass.depthAttachment.clearDepth = 0.0;
 +    } else {
 +      pass.colorAttachments[0].texture = result;
 +      pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -684,7 +794,7 @@ new file mode 100644
 +    PrimitiveProcessor::ProcessingResult primitive{};
 +    if (!primitives_->Process(primitive)) { ++failures_; return false; }
 +    if (primitive.IsTessellated() || !primitive.host_draw_vertex_count) return true;
-+    if (!SnapshotDraw(*vs, primitive)) { ++failures_; return false; }
++    if (REXCVAR_GET(metal_snapshot_vertices) && !SnapshotDraw(*vs, primitive)) { ++failures_; return false; }
 +    uint64_t vm, pm;
 +    shaders_.translator().GetDrawModifications(regs_, *vs, ps, vm, pm, primitive.host_vertex_shader_type);
 +    shaders_.Request(*vs, vm); if (ps) shaders_.Request(*ps, pm);
@@ -695,14 +805,15 @@ new file mode 100644
 +    if (!vl || (ps && !pl)) { ++failures_; return false; }
 +    auto dc = draw_util::GetNormalizedDepthControl(regs_);
 +    uint32_t mask = draw_util::GetNormalizedColorMask(regs_, ps ? ps->writes_color_targets() : 0);
++    auto msaa = regs_.Get<reg::RB_SURFACE_INFO>().msaa_samples;
++    uint32_t ssx = msaa >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = msaa >= xenos::MsaaSamples::k2X ? 2 : 1;
 +    draw_util::ViewportInfo viewport{};
-+    draw_util::GetHostViewportInfo(regs_, 1, 1, false, 16384, 16384, true, dc, false, true,
++    draw_util::GetHostViewportInfo(regs_, ssx, ssy, false, 16384, 16384, true, dc, false, true,
 +                                   ps && ps->writes_depth(), viewport);
 +    draw_util::Scissor scissor{}; draw_util::GetScissor(regs_, scissor);
++    scissor.offset[0] *= ssx; scissor.extent[0] *= ssx; scissor.offset[1] *= ssy; scissor.extent[1] *= ssy;
 +    if (!scissor.extent[0] || !scissor.extent[1] || !viewport.xy_extent[0] || !viewport.xy_extent[1]) return true;
-+    uint32_t height = std::min(2048u, (scissor.offset[1] + scissor.extent[1] + 63) & ~63u);
-+    // Keep target allocation stable through the normal 720p scene and UI passes.
-+    height = std::max(height, 1024u);
++    const uint32_t width = pitch * ssx;
 +    std::array<id<MTLTexture>, 5> next{};
 +    std::string key; Key(key, reinterpret_cast<uintptr_t>(vt)); Key(key, reinterpret_cast<uintptr_t>(pt));
 +    Key(key, mask);
@@ -715,7 +826,8 @@ new file mode 100644
 +        auto color = regs_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
 +        format = ColorFormat(color.color_format);
 +        if (format == MTLPixelFormatInvalid) { ++failures_; return false; }
-+        next[i] = Target(color.GetBaseTiles(edram_tiles_), format, pitch, height);
++        next[i] = Target(color.GetBaseTiles(edram_tiles_), format, width,
++                         xenos::IsColorRenderTargetFormat64bpp(color.color_format));
 +        if (!next[i]) return false;
 +      }
 +      Key(key, format);
@@ -726,7 +838,7 @@ new file mode 100644
 +      a.writeMask = MTLColorWriteMask(((wm & 1) ? MTLColorWriteMaskRed : 0) |
 +        ((wm & 2) ? MTLColorWriteMaskGreen : 0) | ((wm & 4) ? MTLColorWriteMaskBlue : 0) |
 +        ((wm & 8) ? MTLColorWriteMaskAlpha : 0));
-+      a.blendingEnabled = format != MTLPixelFormatInvalid && 
++      a.blendingEnabled = format != MTLPixelFormatInvalid &&
 +                         (bc.value & 0x1FFF1FFF) != 0x00010001;
 +      a.sourceRGBBlendFactor = BlendFactor(bc.color_srcblend); a.destinationRGBBlendFactor = BlendFactor(bc.color_destblend);
 +      a.sourceAlphaBlendFactor = BlendFactor(bc.alpha_srcblend); a.destinationAlphaBlendFactor = BlendFactor(bc.alpha_destblend);
@@ -735,7 +847,7 @@ new file mode 100644
 +    bool depth = dc.z_enable || dc.stencil_enable;
 +    Key(key, depth);
 +    if (depth) {
-+      next[4] = Target(regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), MTLPixelFormatDepth32Float_Stencil8, pitch, height);
++      next[4] = Target(regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), MTLPixelFormatDepth32Float_Stencil8, width, false);
 +      if (!next[4]) return false;
 +      pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
 +    }
@@ -749,6 +861,9 @@ new file mode 100644
 +      if (!pipeline) { ++failures_; REXGPU_ERROR("Metal pipeline failed: {}", error.localizedDescription.UTF8String); }
 +    }
 +    if (!pipeline) return false;
++    // Texture loads are compute work and cannot run inside a render pass: do them first (a load
++    // needed while a pass is open ends it).
++    for (auto* t : {vt, pt}) if (t) for (auto& b : shaders_.translator().bindings(t).textures) Texture(b);
 +    if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
 +    if (!encoder_ || next != attachments_) {
 +      EndEncoder(); attachments_ = next;
@@ -763,6 +878,23 @@ new file mode 100644
 +        pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
 +      }
 +      encoder_ = [commands_ renderCommandEncoderWithDescriptor:pass];
++      if (DebugFrame()) {
++        auto si = regs_.Get<reg::RB_SURFACE_INFO>();
++        std::string rts;
++        for (uint32_t i = 0; i < 4; ++i) if (next[i]) {
++          auto color = regs_.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
++          rts += fmt::format(" rt{} base {} fmt {} {}x{}", i, color.GetBaseTiles(edram_tiles_),
++                             uint32_t(color.color_format), next[i].width, next[i].height);
++        }
++        if (depth) rts += fmt::format(" depth base {} fmt {} zfunc {} zwrite {} stencil {}",
++            regs_.Get<reg::RB_DEPTH_INFO>().GetBaseTiles(edram_tiles_), uint32_t(regs_.Get<reg::RB_DEPTH_INFO>().depth_format),
++            uint32_t(dc.zfunc), uint32_t(dc.z_write_enable), uint32_t(dc.stencil_enable));
++        REXGPU_INFO("Metal pass debug: draw {} pitch {} msaa {} viewport {},{} {}x{} z {}..{} scissor {},{} {}x{} window_offset {:08X}:{}",
++            draws_, pitch, uint32_t(si.msaa_samples), viewport.xy_offset[0], viewport.xy_offset[1],
++            viewport.xy_extent[0], viewport.xy_extent[1], viewport.z_min, viewport.z_max,
++            scissor.offset[0], scissor.offset[1], scissor.extent[0], scissor.extent[1],
++            regs_[XE_GPU_REG_PA_SC_WINDOW_OFFSET], rts);
++      }
 +    }
 +    [encoder_ setRenderPipelineState:pipeline];
 +    std::string dk; Key(dk, dc.value);
@@ -796,14 +928,17 @@ new file mode 100644
 +    [encoder_ setStencilFrontReferenceValue:sf.stencilref backReferenceValue:dc.backface_enable ? sb.stencilref : sf.stencilref];
 +    [encoder_ setViewport:MTLViewport{double(viewport.xy_offset[0]), double(viewport.xy_offset[1]),
 +        double(viewport.xy_extent[0]), double(viewport.xy_extent[1]), viewport.z_min, viewport.z_max}];
-+    uint32_t sx = std::min(scissor.offset[0], pitch), sy = std::min(scissor.offset[1], height);
-+    [encoder_ setScissorRect:MTLScissorRect{sx, sy, std::min(scissor.extent[0], pitch - sx), std::min(scissor.extent[1], height - sy)}];
++    uint32_t height = UINT32_MAX;
++    for (auto t : next) if (t) height = std::min(height, uint32_t(t.height));
++    uint32_t sx = std::min(scissor.offset[0], width), sy = std::min(scissor.offset[1], height);
++    [encoder_ setScissorRect:MTLScissorRect{sx, sy, std::min(scissor.extent[0], width - sx), std::min(scissor.extent[1], height - sy)}];
 +    auto raster = regs_.Get<reg::PA_SU_SC_MODE_CNTL>();
 +    [encoder_ setFrontFacingWinding:raster.face ? MTLWindingClockwise : MTLWindingCounterClockwise];
 +    [encoder_ setCullMode:!polygonal ? MTLCullModeNone : raster.cull_front ? MTLCullModeFront : raster.cull_back ? MTLCullModeBack : MTLCullModeNone];
 +    [encoder_ setBlendColorRed:regs_.Get<float>(XE_GPU_REG_RB_BLEND_RED) green:regs_.Get<float>(XE_GPU_REG_RB_BLEND_GREEN)
 +                        blue:regs_.Get<float>(XE_GPU_REG_RB_BLEND_BLUE) alpha:regs_.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)];
 +    auto system = BuildMetalSystemConstants(regs_, primitive, viewport);
++    debug_draw_log_ = DebugFrame() && primitive.host_draw_vertex_count <= 6;
 +    Bind(*vs, vt, true, system); if (ps) Bind(*ps, pt, false, system);
 +    MTLPrimitiveType topology;
 +    switch (primitive.host_primitive_type) {
@@ -818,11 +953,19 @@ new file mode 100644
 +      [encoder_ drawPrimitives:topology vertexStart:0 vertexCount:primitive.host_draw_vertex_count];
 +    } else {
 +      id<MTLBuffer> buffer; size_t offset;
-+      if (primitive.index_buffer_type == PrimitiveProcessor::kGuestDMA) { buffer = snapshot_buffer_; offset = primitive.guest_index_base; }
++      if (primitive.index_buffer_type == PrimitiveProcessor::kGuestDMA) { buffer = REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_; offset = primitive.guest_index_base; }
 +      else { auto b = primitives_->Buffer(primitive); buffer = b.first; offset = b.second; }
 +      [encoder_ drawIndexedPrimitives:topology indexCount:primitive.host_draw_vertex_count
 +          indexType:primitive.host_index_format == xenos::IndexFormat::kInt16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
 +          indexBuffer:buffer indexBufferOffset:offset];
++    }
++    if (DebugFrame() && (draws_ % 64) == 0) {
++      auto fetch = regs_.GetTextureFetch(0); auto vf = regs_.GetVertexFetch(0);
++      REXGPU_INFO("Metal draw debug: VS {:016X} PS {:016X}, prim {} index {} count {}, RT {:08X} depth {:08X}, vfetch {:08X} size {}, tex {:08X} fmt {} swizzle {:03X} signs {:02X}",
++        vs->ucode_data_hash(), ps ? ps->ucode_data_hash() : 0, uint32_t(primitive.host_vertex_shader_type),
++        uint32_t(primitive.index_buffer_type), primitive.host_draw_vertex_count,
++        regs_[XE_GPU_REG_RB_COLOR_INFO], dc.value, uint32_t(vf.address << 2), uint32_t(vf.size),
++        uint32_t(fetch.base_address << 12), uint32_t(fetch.format), uint32_t(fetch.swizzle), uint32_t((fetch.dword_0 >> 2) & 255));
 +    }
 +    ++draws_;
 +    return true;
@@ -832,12 +975,18 @@ new file mode 100644
 +uint32_t MetalDraw::Snapshot(uint32_t address, uint32_t size) {
 +  if (!size) return 0;
 +  const void* source = memory_.TranslatePhysical<const void*>(address);
-+  std::string key; Key(key, address); Key(key, size); Key(key, XXH3_64bits(source, size));
-+  auto found = snapshots_.find(key); if (found != snapshots_.end()) return found->second;
++  // A range copied earlier in the frame is reused if its data is the same. (Tried 2026-11-01: the write
++  // watches' page validity instead of the hash, 23 FPS against 28 to 30 in free roam: watching every
++  // vertex range costs more than hashing it.)
++  uint64_t hash = XXH3_64bits(source, size);
++  std::string key; Key(key, address); Key(key, size);
++  auto found = snapshots_.find(key);
++  if (found != snapshots_.end() && found->second.second == hash) return found->second.first;
 +  uint32_t offset = uint32_t(snapshot_used_);
 +  std::memcpy(static_cast<uint8_t*>(snapshot_buffer_.contents) + offset, source, size);
 +  snapshot_used_ += (size + 255) & ~size_t(255);
-+  snapshots_[key] = offset; return offset;
++  snapshots_[key] = {offset, hash};
++  return offset;
 +}
 +
 +bool MetalDraw::SnapshotDraw(Shader& vertex, PrimitiveProcessor::ProcessingResult& primitive) {
@@ -876,20 +1025,36 @@ new file mode 100644
 +    if (vertex) [encoder_ setVertexBuffer:b offset:0 atIndex:slot];
 +    else [encoder_ setFragmentBuffer:b offset:0 atIndex:slot];
 +  };
-+  buffer(Upload(system.data(), system.size()), 0);
++  // Inline constants (Metal copies up to 4 KB with the command); a buffer only if larger.
++  auto bytes = [&](const void* data, size_t size, uint32_t slot) {
++    if (size > 4096) { buffer(Upload(data, size), slot); return; }
++    if (vertex) [encoder_ setVertexBytes:data length:size atIndex:slot];
++    else [encoder_ setFragmentBytes:data length:size atIndex:slot];
++  };
++  bytes(system.data(), system.size(), 0);
 +  std::array<uint32_t, 1024> floats{}; size_t count = 0;
 +  uint32_t base = vertex ? XE_GPU_REG_SHADER_CONSTANT_000_X : XE_GPU_REG_SHADER_CONSTANT_256_X;
 +  const auto& map = shader.constant_register_map();
 +  for (uint32_t i = 0; i < 256; ++i) if ((map.float_bitmap[i / 64] >> (i % 64)) & 1) {
 +    std::memcpy(floats.data() + count * 4, &regs_[base + i * 4], 16); ++count;
 +  }
-+  buffer(Upload(floats.data(), std::max(count, size_t(1)) * 16), vertex ? 1 : 2);
-+  buffer(Upload(&regs_[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 40 * 4), 3);
-+  buffer(Upload(vertex ? draw_fetch_.data() : &regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4), 4);
-+  buffer(snapshot_buffer_, 5);
++  bytes(floats.data(), std::max(count, size_t(1)) * 16, vertex ? 1 : 2);
++  bytes(&regs_[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031], 40 * 4, 3);
++  bytes(vertex && REXCVAR_GET(metal_snapshot_vertices) ? draw_fetch_.data() : &regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4, 4);
++  buffer(REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_, 5);
 +  const auto& bindings = shaders_.translator().bindings(translation);
 +  for (auto& t : bindings.textures) {
 +    auto texture = Texture(t);
++    if (DebugFrame() && debug_draw_log_) {
++      auto f = regs_.GetTextureFetch(t.fetch_constant);
++      uint32_t a = (f.base_address << 12) & 0x1FFFFFFF;
++      auto r = resolved_.find(a);
++      REXGPU_INFO("Metal texture debug: draw {} {} slot {} fetch {} addr {:08X} fmt {} {}x{} tiled {} -> {}x{} {} ({})",
++          draws_, vertex ? "VS" : "PS", t.index, t.fetch_constant, a, uint32_t(f.format),
++          uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1, uint32_t(f.tiled),
++          texture.width, texture.height, uint32_t(texture.pixelFormat),
++          r != resolved_.end() ? fmt::format("resolve {}x{} fmt {}", r->second.width, r->second.height, r->second.format) : std::string("memory"));
++    }
 +    if (vertex) [encoder_ setVertexTexture:texture atIndex:t.index];
 +    else [encoder_ setFragmentTexture:texture atIndex:t.index];
 +  }
@@ -902,32 +1067,45 @@ new file mode 100644
 +
 +id<MTLTexture> MetalDraw::Texture(const MetalTextureBinding& binding) {
 +  auto fetch = regs_.GetTextureFetch(binding.fetch_constant);
-+  std::string key(reinterpret_cast<const char*>(&fetch), sizeof(fetch));
++  // The texture's identity is its memory and layout only; the sampler fields and the swizzle vary between
++  // passes that read the same texture, which is then loaded once and viewed with each swizzle.
++  std::string key;
++  Key(key, fetch.dword_0 & 0xFFC00003u); Key(key, fetch.dword_1); Key(key, fetch.dword_2); Key(key, fetch.dword_5);
 +  Key(key, binding.dimension); Key(key, binding.is_signed);
++  bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
 +  auto cached = textures_.find(key);
-+  if (cached != textures_.end() && texture_checked_frame_[key] == frame_) return cached->second;
++  if (cached != textures_.end() && texture_checked_frame_[key] == frame_) return View(cached->second, fetch.swizzle, cube);
++  bool volume = binding.dimension == xenos::FetchOpDimension::k3DOrStacked;
++  uint32_t address = (fetch.base_address << 12) & 0x1FFFFFFF;
 +  uint64_t content_hash = 0;
-+  if (fetch.type == xenos::FetchConstantType::kTexture && fetch.dimension != xenos::DataDimension::k3D &&
-+      !resolved_.contains((fetch.base_address << 12) & 0x1FFFFFFF)) {
++  uint32_t range = 0;
++  const ResolvedTexture* resolved = nullptr;
++  if (fetch.type == xenos::FetchConstantType::kTexture && fetch.dimension != xenos::DataDimension::k3D) {
 +    uint32_t w, h, layers, base, mip, lo, hi;
 +    texture_util::GetSubresourcesFromFetchConstant(fetch, &w, &h, &layers, &base, &mip, &lo, &hi);
 +    auto layout = texture_util::GetGuestTextureLayout(fetch.dimension, fetch.pitch, w + 1, h + 1, layers + 1,
 +        fetch.tiled, GetBaseFormat(fetch.format), fetch.packed_mips, base != 0, 0);
-+    uint32_t address = (base << 12) & 0x1FFFFFFF;
-+    uint32_t size = layout.base.level_data_extent_bytes;
-+    if (base && uint64_t(address) + size <= SharedMemory::kBufferSize)
-+      content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(address), size);
++    range = layout.base.level_data_extent_bytes;
++    // A resolve's texture stands in only for exactly what it wrote: a scene drawn in tiles is
++    // resolved piece by piece to one surface, and memory is often reused for other resolves.
++    auto r = resolved_.find(address);
++    if (r != resolved_.end() && !cube && !volume && r->second.width == w + 1 && r->second.height == h + 1 &&
++        r->second.format == uint32_t(GetBaseFormat(fetch.format)))
++      resolved = &r->second;
++    else if (base && uint64_t(address) + range <= SharedMemory::kBufferSize)
++      content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(address), range);
 +  }
 +  texture_checked_frame_[key] = frame_;
-+  if (cached != textures_.end() && texture_hashes_[key] == content_hash) return cached->second;
++  texture_ranges_[key] = {address, resolved ? resolved->length : range};
++  if (cached != textures_.end() && texture_hashes_[key] == content_hash) return View(cached->second, fetch.swizzle, cube);
++  if (DebugFrame())
++    REXGPU_INFO("Metal texture load debug: addr {:08X} fmt {} {}x{} range {} - {}", address, uint32_t(fetch.format),
++        uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1, range,
++        cached == textures_.end() ? (texture_hashes_.contains(key) ? "dropped by a resolve" : "new") : "content changed");
 +  texture_hashes_[key] = content_hash;
-+  bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
-+  bool volume = binding.dimension == xenos::FetchOpDimension::k3DOrStacked;
 +  id<MTLTexture> texture = nil;
-+  uint32_t address = (fetch.base_address << 12) & 0x1FFFFFFF;
-+  auto resolved = resolved_.find(address);
-+  if (resolved != resolved_.end() && !cube && !volume) {
-+    auto source = resolved->second;
++  if (resolved) {
++    auto source = resolved->texture;
 +    texture = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2DArray
 +        levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
 +  } else if (fetch.type == xenos::FetchConstantType::kTexture && !volume) {
@@ -948,6 +1126,7 @@ new file mode 100644
 +      case F::k_32_32_FLOAT: metal_format = MTLPixelFormatRG32Float; break;
 +      case F::k_32_32_32_32_FLOAT: metal_format = MTLPixelFormatRGBA32Float; break;
 +      case F::k_2_10_10_10: metal_format = MTLPixelFormatRGB10A2Unorm; break;
++      case F::k_24_8: case F::k_24_8_FLOAT: metal_format = MTLPixelFormatR32Float; break;
 +      case F::k_DXT1: metal_format = MTLPixelFormatBC1_RGBA; break;
 +      case F::k_DXT2_3: metal_format = MTLPixelFormatBC2_RGBA; break;
 +      case F::k_DXT4_5: metal_format = MTLPixelFormatBC3_RGBA; break;
@@ -962,9 +1141,11 @@ new file mode 100644
 +      auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:metal_format width:w height:h mipmapped:NO];
 +      desc.textureType = cube ? MTLTextureTypeCube : MTLTextureType2DArray;
 +      desc.arrayLength = cube ? 1 : layers;
-+      desc.storageMode = MTLStorageModeShared; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++      desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 +      texture = [device_ newTextureWithDescriptor:desc];
 +      if (texture) {
++        // Untiled on the GPU straight from guest memory (the no-copy buffer), ordered after the
++        // resolves already encoded, then blitted: any format, compressed ones by blocks.
 +        auto info = FormatInfo::Get(format);
 +        uint32_t bpb = info->bytes_per_block(), bw = (w + info->block_width - 1) / info->block_width;
 +        uint32_t bh = (h + info->block_height - 1) / info->block_height;
@@ -972,24 +1153,33 @@ new file mode 100644
 +            fetch.tiled, format, fetch.packed_mips, true, 0);
 +        uint32_t ox = 0, oy = 0, oz = 0;
 +        if (fetch.packed_mips) texture_util::GetPackedMipOffset(w, h, 1, format, 0, ox, oy, oz);
-+        std::vector<uint8_t> bytes(size_t(bw) * bh * bpb);
-+        for (uint32_t layer = 0; layer < layers; ++layer) {
-+          uint32_t src_base = ((base_page << 12) & 0x1FFFFFFF) + layer * layout.base.array_slice_stride_bytes;
-+          for (uint32_t y = 0; y < bh; ++y) for (uint32_t x = 0; x < bw; ++x) {
-+            uint32_t offset = fetch.tiled ? uint32_t(texture_util::GetTiledOffset2D(x + ox, y + oy,
-+                layout.base.row_pitch_bytes / bpb, rex::log2_floor(bpb))) :
-+                (y + oy) * layout.base.row_pitch_bytes + (x + ox) * bpb;
-+            auto* dst = bytes.data() + (y * bw + x) * bpb;
-+            if (uint64_t(src_base) + offset + bpb <= SharedMemory::kBufferSize) {
-+              // Swap each addressed byte: also handles 8/16-bit formats crossing a 32-bit word.
-+              auto* src = memory_.TranslatePhysical<const uint8_t*>(0);
-+              uint32_t xor_mask = fetch.endianness == xenos::Endian::k8in16 ? 1 :
-+                fetch.endianness == xenos::Endian::k8in32 ? 3 : fetch.endianness == xenos::Endian::k16in32 ? 2 : 0;
-+              for (uint32_t b = 0; b < bpb; ++b) dst[b] = src[(src_base + offset + b) ^ xor_mask];
-+            }
-+          }
-+          [texture replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 slice:layer withBytes:bytes.data()
-+              bytesPerRow:bw * bpb bytesPerImage:bytes.size()];
++        size_t image = size_t(bw) * bh * bpb;
++        id<MTLBuffer> staging = [device_ newBufferWithLength:image * layers options:MTLResourceStorageModePrivate];
++        if (!staging || !memory_buffer_) {
++          texture = nil;
++        } else {
++          struct {
++            uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
++          } c{(base_page << 12) & 0x1FFFFFFF, layout.base.array_slice_stride_bytes, layout.base.row_pitch_bytes,
++              layout.base.row_pitch_bytes / bpb, rex::log2_floor(bpb), ox, oy, fetch.tiled ? 1u : 0u,
++              fetch.endianness == xenos::Endian::k8in16 ? 1u : fetch.endianness == xenos::Endian::k8in32 ? 3u :
++                  fetch.endianness == xenos::Endian::k16in32 ? 2u : 0u,
++              bw, bh, format == F::k_24_8 ? 1u : format == F::k_24_8_FLOAT ? 2u : 0u};
++          EndEncoder();
++          if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++          auto compute = [commands_ computeCommandEncoder];
++          [compute setComputePipelineState:load_texture_];
++          [compute setBuffer:memory_buffer_ offset:0 atIndex:0]; [compute setBuffer:staging offset:0 atIndex:1];
++          [compute setBytes:&c length:sizeof(c) atIndex:2];
++          [compute dispatchThreads:MTLSizeMake(bw, bh, layers) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++          [compute endEncoding];
++          auto blit = [commands_ blitCommandEncoder];
++          for (uint32_t layer = 0; layer < layers; ++layer)
++            [blit copyFromBuffer:staging sourceOffset:layer * image sourceBytesPerRow:bw * bpb sourceBytesPerImage:image
++                sourceSize:MTLSizeMake(w, h, 1) toTexture:texture destinationSlice:layer destinationLevel:0
++                destinationOrigin:MTLOriginMake(0, 0, 0)];
++          [blit endEncoding];
++          ++texture_loads_;
 +        }
 +      }
 +    }
@@ -1004,15 +1194,23 @@ new file mode 100644
 +    for (uint32_t i = 0; i < (cube ? 6u : 1u); ++i)
 +      [texture replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:i withBytes:&zero bytesPerRow:4 bytesPerImage:4];
 +  }
-+  if (texture) {
-+    static const MTLTextureSwizzle swizzle[] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
-+      MTLTextureSwizzleAlpha, MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
-+    MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(swizzle[fetch.swizzle & 7],
-+      swizzle[(fetch.swizzle >> 3) & 7], swizzle[(fetch.swizzle >> 6) & 7], swizzle[(fetch.swizzle >> 9) & 7]);
-+    texture = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
-+      levels:NSMakeRange(0, texture.mipmapLevelCount) slices:NSMakeRange(0, cube ? 6 : texture.arrayLength) swizzle:channels];
-+  }
-+  textures_[key] = texture; return texture;
++  if (cached != textures_.end()) DropViews(cached->second);
++  textures_[key] = texture; return View(texture, fetch.swizzle, cube);
++}
++
++id<MTLTexture> MetalDraw::View(id<MTLTexture> texture, uint32_t swizzle_bits, bool cube) {
++  if (!texture) return nil;
++  std::string key; Key(key, reinterpret_cast<uintptr_t>((__bridge void*)texture)); Key(key, swizzle_bits);
++  auto found = views_.find(key);
++  if (found != views_.end()) return found->second;
++  static const MTLTextureSwizzle swizzle[] = {MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue,
++    MTLTextureSwizzleAlpha, MTLTextureSwizzleZero, MTLTextureSwizzleOne, MTLTextureSwizzleZero, MTLTextureSwizzleZero};
++  MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(swizzle[swizzle_bits & 7],
++    swizzle[(swizzle_bits >> 3) & 7], swizzle[(swizzle_bits >> 6) & 7], swizzle[(swizzle_bits >> 9) & 7]);
++  id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
++    levels:NSMakeRange(0, texture.mipmapLevelCount) slices:NSMakeRange(0, cube ? 6 : texture.arrayLength) swizzle:channels];
++  views_[key] = view;
++  return view;
 +}
 +
 +id<MTLSamplerState> MetalDraw::Sampler(const MetalSamplerBinding& b) {
@@ -1040,22 +1238,23 @@ new file mode 100644
 +    bool depth = info.IsCopyingDepth();
 +    auto ei = depth ? info.depth_edram_info : info.color_edram_info;
 +    uint32_t original = depth ? info.depth_original_base : info.color_original_base;
-+    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch;
++    uint32_t ssx = ei.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1, ssy = ei.msaa_samples >= xenos::MsaaSamples::k2X ? 2 : 1;
++    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx;
 +    MTLPixelFormat format = depth ? MTLPixelFormatDepth32Float_Stencil8 : ColorFormat(xenos::ColorRenderTargetFormat(ei.format));
 +    id<MTLTexture> source = nil;
 +    std::string identity; Key(identity, original); Key(identity, format); Key(identity, pitch);
-+    auto current = latest_targets_.find(identity);
-+    if (current != latest_targets_.end()) source = current->second;
++    auto current = targets_.find(identity);
++    if (current != targets_.end()) source = current->second;
 +    uint32_t width = info.coordinate_info.width_div_8 * 8, height = info.height_div_8 * 8;
 +    if (source && width && height && info.copy_dest_extent_length) {
 +      uint32_t delta = (ei.GetBaseTiles() - original) & (edram_tiles_ - 1);
-+      uint32_t sx = (delta % std::max(1u, uint32_t(ei.pitch_tiles))) * (ei.format_is_64bpp ? 40 : 80) + info.coordinate_info.edram_offset_x_div_8 * 8;
-+      uint32_t sy = (delta / std::max(1u, uint32_t(ei.pitch_tiles))) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8;
-+      // M1 represents MSAA targets at one sample per pixel.
-+      if (ei.msaa_samples >= xenos::MsaaSamples::k2X) sy /= 2;
-+      if (ei.msaa_samples >= xenos::MsaaSamples::k4X) sx /= 2;
++      uint32_t sx = (delta % std::max(1u, uint32_t(ei.pitch_tiles))) * (ei.format_is_64bpp ? 40 : 80) +
++                    info.coordinate_info.edram_offset_x_div_8 * 8 * ssx;
++      uint32_t sy = (delta / std::max(1u, uint32_t(ei.pitch_tiles))) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8 * ssy;
 +      if (sx < source.width && sy < source.height) {
-+        width = std::min(width, uint32_t(source.width) - sx); height = std::min(height, uint32_t(source.height) - sy);
++        width = std::min(width, (uint32_t(source.width) - sx) / ssx); height = std::min(height, (uint32_t(source.height) - sy) / ssy);
++      }
++      if (sx < source.width && sy < source.height && width && height) {
 +        MTLPixelFormat dest_format = MTLPixelFormatRGBA8Unorm;
 +        if (depth) dest_format = MTLPixelFormatR32Float;
 +        else switch (uint32_t(info.copy_dest_info.copy_dest_format)) {
@@ -1076,15 +1275,17 @@ new file mode 100644
 +        desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 +        id<MTLTexture> destination = [device_ newTextureWithDescriptor:desc];
 +        if (!destination) return false;
-+        struct Constants {
-+          uint32_t sx, sy, width, height, dx, dy, pitch, address, format, endian, swap, write_memory;
-+          float scale; uint32_t padding = 0;
-+        } constants{sx, sy, width, height, info.copy_dest_coordinate_info.offset_x_div_8 * 8u,
++        bool depth_float = info.depth_edram_info.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8);
++        ResolveConstants constants{sx, sy, width, height, info.copy_dest_coordinate_info.offset_x_div_8 * 8u,
 +          info.copy_dest_coordinate_info.offset_y_div_8 * 8u, info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32u,
 +          info.copy_dest_base, uint32_t(info.copy_dest_info.copy_dest_format), uint32_t(info.copy_dest_info.copy_dest_endian),
-+          info.copy_dest_info.copy_dest_swap, memory_buffer_ && !depth ? 1u : 0u,
-+          depth && info.depth_edram_info.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)
-+              ? 2.0f : std::ldexp(1.0f, info.copy_dest_info.copy_dest_exp_bias)};
++          info.copy_dest_info.copy_dest_swap, memory_buffer_ ? 1u : 0u,
++          !depth ? std::ldexp(1.0f, info.copy_dest_info.copy_dest_exp_bias) : depth_float ? 2.0f : 1.0f, 0, ssx, ssy,
++          // One sample (depth always: averaging depth is meaningless) or the average of all.
++          depth || xenos::IsSingleCopySampleSelected(info.rb_copy_control.copy_sample_select)
++              ? (depth ? 0u : uint32_t(info.rb_copy_control.copy_sample_select)) : 4u};
++        // Depth resolves write the EDRAM depth format (xenos.h: no format conversion for depth).
++        if (depth) constants.format = depth_float ? uint32_t(xenos::TextureFormat::k_24_8_FLOAT) : uint32_t(xenos::TextureFormat::k_24_8);
 +        auto compute = [commands_ computeCommandEncoder];
 +        [compute setComputePipelineState:depth ? resolve_depth_ : resolve_color_];
 +        [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
@@ -1092,26 +1293,28 @@ new file mode 100644
 +        [compute setBuffer:memory_buffer_ ? memory_buffer_ : snapshot_buffer_ offset:0 atIndex:1];
 +        [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 +        [compute endEncoding];
-+        uint32_t address = regs_[XE_GPU_REG_RB_COPY_DEST_BASE] & 0x1FFFFFFF;
-+        resolved_[address] = destination; ++resolves_;
-+        if (frame_ == REXCVAR_GET(metal_debug_frame)) {
++        uint32_t address = info.copy_dest_base & 0x1FFFFFFF;
++        InvalidateRange(info.copy_dest_extent_start & 0x1FFFFFFF, info.copy_dest_extent_length);
++        if (!constants.dx && !constants.dy)
++          resolved_[address] = {destination, info.copy_dest_extent_start & 0x1FFFFFFF, info.copy_dest_extent_length,
++                                width, height, depth ? constants.format : uint32_t(info.copy_dest_info.copy_dest_format)};
++        ++resolves_;
++        if (!resolve_verified_ && memory_buffer_ && frame_ >= 650 && dest_format == MTLPixelFormatRGBA8Unorm)
++          VerifyResolve(destination, info);
++        if (DebugFrame()) {
 +          REXGPU_INFO("Metal resolve debug {}: base {} -> {:08X}, format {} -> {}, source {}x{} origin {},{} size {}x{}, exponent {}, swap {}",
 +            resolves_, original, address, uint32_t(ei.format), uint32_t(info.copy_dest_info.copy_dest_format),
 +            source.width, source.height, sx, sy, width, height, int(info.copy_dest_info.copy_dest_exp_bias), uint32_t(info.copy_dest_info.copy_dest_swap));
 +          DumpTexture(destination, fmt::format("resolve_{}_{:08X}", resolves_, address));
-+        }
-+        for (auto it = textures_.begin(); it != textures_.end();) {
-+          xenos::xe_gpu_texture_fetch_t fetch;
-+          std::memcpy(&fetch, it->first.data(), sizeof(fetch));
-+          if (((fetch.base_address << 12) & 0x1FFFFFFF) == address) it = textures_.erase(it);
-+          else ++it;
 +        }
 +      }
 +    }
 +    if (!depth && info.IsClearingDepth()) {
 +      for (auto& [key, target] : targets_) {
 +        uint32_t base; std::memcpy(&base, key.data(), sizeof(base));
-+        if (base != info.depth_original_base || target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 || target.width != pitch) continue;
++        if (base != info.depth_original_base || target.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 ||
++            target.width != regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch *
++                (info.depth_edram_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1)) continue;
 +        auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
 +        pass.depthAttachment.texture = pass.stencilAttachment.texture = target;
 +        pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionClear;
@@ -1141,15 +1344,54 @@ new file mode 100644
 +      }
 +      [[commands_ renderCommandEncoderWithDescriptor:pass] endEncoding];
 +    }
-+    Submit();
++    if (DebugFrame())
++      REXGPU_INFO("Metal resolve clear debug: draw {} {} base color {} depth {}, clear color {} ({:08X}) depth {} ({:08X}), source {}",
++          draws_, depth ? "depth" : "color", info.color_original_base, info.depth_original_base,
++          info.IsClearingColor(), info.rb_color_clear, info.IsClearingDepth(), info.rb_depth_clear, source ? "found" : "missing");
 +    return true;
 +  }
++}
++
++void MetalDraw::VerifyResolve(id<MTLTexture> texture, const draw_util::ResolveInfo& info) {
++  Submit();
++  // Preserve the caller's pending resolve clears even if allocation or readback fails.
++  commands_ = [queue_ commandBuffer];
++  size_t stride = (texture.width * 4 + 255) & ~size_t(255);
++  auto buffer = [device_ newBufferWithLength:stride * texture.height options:MTLResourceStorageModeShared];
++  if (!buffer) return;
++  auto commands = [queue_ commandBuffer]; auto blit = [commands blitCommandEncoder];
++  [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
++    sourceSize:MTLSizeMake(texture.width, texture.height, 1) toBuffer:buffer destinationOffset:0
++    destinationBytesPerRow:stride destinationBytesPerImage:stride * texture.height];
++  [blit endEncoding]; [commands commit]; [commands waitUntilCompleted];
++  if (commands.status != MTLCommandBufferStatusCompleted) return;
++  uint32_t mismatch = 0, checked = 0, nonzero = 0;
++  uint32_t endian = uint32_t(info.copy_dest_info.copy_dest_endian);
++  uint32_t xor_mask = endian == 1 ? 1 : endian == 2 ? 3 : endian == 3 ? 2 : endian == 4 ? 7 : endian == 5 ? 15 : 0;
++  auto* physical = memory_.physical_membase();
++  for (uint32_t y = 0; y < texture.height; y += std::max(1u, uint32_t(texture.height) / 16))
++    for (uint32_t x = 0; x < texture.width; x += std::max(1u, uint32_t(texture.width) / 16)) {
++      uint32_t address = info.copy_dest_base + texture_util::GetTiledOffset2D(
++          x + info.copy_dest_coordinate_info.offset_x_div_8 * 8,
++          y + info.copy_dest_coordinate_info.offset_y_div_8 * 8,
++          info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32, 2);
++      auto* expected = static_cast<const uint8_t*>(buffer.contents) + y * stride + x * 4;
++      for (uint32_t c = 0; c < 4; ++c) {
++        uint32_t a = (address + c) ^ xor_mask;
++        if (a >= SharedMemory::kBufferSize) { ++mismatch; continue; }
++        ++checked; mismatch += physical[a] != expected[c]; nonzero += expected[c] != 0;
++      }
++    }
++  resolve_verified_ = true;
++  REXGPU_INFO("Metal resolve CPU visibility: {} bytes checked ({} nonzero), {} mismatches", checked, nonzero, mismatch);
++  if (mismatch) ++failures_;
 +}
 +
 +void MetalDraw::DumpTexture(id<MTLTexture> texture, const std::string& name) {
 +  const auto dir = REXCVAR_GET(metal_debug_dir);
 +  if (dir.empty()) return;
 +  Submit();
++  commands_ = [queue_ commandBuffer];
 +  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
 +      width:texture.width height:texture.height mipmapped:NO];
 +  desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderWrite;
@@ -1161,9 +1403,9 @@ new file mode 100644
 +  auto compute = [commands computeCommandEncoder];
 +  [compute setComputePipelineState:resolve_color_];
 +  [compute setTexture:texture atIndex:0]; [compute setTexture:readable atIndex:1];
-+  std::array<uint32_t, 14> constants{}; constants[2] = uint32_t(texture.width); constants[3] = uint32_t(texture.height);
-+  constants[12] = 0x3F800000;
-+  [compute setBytes:constants.data() length:sizeof(constants) atIndex:0];
++  ResolveConstants constants;
++  constants.width = uint32_t(texture.width); constants.height = uint32_t(texture.height);
++  [compute setBytes:&constants length:sizeof(constants) atIndex:0];
 +  [compute setBuffer:snapshot_buffer_ offset:0 atIndex:1];
 +  [compute dispatchThreads:MTLSizeMake(texture.width, texture.height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 +  [compute endEncoding];
@@ -1188,17 +1430,28 @@ new file mode 100644
 +}
 +
 +bool MetalDraw::Present(uint32_t address, id<MTLTexture> destination) {
-+  Submit();
-+  auto found = resolved_.find(address & 0x1FFFFFFF);
-+  if (found == resolved_.end()) return false;
-+  id<MTLTexture> source = found->second;
-+  if (source.pixelFormat != destination.pixelFormat) return false;
-+  auto commands = [queue_ commandBuffer]; commands.label = @"Xenos resolved front buffer";
-+  auto blit = [commands blitCommandEncoder];
-+  [blit copyFromTexture:source sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-+    sourceSize:MTLSizeMake(std::min(source.width, destination.width), std::min(source.height, destination.height), 1)
-+    toTexture:destination destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-+  [blit endEncoding]; [commands commit];
++  // EndFrame has committed the frame; the front buffer's load and the copy follow it on the queue.
++  Submit(false);
++  // The swap packet installs the front buffer's texture fetch constant in slot 0; it goes through
++  // the same lookup as any texture (the resolve's own texture if it is exactly the front buffer,
++  // guest memory otherwise, e.g. a scene resolved in tiles), with the fetch's component swizzle.
++  auto fetch = regs_.GetTextureFetch(0);
++  if (fetch.type != xenos::FetchConstantType::kTexture || !fetch.base_address) return false;
++  (void)address;
++  MetalTextureBinding binding{0, 0, xenos::FetchOpDimension::k2D, false};
++  id<MTLTexture> source = Texture(binding);
++  if (!source || source.width <= 1) return false;
++  uint32_t size[2] = {uint32_t(std::min(source.width, destination.width)), uint32_t(std::min(source.height, destination.height))};
++  EndEncoder();
++  if (!commands_) commands_ = [queue_ commandBuffer];
++  auto commands = commands_; commands.label = @"Xenos front buffer";
++  commands_ = nil;
++  auto compute = [commands computeCommandEncoder];
++  [compute setComputePipelineState:present_];
++  [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
++  [compute setBytes:size length:sizeof(size) atIndex:0];
++  [compute dispatchThreads:MTLSizeMake(size[0], size[1], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++  [compute endEncoding]; [commands commit];
 +  return true;
 +}
 +}  // namespace rex::graphics::metal
@@ -1682,7 +1935,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,139 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -1694,13 +1947,26 @@ new file mode 100644
 +  uint2 origin, size, dest_offset;
 +  uint pitch, address, format, endian, swap, write_memory;
 +  float scale;
++  uint2 samples;  // EDRAM samples a pixel covers: 1x1, 1x2 (MSAA 2x) or 2x2 (4x).
++  uint sample_select;  // 0 to 3: that sample; 4: the average.
 +};
++uint2 sample_offset(uint i, uint2 samples) {
++  return samples.x == 2 ? uint2(i & 1, i >> 1) : uint2(0, min(i, samples.y - 1));
++}
 +uint tiled_offset(uint2 p, uint pitch, uint log_bpp) {
 +  uint macro = ((p.x >> 5) + (p.y >> 5) * ((pitch + 31) >> 5)) << (log_bpp + 7);
 +  uint micro = ((p.x & 7) + ((p.y & 14) << 2)) << log_bpp;
 +  uint offset = macro + ((micro & ~15u) << 1) + (micro & 15) + ((p.y & 1) << 4);
 +  return ((offset & ~511u) << 3) + ((p.y & 16) << 7) + ((offset & 448) << 2) +
 +         (((((p.y & 8) >> 2) + (p.x >> 3)) & 3) << 6) + (offset & 63);
++}
++void store_raw(uint4 packed, uint log_bpp, uint2 p, constant ResolveConstants& c, device uchar* memory) {
++  uint address = c.address + tiled_offset(p + c.dest_offset, c.pitch, log_bpp);
++  uint xor_mask = c.endian == 1 ? 1 : c.endian == 2 ? 3 : c.endian == 3 ? 2 : c.endian == 4 ? 7 : c.endian == 5 ? 15 : 0;
++  for (uint b = 0; b < (1u << log_bpp); ++b) {
++    uint a = (address + b) ^ xor_mask;
++    if (a < 0x20000000u) memory[a] = uchar(packed[b >> 2] >> ((b & 3) * 8));
++  }
 +}
 +void store_guest(float4 value, uint2 p, constant ResolveConstants& c, device uchar* memory) {
 +  if (!c.write_memory) return;
@@ -1724,18 +1990,32 @@ new file mode 100644
 +    case 38: packed = as_type<uint4>(value); log_bpp = 4; break;
 +    default: return;
 +  }
-+  uint address = c.address + tiled_offset(p + c.dest_offset, c.pitch, log_bpp);
-+  uint xor_mask = c.endian == 1 ? 1 : c.endian == 2 ? 3 : c.endian == 3 ? 2 : c.endian == 4 ? 7 : c.endian == 5 ? 15 : 0;
-+  for (uint b = 0; b < (1u << log_bpp); ++b) {
-+    uint a = (address + b) ^ xor_mask;
-+    if (a < 0x20000000u) memory[a] = uchar(packed[b >> 2] >> ((b & 3) * 8));
-+  }
++  store_raw(packed, log_bpp, p, c, memory);
++}
++// xenos::Float32To20e4 with rounding to nearest even.
++uint float32_to_20e4(float f) {
++  if (!(f > 0.0f)) return 0;
++  uint u = as_type<uint>(f);
++  if (u >= 0x3FFFFFF8u) return 0xFFFFFFu;
++  if (u < 0x38800000u) u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23), 24u);
++  else u += 0xC8000000u;
++  u += 3 + ((u >> 3) & 1);
++  return (u >> 3) & 0xFFFFFFu;
 +}
 +kernel void resolve_color(texture2d<float, access::read> source [[texture(0)]],
 +    texture2d<float, access::write> destination [[texture(1)]],
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
-+  float4 value = source.read(p + c.origin) * c.scale;
++  uint2 base = c.origin + p * c.samples;
++  float4 value;
++  if (c.sample_select < 4) {
++    value = source.read(base + sample_offset(c.sample_select, c.samples));
++  } else {
++    value = float4(0);
++    for (uint y = 0; y < c.samples.y; ++y) for (uint x = 0; x < c.samples.x; ++x) value += source.read(base + uint2(x, y));
++    value /= float(c.samples.x * c.samples.y);
++  }
++  value *= c.scale;
 +  if (c.swap) value = value.bgra;
 +  destination.write(value, p);
 +  store_guest(value, p, c, memory);
@@ -1744,7 +2024,54 @@ new file mode 100644
 +    texture2d<float, access::write> destination [[texture(1)]],
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
-+  destination.write(float4(source.read(p + c.origin) * c.scale), p);
++  float depth = source.read(c.origin + p * c.samples + sample_offset(c.sample_select, c.samples)) * c.scale;
++  destination.write(float4(depth), p);
++  // Depth resolves write the EDRAM depth format whatever the destination format says: 24-bit
++  // depth over 8-bit stencil (stencil is not read here yet, so written as 0).
++  if (!c.write_memory) return;
++  uint d24 = c.format == 23 ? float32_to_20e4(depth) : uint(rint(saturate(depth) * 16777215.0f));
++  store_raw(uint4(d24 << 8, 0, 0, 0), 2, p, c, memory);
++}
++// Guest texture memory to linear blocks, for a blit into the texture (any format, compressed too).
++struct LoadConstants {
++  uint src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
++};
++float float20e4_to_32(uint f24) {
++  f24 &= 0xFFFFFFu;
++  if (!f24) return 0.0f;
++  uint mantissa = f24 & 0xFFFFFu, exponent = f24 >> 20;
++  if (!exponent) {
++    uint lz = clz(mantissa) - (32 - 21);
++    exponent = uint(1 - int(lz)); mantissa = (mantissa << lz) & 0xFFFFFu;
++  }
++  return as_type<float>(((exponent + 112) << 23) | (mantissa << 3));
++}
++kernel void load_texture(device const uchar* memory [[buffer(0)]], device uchar* out [[buffer(1)]],
++    constant LoadConstants& c [[buffer(2)]], uint3 p [[thread_position_in_grid]]) {
++  if (p.x >= c.bw || p.y >= c.bh) return;
++  uint bpb = 1u << c.log_bpp;
++  uint offset = c.tiled ? tiled_offset(uint2(p.x + c.ox, p.y + c.oy), c.pitch_blocks, c.log_bpp)
++                        : (p.y + c.oy) * c.row_pitch_bytes + (p.x + c.ox) * bpb;
++  uint src = c.src_base + p.z * c.slice_stride + offset;
++  uint dst = ((p.z * c.bh + p.y) * c.bw + p.x) * bpb;
++  bool inside = src + bpb <= 0x20000000u;
++  if (c.convert) {
++    // k_24_8 and k_24_8_FLOAT as R32Float depth, like a depth resolve's own texture.
++    uint v = 0;
++    for (uint i = 0; i < 4; ++i) v |= uint(inside ? memory[(src + i) ^ c.xor_mask] : 0) << (i * 8);
++    uint d24 = v >> 8;
++    float depth = c.convert == 1 ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f) : float20e4_to_32(d24);
++    uint bits = as_type<uint>(depth);
++    for (uint i = 0; i < 4; ++i) out[dst + i] = uchar(bits >> (i * 8));
++    return;
++  }
++  for (uint i = 0; i < bpb; ++i) out[dst + i] = inside ? memory[(src + i) ^ c.xor_mask] : uchar(0);
++}
++kernel void present_color(texture2d_array<float, access::read> source [[texture(0)]],
++    texture2d<float, access::write> destination [[texture(1)]],
++    constant uint2& size [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
++  if (any(p >= size)) return;
++  destination.write(source.read(p, 0), p);
 +}
 +)MSL";
 +}
@@ -1752,7 +2079,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,215 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -1772,6 +2099,8 @@ new file mode 100644
 +#include <spirv_msl.hpp>
 +
 +#include <rex/graphics/pipeline/shader/spirv_translator.h>
++#include <rex/cvar.h>
++REXCVAR_DEFINE_BOOL(metal_texture_signs, true, "GPU/Metal", "Apply texture signedness/gamma (disable only for diagnosis)");
 +#include <rex/graphics/register_file.h>
 +#include <rex/graphics/pipeline/shader/spirv.h>
 +
@@ -1939,7 +2268,7 @@ new file mode 100644
 +  c.ndc_scale[1] = -c.ndc_scale[1]; c.ndc_offset[1] = -c.ndc_offset[1];
 +  c.alpha_test_reference = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
 +  c.ps_param_gen_scale = 1.0f;
-+  for (uint32_t i = 0; i < 32; ++i) {
++  for (uint32_t i = 0; REXCVAR_GET(metal_texture_signs) && i < 32; ++i) {
 +    auto fetch = regs.GetTextureFetch(i);
 +    uint32_t signs = (fetch.dword_0 >> 2) & 255, swizzled = 0;
 +    for (uint32_t channel = 0; channel < 4; ++channel) {
