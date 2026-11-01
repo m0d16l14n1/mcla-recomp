@@ -43,9 +43,12 @@ cd mcla-recomp
 bash scripts/make_mac.sh --iso /path/to/your.iso
 bash scripts/play_mac.sh                              # Vulkan on MoltenVK
 bash scripts/play_mac.sh --mcla_gpu_backend=metal     # the native Metal backend
+sh scripts/make_app.sh                                # out/MCLA.app: double-click to play
 ```
 
 `make_mac.sh` checks the tools and offers to install what is missing, applies the fork's patches to the ReXGlue SDK and builds it, then extracts and recompiles your game and builds it. `play_mac.sh` starts the game with a log (`run.log` in the build folder). Any option after it goes to the game, for example `--fullscreen=false` for a window or `--mcla_fps=0` for no frame-rate cap. It also has switches for lldb (`MCLA_LLDB=1`), MoltenVK's debug output (`MCLA_MVK_DEBUG=1`) and Apple's Metal HUD (`MCLA_METAL_HUD=1`).
+
+`make_app.sh` makes `out/MCLA.app` from the build (drag it to the Dock or to Applications): it starts full screen on Metal with MetalFX upscaling (Performance) held to 60 FPS and the keyboard on, and logs to `~/Library/Logs/MCLA/mcla.log`. Its settings are `MCLA.app/Contents/MacOS/mcla.toml` (one `name = value` a line, the same names as the options; the game's settings menu saves there too), which a new run of the script keeps. Run it again after a build to update the app. The game stays in `game/` in this folder.
 
 | | |
 |---|---|
@@ -118,7 +121,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 ## Known issues
 
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
-- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks EDRAM transfers of 64-bit formats, 3D textures, the UI overlays and EDR.
+- The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing), the UI overlays and EDR.
 - On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
 
 ## More documentation
