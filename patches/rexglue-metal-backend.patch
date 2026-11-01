@@ -629,7 +629,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,334 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -721,7 +721,7 @@ new file mode 100644
 +  // (metal_4x_as_1x).
 +  id<MTLTexture> Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples = 1,
 +                        bool multisample = false);
-+  static void TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples,
++  static void TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples,
 +                        bool multisample);
 +  // How a surface with this MSAA mode is kept: samples a texel holds and whether as a multisample texture.
 +  static void SurfaceSamples(xenos::MsaaSamples msaa, uint32_t& samples, bool& multisample);
@@ -789,6 +789,8 @@ new file mode 100644
 +  id<MTLComputePipelineState> resolve_color_ = nil, resolve_depth_ = nil, present_ = nil, load_texture_ = nil;
 +  id<MTLComputePipelineState> resolve_color_ms_ = nil, resolve_depth_ms_ = nil;  // metal_msaa sources
 +  uint64_t memexport_skipped_ = 0;
++  uint64_t transfers_dropped_ = 0;  // EDRAM data another target wrote that a 64bpp source or target can't take
++  uint64_t textures_unsupported_ = 0;  // fetches given the zero fallback (3D textures, unsupported formats)
 +  // Fence values for the GPU to copy into guest memory, a slot each (many frames' worth before reuse).
 +  id<MTLBuffer> fence_values_ = nil;
 +  uint32_t fence_slot_ = 0;
@@ -966,7 +968,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2508 @@
+@@ -0,0 +1,2539 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1110,6 +1112,7 @@ new file mode 100644
 +struct TransferConstants {
 +  uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind;
 +  uint32_t dst_ss[2], src_ss[2];
++  uint32_t dst_dw, src_dw;  // EDRAM dwords a sample: 2 for 64bpp formats
 +};
 +template <typename T> void Key(std::string& key, T value) {
 +  key.append(reinterpret_cast<const char*>(&value), sizeof(value));
@@ -1296,6 +1299,11 @@ new file mode 100644
 +    }
 +    REXGPU_INFO("Metal fences: {:.1f} a frame written by the GPU", fences_ / 150.0);
 +    fences_ = 0;
++    if (transfers_dropped_ || textures_unsupported_) {
++      REXGPU_WARN("Metal: {} EDRAM transfers dropped (formats without a transfer), {} texture fetches sampled as zero in 150 frames",
++                  transfers_dropped_, textures_unsupported_);
++      transfers_dropped_ = 0; textures_unsupported_ = 0;
++    }
 +    if (memexport_skipped_) {
 +      REXGPU_WARN("Metal: {} memexport draws skipped in 150 frames (their memory writes are lost)", memexport_skipped_);
 +      memexport_skipped_ = 0;
@@ -1453,9 +1461,11 @@ new file mode 100644
 +  if (n > 1 && REXCVAR_GET(metal_msaa)) { samples = n; multisample = true; }
 +  else if (n == 4 && REXCVAR_GET(metal_4x_as_1x)) samples = 4;
 +}
-+void MetalDraw::TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, uint32_t samples,
-+                          bool multisample) {
-+  key.clear(); Key(key, base); Key(key, format); Key(key, width);
++void MetalDraw::TargetKey(std::string& key, uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp,
++                          uint32_t samples, bool multisample) {
++  // The guest's bits a pixel too: k_2_10_10_10_FLOAT_AS_16_16_16_16 (32bpp) and k_16_16_16_16_FLOAT (64bpp) are both
++  // RGBA16Float here, with different EDRAM layouts.
++  key.clear(); Key(key, base); Key(key, format); Key(key, width | (is_64bpp ? 0x80000000u : 0u));
 +  if (samples > 1) Key(key, samples | (multisample ? 0x100u : 0u));
 +}
 +id<MTLTexture> MetalDraw::Target(uint32_t base, MTLPixelFormat format, uint32_t width, bool is_64bpp, uint32_t samples,
@@ -1465,7 +1475,7 @@ new file mode 100644
 +  // texture. Its height is what is left of EDRAM after the base, so it does not depend on the draw.
 +  // With metal_msaa a 2x or 4x surface is a multisample texture of `width` pixels instead (`samples` 2 or 4),
 +  // and EDRAM transfers carry its tiles to and from the others sample by sample.
-+  std::string key; TargetKey(key, base, format, width, samples, multisample);
++  std::string key; TargetKey(key, base, format, width, is_64bpp, samples, multisample);
 +  auto found = targets_.find(key);
 +  if (found != targets_.end()) return found->second;
 +  const uint32_t ssx = samples >= 4 ? 2 : 1, ssy = samples >= 2 ? 2 : 1;
@@ -2525,6 +2535,15 @@ new file mode 100644
 +      }
 +    }
 +  }
++  if (!texture && fetch.type == xenos::FetchConstantType::kTexture) {
++    ++textures_unsupported_;
++    static uint32_t logged = 0;
++    if (logged < 8) {
++      ++logged;
++      REXGPU_WARN("Metal: texture at {:08X} (dimension {}, format {}, binding dimension {}) sampled as zero",
++                  address, uint32_t(fetch.dimension), uint32_t(fetch.format), uint32_t(binding.dimension));
++    }
++  }
 +  if (!texture) {
 +    // Valid zero fallback for unsupported formats/dimensions, including the unused signed binding.
 +    auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
@@ -2609,7 +2628,7 @@ new file mode 100644
 +    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx / dvx;
 +    MTLPixelFormat format = depth ? MTLPixelFormatDepth32Float_Stencil8 : ColorFormat(xenos::ColorRenderTargetFormat(ei.format));
 +    id<MTLTexture> source = nil;
-+    std::string identity; TargetKey(identity, original, format, pitch, samples, multisample);
++    std::string identity; TargetKey(identity, original, format, pitch, !depth && ei.format_is_64bpp, samples, multisample);
 +    auto current = targets_.find(identity);
 +    if (current != targets_.end()) source = current->second;
 +    uint32_t width = info.coordinate_info.width_div_8 * 8, height = info.height_div_8 * 8;
@@ -2808,6 +2827,9 @@ new file mode 100644
 +    case F::k_16_16: return 3;
 +    case F::k_16_16_FLOAT: return 4;
 +    case F::k_32_FLOAT: return 5;
++    case F::k_16_16_16_16: return 8;
++    case F::k_16_16_16_16_FLOAT: return 9;
++    case F::k_32_32_FLOAT: return 10;
 +    default: return kNoTransfer;
 +  }
 +}
@@ -2830,7 +2852,6 @@ new file mode 100644
 +  auto& l = layout->second;
 +  uint32_t lo, hi;
 +  if (!TileRange(l, uint32_t(target.height), y0, y1, lo, hi)) return;
-+  if (l.is_64bpp) kind = kNoTransfer;
 +  auto mark = [&](uint32_t from, uint32_t to) {
 +    if (from >= to) return;
 +    for (uint32_t t = from; t < to; ++t) {
@@ -2895,7 +2916,7 @@ new file mode 100644
 +  auto& l = layout->second;
 +  uint32_t lo, hi;
 +  if (!TileRange(l, uint32_t(target.height), y0, y1, lo, hi)) return;
-+  bool can_take = kind != kNoTransfer && !l.is_64bpp;
++  bool can_take = kind != kNoTransfer;
 +  // Taken over below: what is left of the stale range afterwards. Tiles outside it hold their versions.
 +  uint32_t range_lo = lo, range_hi = hi;
 +  lo = std::max(lo, l.stale_lo); hi = std::min(hi, l.stale_hi);
@@ -2905,8 +2926,19 @@ new file mode 100644
 +  auto flush = [&](uint32_t end) {
 +    if (!run_owner) return;
 +    auto source = target_layouts_.find(run_owner);
-+    if (source != target_layouts_.end() && run_kind != kNoTransfer && can_take)
++    if (source != target_layouts_.end() && run_kind != kNoTransfer && can_take) {
 +      Transfer(source->second, run_kind, target, kind, run_start, end);
++    } else if (source != target_layouts_.end()) {
++      ++transfers_dropped_;
++      static uint32_t logged = 0;
++      if (logged < 8) {
++        ++logged;
++        REXGPU_WARN("Metal: EDRAM tiles {} to {} not transferred: source kind {} ({}bpp, {}x{} texture), target kind {} "
++                    "({}bpp, {}x{} texture)", run_start, end, run_kind, source->second.is_64bpp ? 64 : 32,
++                    uint32_t(source->second.texture.width), uint32_t(source->second.texture.height), kind,
++                    l.is_64bpp ? 64 : 32, uint32_t(target.width), uint32_t(target.height));
++      }
++    }
 +    run_owner = 0;
 +  };
 +  for (uint32_t t = lo; t < hi; ++t) {
@@ -3127,7 +3159,7 @@ new file mode 100644
 +  if (dl.is_depth) [encoder setDepthStencilState:transfer_depth_state_];
 +  [encoder setScissorRect:MTLScissorRect{0, y0, target.width, y1 - y0}];
 +  TransferConstants c{dl.base, dl.pitch_tiles, sl.base, sl.pitch_tiles, lo, hi, source_kind, kind,
-+                      {dl.ssx, dl.ssy}, {sl.ssx, sl.ssy}};
++                      {dl.ssx, dl.ssy}, {sl.ssx, sl.ssy}, dl.is_64bpp ? 2u : 1u, sl.is_64bpp ? 2u : 1u};
 +  [encoder setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +  [encoder setFragmentTexture:source_texture atIndex:0];
 +  if (sl.is_depth) {
@@ -3186,7 +3218,8 @@ new file mode 100644
 +    [encoder_ setScissorRect:MTLScissorRect{0, t.y0, width, y1 - t.y0}];
 +    const auto& dl = target_layouts_.find(reinterpret_cast<uintptr_t>((__bridge void*)t.target))->second;
 +    TransferConstants c{dl.base, dl.pitch_tiles, t.source->base, t.source->pitch_tiles, t.lo, t.hi, t.source_kind,
-+                        t.kind, {dl.ssx, dl.ssy}, {t.source->ssx, t.source->ssy}};
++                        t.kind, {dl.ssx, dl.ssy}, {t.source->ssx, t.source->ssy}, dl.is_64bpp ? 2u : 1u,
++                        t.source->is_64bpp ? 2u : 1u};
 +    [encoder_ setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +    [encoder_ setFragmentTexture:t.source->texture atIndex:0];
 +    if (t.source->is_depth) {
@@ -3976,7 +4009,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,493 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -4242,14 +4275,18 @@ new file mode 100644
 +}
 +
 +// EDRAM ownership transfers: a target takes over the tiles another one (another format, pitch, or
-+// depth against color) wrote since, as the same raw 32 bits per sample, like Xenos EDRAM.
++// depth against color) wrote since, as the same raw dwords, like Xenos EDRAM. A tile row is 80 dwords:
++// 80 samples of a 32bpp format or 40 of a 64bpp one (sample x in dwords 2x, its red and green or its
++// first half, and 2x + 1).
 +// Kinds: 0 k_8_8_8_8, 1 k_2_10_10_10, 2 k_2_10_10_10_FLOAT (7e3), 3 k_16_16, 4 k_16_16_FLOAT,
-+// 5 k_32_FLOAT, 6 D24S8, 7 D24FS8 (the host keeps half of the guest's 20e4 depth).
++// 5 k_32_FLOAT, 6 D24S8, 7 D24FS8 (the host keeps half of the guest's 20e4 depth); 64bpp:
++// 8 k_16_16_16_16, 9 k_16_16_16_16_FLOAT, 10 k_32_32_FLOAT.
 +struct TransferConstants {
 +  uint dst_base, dst_pitch, src_base, src_pitch;  // tiles; a tile is 80x16 samples (32bpp)
 +  uint lo, hi;  // the EDRAM tiles taken over
 +  uint src_kind, dst_kind;
 +  uint2 dst_ss, src_ss;  // samples a texel of each holds (1x1 for a single-sample texture; metal_msaa)
++  uint dst_dw, src_dw;  // dwords a sample (2 for 64bpp)
 +};
 +// Resolve clears: a scissored full-screen triangle over only the resolved rectangle.
 +struct ClearConstants { float4 color; float depth; };
@@ -4271,38 +4308,60 @@ new file mode 100644
 +  if (m >= 128u) { m = 0; ++e; }
 +  return e > 7 ? 0x3FFu : ((uint(e) << 7) | m);
 +}
-+uint pack_color(float4 v, uint kind) {
++uint snorm16x2(float2 v) { int2 i = int2(rint(clamp(v, -1.0f, 1.0f) * 32767.0f)); return (uint(i.x) & 0xFFFFu) | (uint(i.y) << 16); }
++float2 snorm16x2(uint b) { return max(float2(int(b << 16) >> 16, int(b) >> 16) / 32767.0f, -1.0f); }
++uint pack_color32(float4 v, uint kind) {
 +  switch (kind) {
 +    case 0: { uint4 u = uint4(rint(saturate(v) * 255.0f)); return u.x | (u.y << 8) | (u.z << 16) | (u.w << 24); }
 +    case 1: { uint4 u = uint4(rint(saturate(v) * float4(1023, 1023, 1023, 3))); return u.x | (u.y << 10) | (u.z << 20) | (u.w << 30); }
 +    case 2: return f32_to_7e3(v.x) | (f32_to_7e3(v.y) << 10) | (f32_to_7e3(v.z) << 20) | (uint(rint(saturate(v.w) * 3.0f)) << 30);
-+    case 3: { int2 i = int2(rint(clamp(v.xy, -1.0f, 1.0f) * 32767.0f)); return (uint(i.x) & 0xFFFFu) | (uint(i.y) << 16); }
++    case 3: return snorm16x2(v.xy);
 +    case 4: return as_type<uint>(half2(v.xy));
 +    default: return as_type<uint>(v.x);
 +  }
 +}
-+float4 unpack_color(uint b, uint kind) {
++uint2 pack_color(float4 v, uint kind) {
++  switch (kind) {
++    case 8: return uint2(snorm16x2(v.xy), snorm16x2(v.zw));
++    case 9: return as_type<uint2>(half4(v));
++    case 10: return as_type<uint2>(v.xy);
++    default: return uint2(pack_color32(v, kind), 0u);
++  }
++}
++float4 unpack_color32(uint b, uint kind) {
 +  switch (kind) {
 +    case 0: return float4(b & 255u, (b >> 8) & 255u, (b >> 16) & 255u, b >> 24) / 255.0f;
 +    case 1: return float4(float(b & 1023u) / 1023.0f, float((b >> 10) & 1023u) / 1023.0f, float((b >> 20) & 1023u) / 1023.0f, float(b >> 30) / 3.0f);
 +    case 2: return float4(f7e3_to_32(b & 1023u), f7e3_to_32((b >> 10) & 1023u), f7e3_to_32((b >> 20) & 1023u), float(b >> 30) / 3.0f);
-+    case 3: return float4(max(float2(int(b << 16) >> 16, int(b) >> 16) / 32767.0f, -1.0f), 0.0f, 1.0f);
++    case 3: return float4(snorm16x2(b), 0.0f, 1.0f);
 +    case 4: return float4(float2(as_type<half2>(b)), 0.0f, 1.0f);
 +    default: return float4(as_type<float>(b), 0.0f, 0.0f, 1.0f);
++  }
++}
++float4 unpack_color(uint2 b, uint kind) {
++  switch (kind) {
++    case 8: return float4(snorm16x2(b.x), snorm16x2(b.y));
++    case 9: return float4(as_type<half4>(b));
++    case 10: return float4(as_type<float2>(b), 0.0f, 1.0f);
++    default: return unpack_color32(b.x, kind);
 +  }
 +}
 +uint pack_depth(float depth, uint stencil, uint kind) {
 +  uint d24 = kind == 7 ? float32_to_20e4(depth * 2.0f) : uint(rint(saturate(depth) * 16777215.0f));
 +  return (d24 << 8) | (stencil & 0xFFu);
 +}
-+// The source sample for this destination sample (both in EDRAM sample space), through the EDRAM tile both cover.
-+bool transfer_source(uint2 d, constant TransferConstants& c, uint2 source_size, thread uint2& s) {
-+  uint column = d.x / 80u;
++// Where dword k of this destination sample (both in EDRAM sample space) is in the source, through the EDRAM tile
++// both cover: the source sample s and its dword sk.
++bool transfer_source(uint2 d, uint k, constant TransferConstants& c, uint2 source_size, thread uint2& s, thread uint& sk) {
++  uint x = d.x * c.dst_dw + k;
++  uint column = x / 80u;
 +  if (column >= c.dst_pitch) return false;
 +  uint tile = c.dst_base + (d.y >> 4) * c.dst_pitch + column;
 +  if (tile < c.lo || tile >= c.hi || tile < c.src_base) return false;
 +  uint rel = tile - c.src_base;
-+  s = uint2((rel % c.src_pitch) * 80u + d.x % 80u, (rel / c.src_pitch) * 16u + (d.y & 15u));
++  uint sx = (rel % c.src_pitch) * 80u + x % 80u;
++  s = uint2(sx / c.src_dw, (rel / c.src_pitch) * 16u + (d.y & 15u));
++  sk = sx % c.src_dw;
 +  return all(s < source_size);
 +}
 +struct TransferDepthOut { float depth [[depth(any)]]; uint stencil [[stencil]]; };
@@ -4333,30 +4392,37 @@ new file mode 100644
 +#define DST_ARGS_M , uint sid [[sample_id]]
 +#define DST_COORD_P (uint2(position.xy) * c.dst_ss)
 +#define DST_COORD_M (uint2(position.xy) * c.dst_ss + guest_sub(sid, c.dst_ss))
++// The destination sample's dwords (b) from a color or a depth source; discarded where the source has none.
++#define TRANSFER_DWORDS(D, PACK) \
++  uint2 d = DST_COORD_##D, s, s1; uint sk, sk1; \
++  if (!transfer_source(d, 0u, c, sample_size(source, c.src_ss), s, sk)) discard_fragment(); \
++  uint2 p = PACK(s), b = uint2(p[sk], 0u); \
++  if (c.dst_dw > 1u && transfer_source(d, 1u, c, sample_size(source, c.src_ss), s1, sk1)) { \
++    if (any(s1 != s)) p = PACK(s1); \
++    b.y = p[sk1]; \
++  }
++#define PACK_COLOR(at) pack_color(read_color(source, at, c.src_ss), c.src_kind)
++#define PACK_DEPTH(at) uint2(pack_depth(read_depth(source, at, c.src_ss), read_stencil(stencil, at, c.src_ss), c.src_kind), 0u)
 +#define TRANSFERS(SUFFIX, S, D) \
 +fragment float4 transfer_color_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
 +    SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  return unpack_color(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); \
++  TRANSFER_DWORDS(D, PACK_COLOR) \
++  return unpack_color(b, c.dst_kind); \
 +} \
 +fragment float4 transfer_color_from_depth##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
 +    SRC_DEPTH_##S source [[texture(0)]], SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  return unpack_color(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
++  TRANSFER_DWORDS(D, PACK_DEPTH) \
++  return unpack_color(b, c.dst_kind); \
 +} \
 +fragment TransferDepthOut transfer_depth_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
 +    SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  return unpack_depth(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); \
++  TRANSFER_DWORDS(D, PACK_COLOR) \
++  return unpack_depth(b.x, c.dst_kind); \
 +} \
 +fragment TransferDepthOut transfer_depth_from_depth##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
 +    SRC_DEPTH_##S source [[texture(0)]], SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  return unpack_depth(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
++  TRANSFER_DWORDS(D, PACK_DEPTH) \
++  return unpack_depth(b.x, c.dst_kind); \
 +}
 +TRANSFERS(, P, P)
 +TRANSFERS(_sm, M, P)
@@ -4367,18 +4433,14 @@ new file mode 100644
 +#define TRANSFER_INTO_COLOR(N, SUFFIX, S, D) \
 +fragment TransferColorOut##N transfer_color_from_color_##N##SUFFIX(float4 position [[position]], \
 +    constant TransferConstants& c [[buffer(0)]], SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  TransferColorOut##N o; o.color = unpack_color(pack_color(read_color(source, s, c.src_ss), c.src_kind), c.dst_kind); return o; \
++  TRANSFER_DWORDS(D, PACK_COLOR) \
++  TransferColorOut##N o; o.color = unpack_color(b, c.dst_kind); return o; \
 +} \
 +fragment TransferColorOut##N transfer_color_from_depth_##N##SUFFIX(float4 position [[position]], \
 +    constant TransferConstants& c [[buffer(0)]], SRC_DEPTH_##S source [[texture(0)]], \
 +    SRC_STENCIL_##S stencil [[texture(1)]] DST_ARGS_##D) { \
-+  uint2 s; \
-+  if (!transfer_source(DST_COORD_##D, c, sample_size(source, c.src_ss), s)) discard_fragment(); \
-+  TransferColorOut##N o; \
-+  o.color = unpack_color(pack_depth(read_depth(source, s, c.src_ss), read_stencil(stencil, s, c.src_ss), c.src_kind), c.dst_kind); \
-+  return o; \
++  TRANSFER_DWORDS(D, PACK_DEPTH) \
++  TransferColorOut##N o; o.color = unpack_color(b, c.dst_kind); return o; \
 +}
 +#define TRANSFER_OUT(N) struct TransferColorOut##N { float4 color [[color(N)]]; };
 +#define TRANSFERS_INTO_COLOR(N) TRANSFER_OUT(N) TRANSFER_INTO_COLOR(N, , P, P) TRANSFER_INTO_COLOR(N, _sm, M, P) \

@@ -27,10 +27,10 @@ The picture at the spawn point matches MoltenVK's (shadows, colour grading, mini
 from boot to free roam and drives. A warm or busy Mac loses up to a third of these frame rates. At MetalFX
 Performance the GPU is the limit again: the GPU command thread uses 7.4 ms a frame, 3.4 of it waiting for the GPU.
 The rows above are before the tenth pass (the 4x reflections at one sample a pixel, now the default), which adds
-5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: EDRAM transfers
-of 64-bit formats, 3D textures, the UI overlays (ImGui), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
+5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
+sampled in free roam, drives or races so far), the UI overlays (ImGui), EDR, frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to tenth, record how it got here.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to eleventh, record how it got here.
 
 ## Why
 
@@ -472,6 +472,19 @@ matches its target by samples and multisampling. Same Mac, same hour, VM running
 The spawn point's mean colour is 1.22 from the reference against 0.63 (the car and the street look the same;
 the difference is in the reflections), the minimap is steady (ten shots 150 ms apart, 52.0 to 52.2), and the
 route test passes at MetalFX Performance uncapped.
+
+**64bpp EDRAM transfers, eleventh pass (2026-11-01).** Counters first (the 150-frame stats now warn with EDRAM
+transfers dropped and texture fetches sampled as zero): free roam dropped about 4 transfers a frame, between the
+scene's 32bpp targets and a 640-wide target that held a 64bpp format in a texture laid out for 32bpp. The cause
+was the target key (base, Metal format, width): `k_2_10_10_10_FLOAT_AS_16_16_16_16` (32bpp) and
+`k_16_16_16_16_FLOAT` (64bpp) are both `RGBA16Float`, so a 64bpp surface could take a 32bpp surface's texture,
+with the wrong tile pitch. The key now has the 64bpp flag, and transfers work in EDRAM dwords: a tile row is 80
+dwords, 80 samples of a 32bpp format or 40 of a 64bpp one (sample x in dwords 2x and 2x + 1); each destination
+sample takes its one or two dwords from whichever source samples hold them (`TransferConstants.dst_dw`,
+`src_dw`), with transfer kinds 8 `k_16_16_16_16`, 9 `k_16_16_16_16_FLOAT` and 10 `k_32_32_FLOAT`. After it: no
+transfer dropped and no texture sampled as zero, in free roam, the route drive or a rainy arcade race; the spawn
+point's picture away from passing traffic is 0.62 from the reference. **3D textures** come back as zero (a
+1x1x1 fallback), but nothing the game drew in these runs sampled one, so they wait until something does.
 
 **Frame pacing:** `CAMetalDisplayLink` is put off. The Mac here has a 60 Hz panel, the presenter's layer has
 display sync on, and the game already holds each frame to its target at the swap with a precise clock
