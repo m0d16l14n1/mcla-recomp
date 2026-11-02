@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,666 @@
+@@ -0,0 +1,727 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -177,6 +177,10 @@ new file mode 100644
 +                    "MetalFX upscaling with temporal_aa_upscale above 1 (the game's FSR upscaling setting): the scene drawn "
 +                    "into the render-size corner of its targets and stretched back by its resolves");
 +REXCVAR_DEFINE_BOOL(metal_resolves, true, "GPU/Metal", "Resolves (diagnostic: false skips them)");
++REXCVAR_DEFINE_DOUBLE(metal_motion_blur_fps, 60.0, "GPU/Metal",
++    "MCLA's motion blur as long as at this frame rate at most: the game blurs by one frame's motion, so at 30 FPS "
++    "(or 29 with frame generation) twice as long as at 60. 0: the game's own length")
++    .range(0.0, 240.0);
 +REXCVAR_DEFINE_INT32(metal_resolve_spin_us, 0, "GPU/Metal", "Diagnostic: the command processor spins this long at every resolve");
 +REXCVAR_DEFINE_INT32(metal_fence_spin_us, 0, "GPU/Metal", "Diagnostic: the command processor spins this long before every fence write");
 +REXCVAR_DEFINE_INT32(metal_draw_spin_us, 0, "GPU/Metal", "Diagnostic: the command processor spins this long at every draw");
@@ -475,7 +479,56 @@ new file mode 100644
 +    if (taa_frame_.status == '+') taa_frame_.done = true;
 +  }
 +  if (!draw_) return false;
-+  if (!draw_->Draw(active_vertex_shader(), active_pixel_shader())) return false;
++  // MCLA's motion blur draw: its previous-frame matrices (pixel constants 69 to 164, one per vehicle ID; to the
++  // last frame's pixels, x = w/2 (x + w), y = h/2 (w - y) with the size in constant 62) drawn toward this frame's
++  // view-projection (8 to 11, to clip space) taken to the same pixels, so that the blur is no longer than one
++  // frame's motion at metal_motion_blur_fps; the game's values are put back after the draw (the temporal AA's
++  // vectors read them before).
++  constexpr uint64_t kMotionBlurPixelShader = 0xA6B9B6B0FA692C54;
++  constexpr uint32_t kBlurFirst = XE_GPU_REG_SHADER_CONSTANT_256_X + 69 * 4, kBlurCount = 24 * 16;
++  std::array<uint32_t, kBlurCount> blur_saved;
++  bool blur_scaled = false;
++  const double blur_fps = REXCVAR_GET(metal_motion_blur_fps);
++  if (blur_fps > 0.0 && frame_interval_ > 0.0 && active_pixel_shader() &&
++      active_pixel_shader()->ucode_data_hash() == kMotionBlurPixelShader) {
++    const float scale = float(std::min(1.0, 1.0 / (blur_fps * frame_interval_)));
++    if (scale < 0.999f) {
++      RegisterFile& regs = *register_file_;
++      auto read = [&](uint32_t c, float out[4]) {
++        std::memcpy(out, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4], 4 * sizeof(float));
++      };
++      float size[4];
++      read(62, size);
++      if (size[0] >= 16.0f && size[1] >= 16.0f && size[0] <= 16384.0f && size[1] <= 16384.0f) {
++        float current[16];
++        for (uint32_t i = 0; i < 4; ++i) {
++          float row[4];
++          read(8 + i, row);
++          current[i * 4 + 0] = 0.5f * size[0] * (row[0] + row[3]);
++          current[i * 4 + 1] = 0.5f * size[1] * (row[3] - row[1]);
++          current[i * 4 + 2] = row[2];
++          current[i * 4 + 3] = row[3];
++        }
++        std::memcpy(blur_saved.data(), &regs.values[kBlurFirst], sizeof(blur_saved));
++        for (uint32_t k = 0; k < 24; ++k) {
++          for (uint32_t i = 0; i < 16; ++i) {
++            float previous;
++            std::memcpy(&previous, &regs.values[kBlurFirst + k * 16 + i], sizeof(float));
++            const float value = current[i] + (previous - current[i]) * scale;
++            std::memcpy(&regs.values[kBlurFirst + k * 16 + i], &value, sizeof(float));
++          }
++        }
++        draw_->ConstantsWritten(kBlurFirst, kBlurFirst + kBlurCount);
++        blur_scaled = true;
++      }
++    }
++  }
++  const bool drawn = draw_->Draw(active_vertex_shader(), active_pixel_shader());
++  if (blur_scaled) {
++    std::memcpy(&register_file_->values[kBlurFirst], blur_saved.data(), sizeof(blur_saved));
++    draw_->ConstantsWritten(kBlurFirst, kBlurFirst + kBlurCount);
++  }
++  if (!drawn) return false;
 +  // HDR scene: after the tone map draw, from its textures.
 +  if (hdr_scene_pending_) {
 +    hdr_scene_pending_ = false;
@@ -594,6 +647,14 @@ new file mode 100644
 +                                      uint32_t frontbuffer_width, uint32_t frontbuffer_height) {
 +  if (draw_) draw_->EndFrame();
 +  ++swaps_;
++  {
++    // The time between frames (averaged), for the motion blur's length.
++    const auto now = std::chrono::steady_clock::now();
++    const double interval = std::chrono::duration<double>(now - last_swap_time_).count();
++    if (last_swap_time_ != std::chrono::steady_clock::time_point{} && interval < 0.25)
++      frame_interval_ = frame_interval_ > 0.0 ? frame_interval_ * 0.9 + interval * 0.1 : interval;
++    last_swap_time_ = now;
++  }
 +  ++stats_swaps_;
 +  // In free roam on the scripted route (40 s in at 30 swaps a second), when most shaders are loaded.
 +  if (swaps_ == 1200 && shared_memory_buffer_ && !shared_memory_checked_) {
@@ -958,8 +1019,8 @@ new file mode 100644
 +  bool fg_taa_ran_ = false;
 +  float fg_jitter_[2] = {};
 +  // For the stats line: frames generated, and why the others weren't (no temporal AA, the composite, the first
-+  // after a gap), and the GPU time of the interpolation and its compose.
-+  uint32_t fg_generated_ = 0, fg_no_taa_ = 0, fg_not_allowed_ = 0, fg_first_ = 0;
++  // after a gap, a camera cut), and the GPU time of the interpolation and its compose.
++  uint32_t fg_generated_ = 0, fg_no_taa_ = 0, fg_not_allowed_ = 0, fg_first_ = 0, fg_cuts_ = 0;
 +  std::shared_ptr<std::atomic<uint64_t>> fg_gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  id<MTLRenderPipelineState> hdr_restore_ = nil;
 +  bool hdr_pipelines_failed_ = false;
@@ -1255,7 +1316,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3179 @@
+@@ -0,0 +1,3309 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1273,6 +1334,7 @@ new file mode 100644
 +#include <filesystem>
 +#include <fstream>
 +#include <rex/cvar.h>
++#include <rex/graphics/flags.h>
 +REXCVAR_DEFINE_BOOL(metal_async_compile, true, "GPU/Metal",
 +    "A draw whose shaders or pipeline Metal is still compiling (the first time a place or effect is seen) is left out "
 +    "rather than the game waiting for it, once the frame's wait budget (metal_async_compile_budget_ms) is spent");
@@ -1286,6 +1348,11 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal", "Resolves write guest memory (diagnostic: false keeps them on the GPU only)");
 +REXCVAR_DEFINE_BOOL(metal_draw_cpu_only, false, "GPU/Metal", "Draws stop after the primitive processor and the vertex snapshot (diagnostic)");
 +REXCVAR_DEFINE_BOOL(metal_texture_loads, true, "GPU/Metal", "Load textures from guest memory (diagnostic: false binds a blank texture)");
++REXCVAR_DEFINE_BOOL(metal_texture_mips, true, "GPU/Metal",
++                    "Load textures' mip levels and sample them with the fetch's mip filter and anisotropic "
++                    "filtering (anisotropic_override); false: the base level only, as before (shimmering "
++                    "and sparkling at a distance)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_draw_calls, true, "GPU/Metal", "Issue the draw calls (diagnostic: false encodes everything else of a draw)");
 +REXCVAR_DEFINE_INT32(metal_draw_stop, 0, "GPU/Metal",
 +    "Diagnostic: draws stop after the shaders (2), the pipeline (3) or the texture loads (4); 0 draws");
@@ -1655,13 +1722,13 @@ new file mode 100644
 +        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_ / 150.0, textures_composed_ / 150.0, texture_rows_loaded_ / 150.0, textures_reused_ / 150.0,
 +        snapshot_hashed_ / 1048576.0 / 150, snapshot_copied_ / 1048576.0 / 150, snapshot_persistent_hits_ / 150.0, texture_hashed_ / 1048576.0 / 150,
 +        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0, prebuilt_used_, prebuilt_wait_us_ / 1000.0, async_skipped_);
-+    if (fg_generated_ || fg_no_taa_ || fg_not_allowed_ || fg_first_) {
++    if (fg_generated_ || fg_no_taa_ || fg_not_allowed_ || fg_first_ || fg_cuts_) {
 +      const uint64_t fg_us = fg_gpu_us_->exchange(0);
 +      REXGPU_INFO("Metal frame generation: {} frames generated in 150 ({:.2f} ms of GPU time each for MetalFX and the "
-+                  "compose); not for {} without temporal AA, {} without the UI layer or tone map, {} first after a gap",
-+                  fg_generated_, fg_generated_ ? fg_us / 1000.0 / fg_generated_ : 0.0, fg_no_taa_, fg_not_allowed_,
-+                  fg_first_);
-+      fg_generated_ = 0; fg_no_taa_ = 0; fg_not_allowed_ = 0; fg_first_ = 0;
++                  "compose); not for {} without temporal AA, {} without the UI layer or tone map, {} first after a gap, {} "
++                  "camera cuts", fg_generated_, fg_generated_ ? fg_us / 1000.0 / fg_generated_ : 0.0, fg_no_taa_,
++                  fg_not_allowed_, fg_first_, fg_cuts_);
++      fg_generated_ = 0; fg_no_taa_ = 0; fg_not_allowed_ = 0; fg_first_ = 0; fg_cuts_ = 0;
 +    }
 +    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0; prebuilt_used_ = 0; prebuilt_wait_us_ = 0; async_skipped_ = 0;
 +    stats_frames_ = 0; wait_us_ = 0; texture_loads_ = 0; textures_composed_ = 0; texture_rows_loaded_ = 0; textures_reused_ = 0; snapshot_hashed_ = 0; snapshot_copied_ = 0; snapshot_persistent_hits_ = 0; texture_hashed_ = 0; texture_watch_hits_ = 0; stats_start_ = std::chrono::steady_clock::now();
@@ -2410,6 +2477,16 @@ new file mode 100644
 +        uint32_t(fetch.base_address << 12), uint32_t(fetch.format), uint32_t(fetch.swizzle), uint32_t((fetch.dword_0 >> 2) & 255),
 +        regs_[XE_GPU_REG_RB_BLENDCONTROL0], regs_[XE_GPU_REG_RB_COLOR_MASK], regs_[XE_GPU_REG_RB_COLORCONTROL],
 +        regs_[XE_GPU_REG_RB_MODECONTROL]);
++      {  // The pixel shader's textures: fetch constant, address, format, size, swizzle, signs, filters
++        std::string list;
++        if (pt) for (auto& b : shaders_.translator().bindings(pt).textures) {
++          auto f = regs_.GetTextureFetch(b.fetch_constant);
++          list += fmt::format(" [f{} {:08X} fmt {} {}x{} dim {} swz {:03X} signs {:02X} filt {}/{}]", b.fetch_constant,
++              uint32_t(f.base_address << 12), uint32_t(f.format), f.size_2d.width + 1, f.size_2d.height + 1,
++              uint32_t(f.dimension), uint32_t(f.swizzle), uint32_t((f.dword_0 >> 2) & 255), uint32_t(f.min_filter), uint32_t(f.mag_filter));
++        }
++        REXGPU_INFO("Metal draw debug textures: draw {} alpha_ref {}{}", draws_, regs_.Get<float>(XE_GPU_REG_RB_ALPHA_REF), list);
++      }
 +      if (vf.size <= 64) {
 +        // Small draws (clears by drawing): the vertex data as floats, big-endian guest words.
 +        std::string words;
@@ -2879,6 +2956,12 @@ new file mode 100644
 +  std::string key;
 +  Key(key, fetch.dword_0 & 0xFFC00003u); Key(key, fetch.dword_1); Key(key, fetch.dword_2); Key(key, fetch.dword_5);
 +  Key(key, binding.dimension); Key(key, binding.is_signed);
++  // The mip levels a fetch asks for (its mip_max_level, in dword 4) are loaded with the base.
++  uint32_t fetch_mip_max = 0;
++  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
++                                                 &fetch_mip_max);
++  if (!REXCVAR_GET(metal_texture_mips)) fetch_mip_max = 0;
++  Key(key, fetch_mip_max);
 +  bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
 +  TextureEntry& entry = texture_entries_[key];
 +  const bool cached = entry.cached;
@@ -2914,6 +2997,12 @@ new file mode 100644
 +  uint32_t address = (fetch.base_address << 12) & 0x1FFFFFFF;
 +  uint64_t content_hash = 0;
 +  uint32_t range = 0;
++  // What is hashed and watched: the base level, and with mips the span from the lower of the base and mip
++  // addresses to the end of the higher (the mips usually follow the base).
++  uint32_t span_start = address, span_length = 0;
++  uint32_t load_mip_levels = 0;  // levels after the base to load
++  texture_util::TextureGuestLayout mip_layout{};
++  uint32_t mip_address = 0;
 +  const ResolvedTexture* resolved = nullptr;
 +  id<MTLTexture> composite = nil;
 +  if (fetch.type == xenos::FetchConstantType::kTexture && fetch.dimension != xenos::DataDimension::k3D) {
@@ -2922,6 +3011,20 @@ new file mode 100644
 +    auto layout = texture_util::GetGuestTextureLayout(fetch.dimension, fetch.pitch, w + 1, h + 1, layers + 1,
 +        fetch.tiled, GetBaseFormat(fetch.format), fetch.packed_mips, base != 0, 0);
 +    range = layout.base.level_data_extent_bytes;
++    span_length = range;
++    if (fetch_mip_max && base && mip && !volume) {
++      mip_layout = texture_util::GetGuestTextureLayout(fetch.dimension, fetch.pitch, w + 1, h + 1, layers + 1,
++          fetch.tiled, GetBaseFormat(fetch.format), fetch.packed_mips, true, std::min(hi, fetch_mip_max));
++      mip_address = (mip << 12) & 0x1FFFFFFF;
++      uint64_t lo_end = std::min<uint64_t>(address, mip_address);
++      uint64_t hi_end = std::max<uint64_t>(uint64_t(address) + range, uint64_t(mip_address) + mip_layout.mips_total_extent_bytes);
++      uint32_t levels = std::min(std::min(hi, fetch_mip_max), uint32_t(rex::log2_floor(std::max(w + 1, h + 1))));
++      if (levels && mip_layout.mips_total_extent_bytes && hi_end <= SharedMemory::kBufferSize &&
++          hi_end - lo_end <= uint64_t(range) + mip_layout.mips_total_extent_bytes + 65536) {
++        span_start = uint32_t(lo_end); span_length = uint32_t(hi_end - lo_end);
++        load_mip_levels = levels;
++      }
++    }
 +    // A resolve's texture stands in only for exactly what it wrote: a scene drawn in tiles is
 +    // resolved piece by piece to one surface, and memory is often reused for other resolves.
 +    auto r = resolved_.find(address);
@@ -2935,14 +3038,14 @@ new file mode 100644
 +                                           fetch.endianness == xenos::Endian::k8in16 ? 1u : fetch.endianness == xenos::Endian::k8in32 ? 3u :
 +                                           fetch.endianness == xenos::Endian::k16in32 ? 2u : 0u))))
 +      content_hash = kComposedHash;  // kept until a resolve or a write over its memory drops it
-+    else if (base && uint64_t(address) + range <= SharedMemory::kBufferSize) {
++    else if (base && uint64_t(span_start) + span_length <= SharedMemory::kBufferSize) {
 +      // Watch first, then protect the pages, then hash: a write before the protection is in the hash,
 +      // one after it faults and marks the texture for hashing at its next use.
 +      if (watch && !watch->pending.load(std::memory_order_acquire)) {
 +        watch->dirty.store(false, std::memory_order_release);
 +        watch->pending.store(true, std::memory_order_release);
-+        shared_->WatchMemoryRange(address, range, TextureWritten, this, watch, 0);
-+        shared_->RequestRange(address, range);
++        shared_->WatchMemoryRange(span_start, span_length, TextureWritten, this, watch, 0);
++        shared_->RequestRange(span_start, span_length);
 +      } else if (watch) {
 +        watch->dirty.store(false, std::memory_order_release);
 +      }
@@ -2953,15 +3056,16 @@ new file mode 100644
 +        content_hash = kUnknownHash;
 +      } else {
 +        if (DebugFrame())
-+          REXGPU_INFO("Metal texture hash debug: addr {:08X} range {} fmt {} {}x{} {}", address, range,
++          REXGPU_INFO("Metal texture hash debug: addr {:08X} range {} fmt {} {}x{} {}", span_start, span_length,
 +              uint32_t(fetch.format), w + 1, h + 1, watch ? "written" : "unwatched");
-+        content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(address), range);
-+        texture_hashed_ += range;
++        content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(span_start), span_length);
++        texture_hashed_ += span_length;
 +      }
 +    }
 +  }
 +  entry.checked_frame = frame_;
-+  SetTextureRange(entry, address, resolved ? resolved->length : range);
++  if (resolved || composite || content_hash == kComposedHash) load_mip_levels = 0;
++  SetTextureRange(entry, resolved ? address : span_start, resolved ? resolved->length : span_length);
 +  if (cached && content_hash != kUnknownHash && entry.hash == content_hash) {
 +    if (!resolved && !composite && content_hash != kComposedHash) remember_range();
 +    return View(entry.texture, fetch.swizzle, cube);
@@ -3011,6 +3115,7 @@ new file mode 100644
 +    ++w; ++h; ++layers;
 +    if (metal_format != MTLPixelFormatInvalid && base_page && w <= 8192 && h <= 8192 && (!cube || w == h)) {
 +      auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:metal_format width:w height:h mipmapped:NO];
++      desc.mipmapLevelCount = 1 + load_mip_levels;
 +      desc.textureType = cube ? MTLTextureTypeCube : MTLTextureType2DArray;
 +      desc.arrayLength = cube ? 1 : layers;
 +      desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
@@ -3029,8 +3134,15 @@ new file mode 100644
 +            format == F::k_5_6_5 ? 4u : format == F::k_6_5_5 ? 5u : format == F::k_4_4_4_4 ? 6u : 0u;
 +        uint32_t out_bpb = convert >= 3 ? 4u : bpb;
 +        size_t image = size_t(bw) * bh * out_bpb;
++        // The mips (levels 1 to load_mip_levels) after the base in the staging buffer.
++        size_t mips_bytes = 0;
++        for (uint32_t level = 1; level <= load_mip_levels; ++level) {
++          uint32_t lw = std::max(w >> level, 1u), lh = std::max(h >> level, 1u);
++          mips_bytes += size_t((lw + info->block_width - 1) / info->block_width) *
++                        ((lh + info->block_height - 1) / info->block_height) * out_bpb * layers;
++        }
 +        size_t staging_offset = 0;
-+        id<MTLBuffer> staging = Staging(image * layers, staging_offset);
++        id<MTLBuffer> staging = Staging(image * layers + mips_bytes, staging_offset);
 +        if (!staging || !memory_buffer_) {
 +          texture = nil;
 +        } else {
@@ -3049,12 +3161,44 @@ new file mode 100644
 +          [compute setBuffer:memory_buffer_ offset:0 atIndex:0]; [compute setBuffer:staging offset:staging_offset atIndex:1];
 +          [compute setBytes:&c length:sizeof(c) atIndex:2];
 +          [compute dispatchThreads:MTLSizeMake(bw, bh, layers) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++          // The mips, from the mip address: each level with its own pitch, the small ones from the packed
++          // tail (one 32x32-block tile, the level at its offset in it) with the tail's.
++          struct MipCopy { size_t offset, image; uint32_t w, h, bw; };
++          std::array<MipCopy, xenos::kTextureMaxMips> mip_copies{};
++          size_t mip_offset = staging_offset + image * layers;
++          for (uint32_t level = 1; level <= load_mip_levels; ++level) {
++            uint32_t lw = std::max(w >> level, 1u), lh = std::max(h >> level, 1u);
++            uint32_t lbw = (lw + info->block_width - 1) / info->block_width;
++            uint32_t lbh = (lh + info->block_height - 1) / info->block_height;
++            uint32_t stored = std::min(level, mip_layout.packed_level);
++            const auto& lv = mip_layout.mips[stored];
++            uint32_t lox = 0, loy = 0, loz = 0;
++            if (fetch.packed_mips) texture_util::GetPackedMipOffset(w, h, 1, format, level, lox, loy, loz);
++            auto lc = c;
++            lc.src_base = mip_address + mip_layout.mip_offsets_bytes[stored];
++            lc.slice_stride = lv.array_slice_stride_bytes;
++            lc.row_pitch_bytes = lv.row_pitch_bytes; lc.pitch_blocks = lv.row_pitch_bytes / bpb;
++            lc.ox = lox; lc.oy = loy; lc.bw = lbw; lc.bh = lbh;
++            [compute setBuffer:staging offset:mip_offset atIndex:1];
++            [compute setBytes:&lc length:sizeof(lc) atIndex:2];
++            [compute dispatchThreads:MTLSizeMake(lbw, lbh, layers) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++            size_t limage = size_t(lbw) * lbh * out_bpb;
++            mip_copies[level] = {mip_offset, limage, lw, lh, lbw};
++            mip_offset += limage * layers;
++          }
 +          [compute endEncoding];
 +          auto blit = [cb blitCommandEncoder];
 +          for (uint32_t layer = 0; layer < layers; ++layer)
 +            [blit copyFromBuffer:staging sourceOffset:staging_offset + layer * image sourceBytesPerRow:bw * out_bpb sourceBytesPerImage:image
 +                sourceSize:MTLSizeMake(w, h, 1) toTexture:texture destinationSlice:layer destinationLevel:0
 +                destinationOrigin:MTLOriginMake(0, 0, 0)];
++          for (uint32_t level = 1; level <= load_mip_levels; ++level) {
++            const MipCopy& m = mip_copies[level];
++            for (uint32_t layer = 0; layer < layers; ++layer)
++              [blit copyFromBuffer:staging sourceOffset:m.offset + layer * m.image sourceBytesPerRow:m.bw * out_bpb
++                  sourceBytesPerImage:m.image sourceSize:MTLSizeMake(m.w, m.h, 1) toTexture:texture
++                  destinationSlice:layer destinationLevel:level destinationOrigin:MTLOriginMake(0, 0, 0)];
++          }
 +          [blit endEncoding];
 +          ++texture_loads_;
 +        }
@@ -3124,15 +3268,61 @@ new file mode 100644
 +  auto fetch = regs_.GetTextureFetch(b.fetch_constant);
 +  auto mag = b.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter : b.mag_filter;
 +  auto min = b.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter : b.min_filter;
-+  const uint64_t key = uint64_t(mag) | (uint64_t(min) << 8) | (uint64_t(fetch.clamp_x) << 16) |
-+                       (uint64_t(fetch.clamp_y) << 24) | (uint64_t(fetch.clamp_z) << 32);
++  auto mip = b.mip_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mip_filter : b.mip_filter;
++  auto aniso = b.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter : b.aniso_filter;
++  xenos::ClampMode clamp_x, clamp_y, clamp_z;
++  texture_util::GetClampModesForDimension(fetch, clamp_x, clamp_y, clamp_z);
++  uint32_t mip_min = 0, mip_max = 0;
++  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr, &mip_min, &mip_max);
++  const bool mips = REXCVAR_GET(metal_texture_mips);
++  const bool base_map = mip == xenos::TextureFilter::kBaseMap;
++  // Like the Vulkan backend: anisotropic filtering (anisotropic_override, 4:1 by default) for linear
++  // textures with mips, which forces linear filtering.
++  int32_t override_aniso = REXCVAR_GET(anisotropic_override);
++  if (mips && override_aniso > -1 && override_aniso < 6 && mip_max > mip_min && !base_map &&
++      mag == xenos::TextureFilter::kLinear && min == xenos::TextureFilter::kLinear &&
++      (mip == xenos::TextureFilter::kPoint || mip == xenos::TextureFilter::kLinear))
++    aniso = xenos::AnisoFilter(override_aniso);
++  if (!mips || uint32_t(aniso) > uint32_t(xenos::AnisoFilter::kMax_16_1)) aniso = xenos::AnisoFilter::kDisabled;
++  if (aniso != xenos::AnisoFilter::kDisabled) {
++    mag = min = mip = xenos::TextureFilter::kLinear;
++  }
++  bool border = xenos::ClampModeUsesBorder(clamp_x) || xenos::ClampModeUsesBorder(clamp_y) ||
++                xenos::ClampModeUsesBorder(clamp_z);
++  uint32_t border_color = border ? uint32_t(fetch.border_color) : 0u;
++  const uint64_t key = uint64_t(mag) | (uint64_t(min) << 2) | (uint64_t(mips ? mip : xenos::TextureFilter::kBaseMap) << 4) |
++                       (uint64_t(aniso) << 6) | (uint64_t(clamp_x) << 9) | (uint64_t(clamp_y) << 12) |
++                       (uint64_t(clamp_z) << 15) | (uint64_t(border_color) << 18) | (uint64_t(mip_min) << 20) |
++                       (uint64_t(mip_max) << 24);
 +  auto found = samplers_.find(key); if (found != samplers_.end()) return found->second;
 +  auto d = [MTLSamplerDescriptor new];
 +  d.magFilter = mag == xenos::TextureFilter::kLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
 +  d.minFilter = min == xenos::TextureFilter::kLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-+  auto clamp = [](xenos::ClampMode c) { return uint32_t(c) == 0 ? MTLSamplerAddressModeRepeat :
-+    uint32_t(c) == 1 ? MTLSamplerAddressModeMirrorRepeat : MTLSamplerAddressModeClampToEdge; };
-+  d.sAddressMode = clamp(fetch.clamp_x); d.tAddressMode = clamp(fetch.clamp_y); d.rAddressMode = clamp(fetch.clamp_z);
++  // The levels: from the fetch's mip_min_level; the base map filter only that one (as the Vulkan backend).
++  if (!mips) {
++    d.mipFilter = MTLSamplerMipFilterNotMipmapped;
++  } else {
++    d.mipFilter = mip == xenos::TextureFilter::kLinear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
++    d.lodMinClamp = float(mip_min);
++    d.lodMaxClamp = base_map ? float(mip_min) + 0.25f : float(std::max(mip_max, mip_min));
++  }
++  if (aniso != xenos::AnisoFilter::kDisabled)
++    d.maxAnisotropy = NSUInteger(1) << (uint32_t(aniso) - uint32_t(xenos::AnisoFilter::kMax_1_1));
++  auto address = [](xenos::ClampMode c) {
++    switch (c) {
++      case xenos::ClampMode::kRepeat: return MTLSamplerAddressModeRepeat;
++      case xenos::ClampMode::kMirroredRepeat: return MTLSamplerAddressModeMirrorRepeat;
++      case xenos::ClampMode::kMirrorClampToEdge: case xenos::ClampMode::kMirrorClampToHalfway:
++      case xenos::ClampMode::kMirrorClampToBorder: return MTLSamplerAddressModeMirrorClampToEdge;
++      case xenos::ClampMode::kClampToBorder: return MTLSamplerAddressModeClampToBorderColor;
++      default: return MTLSamplerAddressModeClampToEdge;
++    }
++  };
++  d.sAddressMode = address(clamp_x); d.tAddressMode = address(clamp_y); d.rAddressMode = address(clamp_z);
++  // Metal's border colours: white for k_ABGR_White, transparent black otherwise (the YCbCr ones too, the
++  // Vulkan backend's fallback without custom border colours).
++  d.borderColor = fetch.border_color == xenos::BorderColor::k_ABGR_White ? MTLSamplerBorderColorOpaqueWhite
++                                                                         : MTLSamplerBorderColorTransparentBlack;
 +  id<MTLSamplerState> state = [device_ newSamplerStateWithDescriptor:d]; samplers_[key] = state; return state;
 +}
 +
@@ -4176,9 +4366,10 @@ new file mode 100644
 +    fg_history_ = false;
 +    return true;
 +  }
-+  if (!fg_history_) {
-+    // The first since a gap: the next frame generates from this one.
-+    ++fg_first_;
++  if (!fg_history_ || fg->reset) {
++    // The first since a gap, or a cut (the camera jumped: a frame between the two shots would mix them): the next
++    // frame generates from this one.
++    ++(fg->reset && fg_history_ ? fg_cuts_ : fg_first_);
 +    fg_history_ = true;
 +    fg_index_ ^= 1;
 +    return true;
@@ -4201,7 +4392,7 @@ new file mode 100644
 +    interpolator.nearPlane = fg->near_plane; interpolator.farPlane = fg->far_plane;
 +    interpolator.fieldOfView = fg->fov_vertical * (180.0f / 3.14159265f);
 +    interpolator.aspectRatio = float(width) / float(height);
-+    interpolator.shouldResetHistory = fg->reset;
++    interpolator.shouldResetHistory = NO;  // cuts aren't generated (above)
 +    interpolator.outputTexture = fg_output_;
 +    [interpolator encodeToCommandBuffer:fg_commands];
 +    constants[2] = refresh->constants[2] | (1u << 12) | (use_hdr ? 0u : 1u << 15);
@@ -4439,7 +4630,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,293 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -4602,7 +4793,7 @@ new file mode 100644
 +  double display_hz_ = 0.0;
 +  std::chrono::steady_clock::time_point display_hz_checked_{};
 +  bool fg_logged_presenting_ = false;
-+  uint32_t fg_presented_ = 0, fg_held_back_ = 0, fg_dropped_ = 0;
++  uint32_t fg_presented_ = 0, fg_held_back_ = 0, fg_held_ui_ = 0, fg_held_late_ = 0, fg_held_rate_ = 0, fg_dropped_ = 0;
 +  std::chrono::steady_clock::time_point fg_log_time_{};
 +  // Where an image goes in the drawable (the paint flow's last size and offset), and the HDR paint's constants.
 +  struct PaintPlacement {
@@ -4723,6 +4914,9 @@ new file mode 100644
 +  std::unordered_set<uint64_t> stored_pipelines_;
 +
 +  uint64_t swaps_ = 0;
++  // The time between swaps (seconds, averaged): the motion blur's scale (metal_motion_blur_fps).
++  std::chrono::steady_clock::time_point last_swap_time_{};
++  double frame_interval_ = 0.0;
 +  uint64_t stats_draws_ = 0;
 +  uint64_t stats_copies_ = 0;
 +  uint64_t stats_swaps_ = 0;
@@ -4734,7 +4928,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,934 @@
+@@ -0,0 +1,944 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -5596,17 +5790,27 @@ new file mode 100644
 +    bool show_generated = false;
 +    if (new_frame && generated_[mailbox_index] && generated_textures_[mailbox_index] && guest_output) {
 +      show_generated = !execute_ui_drawers && !late && frame_interval >= 1.6 / refresh_hz;
-+      if (!show_generated) ++fg_held_back_;
++      if (!show_generated) {
++        ++fg_held_back_;
++        if (execute_ui_drawers) ++fg_held_ui_;
++        else if (late) ++fg_held_late_;
++        else ++fg_held_rate_;
++      }
 +    }
 +    if (fg_presented_ || fg_held_back_) {
 +      if (now - fg_log_time_ > std::chrono::seconds(10)) {
 +        if (fg_log_time_ != std::chrono::steady_clock::time_point{})
-+          REXGPU_INFO("Metal frame generation: {} generated frames presented in 10 s, {} held back, {} skipped as the "
-+                      "present thread was behind ({:.1f} ms between new frames, a {:.0f} Hz display)",
-+                      fg_presented_, fg_held_back_, fg_dropped_, frame_interval * 1000.0, refresh_hz);
++          REXGPU_INFO("Metal frame generation: {} generated frames presented in 10 s, {} held back ({} under the "
++                      "presenter's UI, {} late paints, {} too fast for the display), {} skipped as the present thread "
++                      "was behind ({:.1f} ms between new frames, a {:.0f} Hz display)",
++                      fg_presented_, fg_held_back_, fg_held_ui_, fg_held_late_, fg_held_rate_, fg_dropped_,
++                      frame_interval * 1000.0, refresh_hz);
 +        fg_log_time_ = now;
 +        fg_presented_ = 0;
 +        fg_held_back_ = 0;
++        fg_held_ui_ = 0;
++        fg_held_late_ = 0;
++        fg_held_rate_ = 0;
 +        fg_dropped_ = 0;
 +      }
 +    }
@@ -6171,7 +6375,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,271 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -6379,6 +6583,14 @@ new file mode 100644
 +  if (vte.vtx_w0_fmt) c.flags |= T::kSysFlag_WNotReciprocal;
 +  if (draw_util::IsPrimitivePolygonal(regs)) c.flags |= T::kSysFlag_PrimitivePolygonal;
 +  if (draw_util::IsPrimitiveLine(regs)) c.flags |= T::kSysFlag_PrimitiveLine;
++  c.flags |= uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples) << T::kSysFlag_MsaaSamples_Shift;
++  // A pixel shader's own depth output is scaled from guest [0, 1] to the host's [0, 0.5] float24
++  // range (GetHostViewportInfo full_float24_in_0_to_1) only with this flag, as on Vulkan
++  // (rexglue-vulkan-odepth-scale.patch). Without it the game's wheel shadow-volume pass, which
++  // writes depth, compares twice the depth and passes behind the car's body: the wheels' object
++  // IDs land in the stencil there, and the motion blur smears streaks over the plate and bumper.
++  if (regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8)
++    c.flags |= T::kSysFlag_DepthFloat24;
 +  auto cc = regs.Get<reg::RB_COLORCONTROL>();
 +  c.flags |= uint32_t(cc.alpha_test_enable ? cc.alpha_func : xenos::CompareFunction::kAlways)
 +             << T::kSysFlag_AlphaPassIfLess_Shift;
@@ -6419,6 +6631,17 @@ new file mode 100644
 +    c.color_exp_bias[i] = std::ldexp(1.0f, color.color_exp_bias);
 +    if (color.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)
 +      c.flags |= T::kSysFlag_ConvertColor0ToGamma << i;
++    // MIN / MAX blending with the SrcAlpha source factor (rexglue-minmax-blend-factor.patch): the
++    // Xenos applies the factor in those equations, Metal's blender ignores it. The game draws the
++    // light glows of the cars' environment map with max(source x SrcAlpha, destination); without
++    // this every glow is a solid square, and the paint, the lamps' lenses and the bumpers mirror it.
++    auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
++    if ((blend.color_comb_fcn == xenos::BlendOp::kMin || blend.color_comb_fcn == xenos::BlendOp::kMax) &&
++        blend.color_srcblend == xenos::BlendFactor::kSrcAlpha && blend.color_destblend == xenos::BlendFactor::kOne)
++      c.flags |= T::kSysFlag_MinMaxColor0TimesSrcAlpha << i;
++    if ((blend.alpha_comb_fcn == xenos::BlendOp::kMin || blend.alpha_comb_fcn == xenos::BlendOp::kMax) &&
++        blend.alpha_srcblend == xenos::BlendFactor::kSrcAlpha && blend.alpha_destblend == xenos::BlendFactor::kOne)
++      c.flags |= T::kSysFlag_MinMaxAlpha0TimesSrcAlpha << i;
 +  }
 +  out.resize((sizeof(c) + 15) & ~size_t(15)); std::memcpy(out.data(), &c, sizeof(c));
 +}

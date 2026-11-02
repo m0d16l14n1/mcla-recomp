@@ -30,7 +30,7 @@ The rows above are before the tenth pass (the 4x reflections at one sample a pix
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
 sampled in free roam, drives or races so far) and frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to fourteenth, record how it got here. HDR output (EDR) came with the fourteenth.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to eighteenth, record how it got here. HDR output (EDR) came with the fourteenth.
 
 ## Why
 
@@ -629,3 +629,30 @@ frame); the command thread's CPU time +2 ms a frame. Generated frames captured w
 The log has a `Metal frame generation` line every 150 frames (generated, and why not) and one every 10 s from the
 presenter (presented, held back, skipped).
 
+**Eighteenth pass (2026-11-02): the car's lamps, plate and reflections.** Bugs seen since the first Metal builds:
+blurred streaks like rain drops near the rear lamps that slid onto the plate and bumper when steering, glaring and
+blinking lamps (ours and the traffic's), a gold sheen on bumpers.
+- Streaks: a pixel shader's own depth output (oDepth) is scaled from guest [0, 1] to the host's [0, 0.5] float24
+  range only with `kSysFlag_DepthFloat24`, which Vulkan sets (`rexglue-vulkan-odepth-scale.patch`, issue #11) and
+  Metal didn't. The game's wheel pass after the car body (stencil and depth test, no colour, the shader writes depth)
+  then compared twice its depth and passed behind the body, writing the wheels' object IDs into the stencil there:
+  two vertical lines inside the car. The motion blur reads object IDs from the stencil and blurred along them. Now set
+  from `RB_DEPTH_INFO` (and the MSAA sample count, as Vulkan); the stencil's car is one ID, and the plate is readable
+  in every frame of a night drive (`--vulkan_odepth_float24_scale=false` turns the scaling off on both backends).
+- Gold sheen and square glows: MIN/MAX blending with a SrcAlpha factor (`kSysFlag_MinMax*TimesSrcAlpha`, the port of
+  `rexglue-minmax-blend-factor.patch`). The car's environment map draws its light glows that way, and every glow was
+  a solid square mirrored by the paint, the lenses and the bumpers.
+- Blinking lamps and shimmer: textures had no mip levels on Metal. Now loaded with their mips (`--metal_texture_mips`,
+  default on; resolved and composed surfaces stay one level) and sampled with the fetch's mip filter, the proper
+  clamp, mirror and border modes, and anisotropic filtering (`anisotropic_override`, 4x by default, as Vulkan). The
+  rear lamps' frame-to-frame flicker went from 20% to 11% of their pixels (MetalFX Performance with frame
+  generation), 6% to 4% without AA; GPU time unchanged in the route test (21.2 ms against 21.8 without mips).
+- Motion blur length (`--metal_motion_blur_fps`, default 60): MCLA blurs by one frame's motion, so at 29 or 30 FPS
+  twice as long as at 60. The backend scales the blur's matrices (keyed by the game's motion blur shader, the only
+  game-specific code in the backend; 0 turns it off).
+- Frame generation: camera cuts (the title and loading fly-throughs, about one a minute when driving) aren't
+  generated, and the interpolator's history restarts; the presenter's 10 s line splits frames held back into UI,
+  late paints and too fast for the display.
+
+Still missing: occlusion queries. Metal answers every query with a fixed count, so the sun's glare (the only use in
+MCLA) shows at 80% even behind buildings ([BACKLOG](BACKLOG.md) 35).

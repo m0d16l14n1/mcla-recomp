@@ -135,6 +135,8 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--metal_4x_as_1x=false` | The game's MSAA 4x surfaces (the reflections) drawn as 2x2 supersampling, as before, instead of one sample a pixel (slower: about 16% at MetalFX Performance) |
 | `--metal_msaa=true` | MSAA surfaces as Metal multisample textures instead of supersampling (correct, but about half the frame rate; for testing) |
 | `--metal_shader_math=1` or `2` | Relaxed or fast math in the shader compiler (shifts the colour grading; for testing) |
+| `--metal_texture_mips=false` | Textures at their base level only, no mips or anisotropic filtering (shimmering and blinking lamps at a distance; next start) |
+| `--metal_motion_blur_fps=0` | The game's own motion blur length (twice as long at 30 FPS as at 60) instead of capped at 60 FPS's |
 
 Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, texture loads, copies, transfers, render passes) and a `Metal command processor` line with the GPU command thread's CPU time. Diagnostics (frame dumps, GPU traces with `--metal_debug_labels=true`): [docs/metal-backend.md](docs/metal-backend.md).
 
