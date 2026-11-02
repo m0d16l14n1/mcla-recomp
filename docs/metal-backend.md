@@ -778,5 +778,14 @@ in out/bench-race). The SDK's FSR 1 and CAS `present_effect` filters stay unbuil
 the presenter's class layout in shared headers). A paint capture (`metal_present_capture`) every 2 s costs a
 freeze each (an 11 MB readback written on Metal's completion thread): not for benchmarks.
 
+*What the hitches left in a race are.* With `--metal_slow_frame_ms=34` the frames over 34 ms in a Performance 60
+race (4 to 12 a minute over twice the median) have no single cause: the command thread at 20 to 37 ms against its
+usual 17, and the worst while the city streams in (160 to 340 texture loads in a frame, +8 to 12 ms). The slow
+frame line now times the texture lookups the fast table missed, the write watches they set up and the loads: a
+load costs the command thread 30 to 50 µs (a texture made, 2 to 5 µs in a test program; a compute and a blit
+encoder, 10 to 15 µs; the dispatches and copies), the watches nothing measurable. The game's own threads use
+about 3 cores in a race, waiting on condition variables most of the time and otherwise running the game: no
+spinning to remove.
+
 Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
 second), every mode with no warning or error.

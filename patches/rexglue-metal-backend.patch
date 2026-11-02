@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,796 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -711,11 +711,13 @@ new file mode 100644
 +                    "the rest {:.1f} ms (waiting for the game, or not scheduled); {} shaders translated ({:.1f} ms), "
 +                    "{} pipelines made ({:.1f} ms), {:.1f} ms waited for stored pipelines, {} draws left out; {} texture "
 +                    "loads ({} made from resolves, {} rows from memory), {:.1f} MB of textures hashed, {:.1f} MB of "
-+                    "vertices copied; {} passes, {} EDRAM transfers",
++                    "vertices copied; {} passes, {} EDRAM transfers; {} slow texture lookups {:.1f} ms (watches set "
++                    "{:.1f} ms, loads {:.1f} ms)",
 +                    wall_ms, swaps_ + 1, cpu_ms, wait_ms, std::max(0.0, wall_ms - cpu_ms - wait_ms),
 +                    translated - slow_translated_, (translate_us - slow_translate_us_) / 1000.0, r.pipelines,
 +                    r.pipeline_us / 1000.0, r.prebuilt_wait_us / 1000.0, r.async_skipped, r.texture_loads, r.composed,
-+                    r.rows_loaded, r.texture_hashed / 1048576.0, r.snapshot_copied / 1048576.0, r.passes, r.transfers);
++                    r.rows_loaded, r.texture_hashed / 1048576.0, r.snapshot_copied / 1048576.0, r.passes, r.transfers,
++                    r.tex_slow_calls, r.tex_slow_us / 1000.0, r.tex_watch_us / 1000.0, r.tex_load_us / 1000.0);
 +      }
 +    }
 +    slow_translated_ = translated;
@@ -929,7 +931,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,522 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -979,6 +981,9 @@ new file mode 100644
 +    uint64_t cpu_us = 0, wait_us = 0, pipeline_us = 0, prebuilt_wait_us = 0, texture_hashed = 0, snapshot_copied = 0;
 +    uint64_t texture_loads = 0, composed = 0, rows_loaded = 0, pipelines = 0, async_skipped = 0, passes = 0,
 +             transfers = 0;
++    // The texture lookups the fast table missed (TextureSlow): calls and time, and of it the write watches set up
++    // and the loads (texture made, encoded).
++    uint64_t tex_slow_calls = 0, tex_slow_us = 0, tex_watch_us = 0, tex_load_us = 0;
 +  };
 +  const FrameReport& last_frame() const { return frame_report_; }
 +  // Temporal anti-aliasing with MetalFX (the SDK's temporal_aa, which the fork's mcla_anti_aliasing = fsr
@@ -1215,6 +1220,7 @@ new file mode 100644
 +  uint64_t texture_loads_ = 0, snapshot_hashed_ = 0, snapshot_copied_ = 0;
 +  id<MTLCommandBuffer> commands_ = nil;
 +  id<MTLRenderCommandEncoder> encoder_ = nil;
++  uint64_t tex_slow_ticks_ = 0, tex_watch_ticks_ = 0, tex_load_ticks_ = 0, tex_slow_calls_ = 0;
 +  // Occlusion queries: the open query's slot (-1: none), whether the open pass has the visibility buffer, and
 +  // the slot the open encoder counts into (-1: not counting).
 +  static constexpr uint32_t kQuerySlots = 1024;
@@ -1452,12 +1458,13 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3637 @@
+@@ -0,0 +1,3651 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
 + */
 +#include <time.h>
++#include <mach/mach_time.h>
 +#include "metal_draw.h"
 +#include <thread>
 +#include "metal_resolve.h"
@@ -1909,6 +1916,13 @@ new file mode 100644
 +    r.composed = now.composed - b.composed; r.rows_loaded = now.rows_loaded - b.rows_loaded;
 +    r.pipelines = now.pipelines - b.pipelines; r.async_skipped = now.async_skipped - b.async_skipped;
 +    r.passes = now.passes - b.passes; r.transfers = now.transfers - b.transfers;
++    {
++      static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
++      auto us = [&](uint64_t t) { return t * tb.numer / tb.denom / 1000; };
++      r.tex_slow_us = us(tex_slow_ticks_); r.tex_watch_us = us(tex_watch_ticks_); r.tex_load_us = us(tex_load_ticks_);
++      r.tex_slow_calls = tex_slow_calls_;
++      tex_slow_ticks_ = tex_watch_ticks_ = tex_load_ticks_ = tex_slow_calls_ = 0;
++    }
 +    frame_base_ = stats_frames_ + 1 == 150 ? FrameReport{} : now;
 +  }
 +  if (++stats_frames_ == 150) {
@@ -3372,7 +3386,9 @@ new file mode 100644
 +  }
 +  FastTexture& entry = *victim;
 +  last_texture_range_ = {0, 0}; last_texture_watch_ = nullptr; last_texture_entry_ = nullptr;
++  const uint64_t slow_start = mach_absolute_time();
 +  id<MTLTexture> view = TextureSlow(binding);
++  tex_slow_ticks_ += mach_absolute_time() - slow_start; ++tex_slow_calls_;
 +  entry.key = key; entry.epoch = texture_epoch_; entry.frame = frame_; entry.view = view;
 +  entry.owner = last_texture_entry_;
 +  entry.watch = REXCVAR_GET(metal_fast_texture_frames) ? last_texture_watch_ : nullptr;
@@ -3479,8 +3495,10 @@ new file mode 100644
 +      if (watch && !watch->pending.load(std::memory_order_acquire)) {
 +        watch->dirty.store(false, std::memory_order_release);
 +        watch->pending.store(true, std::memory_order_release);
++        const uint64_t watch_start = mach_absolute_time();
 +        shared_->WatchMemoryRange(span_start, span_length, TextureWritten, this, watch, 0);
 +        shared_->RequestRange(span_start, span_length);
++        tex_watch_ticks_ += mach_absolute_time() - watch_start;
 +      } else if (watch) {
 +        watch->dirty.store(false, std::memory_order_release);
 +      }
@@ -3564,7 +3582,9 @@ new file mode 100644
 +      desc.textureType = cube ? MTLTextureTypeCube : MTLTextureType2DArray;
 +      desc.arrayLength = cube ? 1 : layers;
 +      desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
++      const uint64_t load_start = mach_absolute_time();
 +      texture = [device_ newTextureWithDescriptor:desc];
++      struct LoadTimer { uint64_t start; uint64_t& sum; ~LoadTimer() { sum += mach_absolute_time() - start; } } load_timer{load_start, tex_load_ticks_};
 +      if (texture) {
 +        // Untiled on the GPU straight from guest memory (the no-copy buffer), ordered after the
 +        // resolves already encoded, then blitted: any format, compressed ones by blocks.
