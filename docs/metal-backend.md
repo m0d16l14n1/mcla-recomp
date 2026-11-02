@@ -30,7 +30,7 @@ The rows above are before the tenth pass (the 4x reflections at one sample a pix
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
 sampled in free roam, drives or races so far) and frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to nineteenth, record how it got here; the nineteenth has a race benchmark of every mode on a warm Mac. HDR output (EDR) came with the fourteenth.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to twentieth, record how it got here; the nineteenth has a race benchmark of every mode on a warm Mac, the twentieth the occlusion queries (the sun's glare). HDR output (EDR) came with the fourteenth.
 
 ## Why
 
@@ -92,7 +92,7 @@ positions, the EDRAM layout in MSL). Code taken from it keeps its BSD notice and
 |---|---|---|
 | M0 | Provider, presenter (CAMetalLayer, letterboxed bilinear guest output, the presenter's 3-image mailbox), graphics system, a command processor that runs the whole command stream and skips draws and resolves; game runs start to free roam | done 2026-10-31 |
 | M1 | First picture: shared memory buffer, primitive processor, SPIR-V to MSL pipelines, host render targets without MSAA and without EDRAM transfers, resolves to memory, texture loads for the common formats, the swap from the front buffer | done 2026-11-01 (the first picture, then 28 to 30 FPS in free roam) |
-| M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | mostly done: EDRAM transfers between formats and depth and color, MSAA as supersampling (real MSAA as an option), float24 depth (D24FS8), the gamma ramp, the spawn point matching MoltenVK. To do: EDRAM transfers of 64bpp formats, 3D textures |
+| M2 | Correct picture: EDRAM ownership transfers, MSAA 2x/4x, float24 depth, every texture format, memexport, occlusion queries, gamma ramp | mostly done: EDRAM transfers between formats and depth and color, MSAA as supersampling (real MSAA as an option), float24 depth (D24FS8), the gamma ramp, the spawn point matching MoltenVK, occlusion queries (twentieth pass). To do: EDRAM transfers of 64bpp formats, 3D textures |
 | M3 | Fast: the encoder planning above, binary archives, frame pacing with `CAMetalDisplayLink`, MetalFX upscaling | mostly done: nine speed passes (below), MetalFX temporal AA and upscaling; binary archives deferred. To do: `CAMetalDisplayLink` pacing |
 | M4 | The rest: the immediate drawer (ImGui overlays), guest output captures (`dev_pad`'s `shot`), EDR (HDR) | done (EDR in the fourteenth pass) |
 
@@ -654,8 +654,8 @@ blinking lamps (ours and the traffic's), a gold sheen on bumpers.
   generated, and the interpolator's history restarts; the presenter's 10 s line splits frames held back into UI,
   late paints and too fast for the display.
 
-Still missing: occlusion queries. Metal answers every query with a fixed count, so the sun's glare (the only use in
-MCLA) shows at 80% even behind buildings ([BACKLOG](BACKLOG.md) 35).
+Still missing (then): occlusion queries. Metal answered every query with a fixed count, so the sun's glare (the
+only use in MCLA) showed at 80% even behind buildings ([BACKLOG](BACKLOG.md) 35; done in the twentieth pass).
 
 **Nineteenth pass (2026-11-03): a race benchmark over every mode, and the stutter it found.**
 - *Race benchmark* (`scripts/mac_race_bench.py`): each run boots the game windowed with a scratch copy of the save
@@ -735,3 +735,37 @@ the race at Performance (about 94% of the GPU's time is the game's): the scene's
 frame, 30 reflection passes of 160x128 about 2, the 520x256 and 320x512 passes about 1.5 each, resolves 2.3, the
 HDR scene 0.7, MetalFX 0.6. So the next speed is on the GPU: fewer and cheaper passes (the reflections),
 attachments not stored when nothing reads them back.
+
+**Twentieth pass (2026-11-03): occlusion queries, and two tries for the command thread that were not kept.**
+
+*Occlusion queries* (`--metal_occlusion_queries`, on; [BACKLOG](BACKLOG.md) 35). The backend now has the SDK's
+host query hooks (`HostOcclusionQuery*`, the asynchronous path Direct3D 12 and Vulkan use): a query's draws count
+the samples that pass the depth and stencil tests into a slot of a shared visibility buffer
+(`setVisibilityResultMode:MTLVisibilityResultModeCounting`), every pass of the query adding to the same slot
+(`visibilityResultType = MTLVisibilityResultTypeAccumulate`, macOS 26; the default reset type cleared another
+pass's slot in a test program), zeroed by the CPU at the begin. A query starts a pass if the open one has no
+visibility buffer, and clears and EDRAM transfers drawn at a pass's start are not counted. The count is read
+without waiting once the command buffer of the query's last draw has completed (a completion handler per query).
+With MetalFX upscaling the scene is drawn at the render size, so a query of a squeezed draw is scaled to the output
+size (Performance counts a quarter of the pixels). In 60 s drives at a 60 FPS cap: every query paired and
+delivered (4,688 at Performance, no cut, dropped or unpaired one), the sun's quad counts 0 behind buildings and up
+to about 3,200 samples in view, the same at Performance (upscaled) and at native size (p99 2,060 and 1,888; the
+game's full view is 1,250, so the glare reaches full strength); the count reaches the game 17 to 22 ms after the
+end (about one frame: the frame's command buffer is committed at its end), and 78% are written into the record
+before the game reads it (the rest give the next query's guess, as on the other backends). FPS unchanged (56.0
+and 55.4 in those drives). Works with `metal_encoder_thread` too.
+
+*Tried, not kept:*
+
+- *Texture loads batched into one compute encoder* (each load is a compute dispatch, and a blit for its mips, in
+  encoders of their own): the loads in a row shared one compute encoder and their blits were encoded at its end.
+  In a 30 s race 58.3 against 54.2 FPS (inside the thermal spread), and the frame that loads the city at the race's
+  start got worse: 157 ms of command thread with 2,948 loads in one frame and 1,112 passes, against 83 ms with the
+  loads split over two frames. Reverted.
+- *Passes bounded to the columns their draws reach* (`--metal_pass_columns`, off): with MetalFX upscaling the scene
+  is drawn into the left part of 1280-wide targets, and a pass loads and stores its whole width. The trace shows
+  the narrower passes, but 50.6 and 50.2 FPS against 50.0 and 49.9 (GPU 20.3 to 20.5 ms either way): the GPU
+  skips tiles nothing touched. Kept as an option.
+
+Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
+second), every mode with no warning or error.

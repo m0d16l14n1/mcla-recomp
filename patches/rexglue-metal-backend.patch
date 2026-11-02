@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,794 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -194,6 +194,9 @@ new file mode 100644
 +  while (std::chrono::steady_clock::now() < until) {}
 +} }
 +REXCVAR_DEFINE_BOOL(metal_draw, true, "GPU/Metal", "Draw and resolve (diagnostic: false runs the game with no GPU work, as M0)");
++REXCVAR_DEFINE_BOOL(metal_occlusion_queries, true, "GPU/Metal",
++    "The game's occlusion queries counted by the GPU (MCLA: the sun's glare fades behind buildings); false: the "
++    "fake count (query_occlusion_fake_sample_count), as before");
 +
 +REXCVAR_DEFINE_BOOL(metal_shared_memory_zero_copy, true, "GPU/Metal",
 +                    "Make the guest's physical memory (512 MB) a Metal buffer without copying it (Apple "
@@ -528,7 +531,12 @@ new file mode 100644
 +      }
 +    }
 +  }
++  const uint64_t recorded_before = draw_->draws_recorded();
 +  const bool drawn = draw_->Draw(active_vertex_shader(), active_pixel_shader());
++  if (draw_->draws_recorded() != recorded_before) {
++    OnHostDrawRecorded(0.0f, 1.0f, 0);
++    if (draw_->OcclusionQueryRecording() && TaaDrawSqueezed()) query_squeezed_ = true;
++  }
 +  if (blur_scaled) {
 +    std::memcpy(&register_file_->values[kBlurFirst], blur_saved.data(), sizeof(blur_saved));
 +    draw_->ConstantsWritten(kBlurFirst, kBlurFirst + kBlurCount);
@@ -568,6 +576,33 @@ new file mode 100644
 +bool MetalCommandProcessor::HdrClearTexture(HdrTexture texture) {
 +  return draw_ && draw_->HdrEnsureTextures(hdr_output_width_, hdr_output_height_) &&
 +         draw_->HdrClearTexture(uint32_t(texture));
++}
++bool MetalCommandProcessor::HostOcclusionQueriesUsable() const {
++  return draw_ && REXCVAR_GET(metal_occlusion_queries) && REXCVAR_GET(metal_draw);
++}
++bool MetalCommandProcessor::HostOcclusionQueryBegin() {
++  query_squeezed_ = false;
++  return draw_ && draw_->OcclusionQueryBegin();
++}
++bool MetalCommandProcessor::HostOcclusionQueryRecording() const { return draw_ && draw_->OcclusionQueryRecording(); }
++bool MetalCommandProcessor::HostOcclusionQueryEnd(uint32_t& host_index_out, uint64_t& submission_out,
++                                                  uint32_t& draws_out) {
++  if (!draw_ || !draw_->OcclusionQueryEnd(host_index_out, submission_out, draws_out)) return false;
++  // A query of the scene drawn at the upscaler's render size counts that size's pixels: the game expects the
++  // output's (MCLA's sun: 1,250 samples in full view).
++  double scale = 1.0;
++  if (query_squeezed_ && taa_up_.render_width && taa_up_.render_height)
++    scale = double(taa_up_.out_width) * taa_up_.out_height / (double(taa_up_.render_width) * taa_up_.render_height);
++  query_scale_[host_index_out % query_scale_.size()] = float(scale);
++  return true;
++}
++void MetalCommandProcessor::HostOcclusionQueryAbandon() { if (draw_) draw_->OcclusionQueryAbandon(); }
++bool MetalCommandProcessor::HostOcclusionQueryRead(uint32_t host_index, uint64_t submission, uint64_t& samples_out,
++                                                   uint64_t& raw_samples_out) {
++  // Host pixels are guest samples (MSAA is drawn as supersampling), as the other backends count at 1x scale.
++  if (!draw_ || !draw_->OcclusionQueryRead(host_index, submission, raw_samples_out)) return false;
++  samples_out = uint64_t(double(raw_samples_out) * query_scale_[host_index % query_scale_.size()] + 0.5);
++  return true;
 +}
 +void MetalCommandProcessor::HdrReleaseTextures() {
 +  if (draw_) draw_->HdrReleaseTextures();
@@ -894,7 +929,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,499 @@
+@@ -0,0 +1,518 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -929,6 +964,16 @@ new file mode 100644
 +  // false: the caller stores it.
 +  bool WriteFence(uint32_t address, uint32_t value);
 +  void EndFrame();
++  // Occlusion queries (the SDK's HostOcclusionQuery*): the samples of the draws between a begin and an end that
++  // pass the depth and stencil tests, counted by the GPU into a slot of a visibility buffer (every pass of the
++  // query adds to it) and read without waiting once the command buffer of the query's last draw has completed.
++  bool OcclusionQueryBegin();
++  bool OcclusionQueryRecording() const { return query_slot_ >= 0; }
++  bool OcclusionQueryEnd(uint32_t& slot_out, uint64_t& generation_out, uint32_t& draws_out);
++  void OcclusionQueryAbandon() { query_slot_ = -1; }
++  bool OcclusionQueryRead(uint32_t slot, uint64_t generation, uint64_t& samples_out);
++  // Draws that reached the GPU (an occlusion query's draw that did not counts as hidden).
++  uint64_t draws_recorded() const { return draws_recorded_; }
 +  // What the frame just ended cost the command thread (for the slow frame log, metal_slow_frame_ms).
 +  struct FrameReport {
 +    uint64_t cpu_us = 0, wait_us = 0, pipeline_us = 0, prebuilt_wait_us = 0, texture_hashed = 0, snapshot_copied = 0;
@@ -1170,6 +1215,15 @@ new file mode 100644
 +  uint64_t texture_loads_ = 0, snapshot_hashed_ = 0, snapshot_copied_ = 0;
 +  id<MTLCommandBuffer> commands_ = nil;
 +  id<MTLRenderCommandEncoder> encoder_ = nil;
++  // Occlusion queries: the open query's slot (-1: none), whether the open pass has the visibility buffer, and
++  // the slot the open encoder counts into (-1: not counting).
++  static constexpr uint32_t kQuerySlots = 1024;
++  id<MTLBuffer> visibility_ = nil;
++  std::shared_ptr<std::atomic<uint64_t>[]> query_done_;  // per slot: the generation whose count is in
++  int32_t query_slot_ = -1, encoder_query_slot_ = -1;
++  bool pass_visibility_ = false;
++  uint32_t query_cursor_ = 0, query_draws_ = 0;
++  uint64_t query_generation_ = 0, draws_recorded_ = 0;
 +  std::array<id<MTLTexture>, 5> attachments_{};
 +  // The inline constants each stage's slots hold in the current encoder (Bind skips resending them).
 +  void* bound_encoder_ = nullptr;
@@ -1398,7 +1452,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3569 @@
+@@ -0,0 +1,3637 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1500,6 +1554,9 @@ new file mode 100644
 +    "The render encoder's per-draw Metal calls (state, bindings, the draw) are made on a thread of their own while "
 +    "the command processor goes on with the next draw (restart to change). Off: on an M5 MacBook Air it moved 6 ms "
 +    "a frame of calls off the command thread in a race and gained nothing (the CPU and GPU share one power budget)");
++REXCVAR_DEFINE_BOOL(metal_pass_columns, false, "GPU/Metal",
++    "Render passes cover only the columns their draws reach, as metal_pass_rows does for rows (false: the whole "
++    "width of the targets)");
 +REXCVAR_DEFINE_INT32(metal_encoder_batch, 96, "GPU/Metal",
 +    "With metal_encoder_thread: the queued Metal calls are handed to the encoder thread once this many are waiting "
 +    "(and at the end of each render pass)");
@@ -1660,6 +1717,9 @@ new file mode 100644
 +  ring_base_ = 0;
 +  resolve_rejected_ = [device_ newBufferWithLength:4 options:MTLResourceStorageModeShared];
 +  fence_values_ = [device_ newBufferWithLength:4096 * 4 options:MTLResourceStorageModeShared];
++  visibility_ = [device_ newBufferWithLength:kQuerySlots * 8 options:MTLResourceStorageModeShared];
++  query_done_.reset(new std::atomic<uint64_t>[kQuerySlots]);
++  for (uint32_t i = 0; i < kQuerySlots; ++i) query_done_[i].store(0);
 +  *static_cast<uint32_t*>(resolve_rejected_.contents) = 0;
 +  NSError* error = nil;
 +  auto library = [device_ newLibraryWithSource:[NSString stringWithUTF8String:kMetalResolveSource] options:nil error:&error];
@@ -1709,6 +1769,7 @@ new file mode 100644
 +    end_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - end_start).count());
 +    bound_encoder_ = nullptr;  // A new encoder may be allocated at the same address.
 +    enc_state_.encoder = nullptr;
++    encoder_query_slot_ = -1; pass_visibility_ = false;
 +    if (commands_ && DebugFrame() && REXCVAR_GET(metal_debug_profile)) ProfileCut(pass_label_, draws_ - pass_first_draw_);
 +  }
 +  attachments_ = {};
@@ -1770,6 +1831,33 @@ new file mode 100644
 +    if (last_committed_) [last_committed_ waitUntilCompleted];
 +    snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0; constant_used_ = 0;
 +  }
++}
++bool MetalDraw::OcclusionQueryBegin() {
++  if (!visibility_) return false;
++  query_slot_ = int32_t(query_cursor_++ % kQuerySlots);
++  // The slot's last use was a thousand queries ago (the game makes one a frame), long completed.
++  static_cast<uint64_t*>(visibility_.contents)[query_slot_] = 0;
++  query_done_[query_slot_].store(0, std::memory_order_relaxed);
++  query_draws_ = 0;
++  return true;
++}
++bool MetalDraw::OcclusionQueryEnd(uint32_t& slot_out, uint64_t& generation_out, uint32_t& draws_out) {
++  if (query_slot_ < 0) return false;
++  const uint32_t slot = uint32_t(query_slot_);
++  const uint64_t generation = ++query_generation_;
++  query_slot_ = -1;
++  // The count is complete when the command buffer being recorded is (one queue: those before it are too). A
++  // draw after this one in the same encoder stops counting (Draw).
++  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
++  auto done = query_done_;
++  [commands_ addCompletedHandler:^(id<MTLCommandBuffer>) { done[slot].store(generation, std::memory_order_release); }];
++  slot_out = slot; generation_out = generation; draws_out = query_draws_;
++  return true;
++}
++bool MetalDraw::OcclusionQueryRead(uint32_t slot, uint64_t generation, uint64_t& samples_out) {
++  if (slot >= kQuerySlots || query_done_[slot].load(std::memory_order_acquire) != generation) return false;
++  samples_out = static_cast<const uint64_t*>(visibility_.contents)[slot];
++  return true;
 +}
 +bool MetalDraw::DebugFrame() const {
 +  return frame_ == REXCVAR_GET(metal_debug_frame) || frame_ == capture_frame_;
@@ -2428,10 +2516,18 @@ new file mode 100644
 +    for (auto t : next) if (t) attachment_height = std::min(attachment_height, uint32_t(t.height));
 +    uint32_t pass_rows = REXCVAR_GET(metal_pass_rows)
 +        ? std::min(attachment_height, std::max(32u, (y1 + 31) & ~31u)) : attachment_height;
++    // And only the columns they reach (metal_pass_columns): with MetalFX upscaling the game draws its scene into
++    // the top left of its 1280-wide targets, and a full-width pass loaded and stored the rest too.
++    uint32_t pass_cols = width;
++    if (REXCVAR_GET(metal_pass_columns)) {
++      const int64_t cols_to = std::min<int64_t>(int64_t(scissor.offset[0]) + scissor.extent[0],
++                                                int64_t(viewport.xy_offset[0]) + viewport.xy_extent[0]);
++      pass_cols = std::min<uint32_t>(width, std::max<uint32_t>(32u, (uint32_t(std::max<int64_t>(cols_to, 0)) + 31) & ~31u));
++    }
 +    // HDR output: the UI layer's underlay copy and clear, before the draw that starts it (ends the open pass).
 +    if (hdr_targets_ready_) hdr_targets_ready_();
 +    // A draw whose targets the open pass already has (fewer of them is fine) goes into it.
-+    bool reuse = encoder_ && pass_rows <= pass_height_;
++    bool reuse = encoder_ && pass_rows <= pass_height_ && pass_cols <= pass_width_;
 +    if (reuse && next != attachments_) {
 +      if (!REXCVAR_GET(metal_pass_merge)) reuse = false;
 +      for (uint32_t i = 0; i < 5 && reuse; ++i) if (next[i] && next[i] != attachments_[i]) reuse = false;
@@ -2439,6 +2535,8 @@ new file mode 100644
 +    }
 +    if (reuse && !pending_clears_.empty())
 +      for (auto& c : pending_clears_) for (auto t : next) if (t && t == c.target) reuse = false;
++    // An occlusion query counts into the visibility buffer, which only a new pass can have.
++    if (reuse && query_slot_ >= 0 && !pass_visibility_) reuse = false;
 +    // A resolve clear waiting for one of the targets is drawn in the pass, which covers its rows (its own pass
 +    // loaded and stored the target from the first row to its last anyway); one wider than the pass goes first.
 +    if (!reuse && !pending_clears_.empty()) {
@@ -2451,6 +2549,8 @@ new file mode 100644
 +          EndEncoder(); EncodeClear(c); pending_clears_.erase(pending_clears_.begin() + i); continue;
 +        }
 +        pass_rows = std::max(pass_rows, std::min(c.y1, attachment_height));
++        // The pass covers the clear (one wider than it would be cut, or, as its load action, leave columns).
++        pass_cols = std::max(pass_cols, std::min(c.x + c.width, width));
 +        ++i;
 +      }
 +    }
@@ -2475,6 +2575,8 @@ new file mode 100644
 +        if (!in_pass) {
 +          for (auto& t : pending_transfers_) EncodeTransfer(t);
 +          pending_transfers_.clear();
++        } else if (!pending_transfers_.empty()) {
++          pass_cols = width;  // transfers in the pass copy whole rows
 +        }
 +        pass_ranges_ = {};
 +      }
@@ -2483,7 +2585,8 @@ new file mode 100644
 +      attachments_ = next;
 +      auto pass = [MTLRenderPassDescriptor renderPassDescriptor];
 +      pass_height_ = pass_rows;
-+      pass.renderTargetWidth = width; pass.renderTargetHeight = pass_height_; pass_width_ = width;
++      pass_width_ = pass_cols;
++      pass.renderTargetWidth = pass_width_; pass.renderTargetHeight = pass_height_;
 +      for (uint32_t i = 0; i < 4; ++i) if (next[i]) {
 +        pass.colorAttachments[i].texture = next[i]; pass.colorAttachments[i].loadAction = MTLLoadActionLoad;
 +        pass.colorAttachments[i].storeAction = MTLStoreActionStore;
@@ -2492,6 +2595,13 @@ new file mode 100644
 +        pass.depthAttachment.texture = pass.stencilAttachment.texture = next[4];
 +        pass.depthAttachment.loadAction = pass.stencilAttachment.loadAction = MTLLoadActionLoad;
 +        pass.depthAttachment.storeAction = pass.stencilAttachment.storeAction = MTLStoreActionStore;
++      }
++      if (query_slot_ >= 0 && visibility_) {
++        // Every pass of the query adds its count to the query's slot (zeroed at the begin); a pass's other
++        // slots are left as they are (the default, reset, cleared at least the first slot of the buffer).
++        pass.visibilityResultBuffer = visibility_;
++        pass.visibilityResultType = MTLVisibilityResultTypeAccumulate;
++        pass_visibility_ = true;
 +      }
 +      open_pass_ordinal_ = frame_passes_++;
 +      bool split = false;
@@ -2515,7 +2625,7 @@ new file mode 100644
 +      if (REXCVAR_GET(metal_debug_labels)) {
 +        std::string label = "pass";
 +        for (uint32_t i = 0; i < 5; ++i) if (next[i])
-+          label += fmt::format(" {}{}x{}/{}", i < 4 ? "rt" : "depth ", next[i].width, pass_height_, uint32_t(next[i].pixelFormat));
++          label += fmt::format(" {}{}x{}/{}", i < 4 ? "rt" : "depth ", pass_width_, pass_height_, uint32_t(next[i].pixelFormat));
 +        encoder_.label = [NSString stringWithUTF8String:label.c_str()];
 +      }
 +      if (DebugFrame() && REXCVAR_GET(metal_debug_profile)) {
@@ -2657,9 +2767,9 @@ new file mode 100644
 +      else [encoder_ setViewport:MTLViewport{vp[0], vp[1], vp[2], vp[3], vp[4], vp[5]}];
 +      if (cache_state) es.viewport = vp;
 +    }
-+    uint32_t height = pass_height_;
-+    uint32_t sx = std::min(scissor.offset[0], width), sy = std::min(scissor.offset[1], height);
-+    const std::array<NSUInteger, 4> sc{sx, sy, std::min(scissor.extent[0], width - sx), std::min(scissor.extent[1], height - sy)};
++    uint32_t height = pass_height_, pass_width = pass_width_;
++    uint32_t sx = std::min(scissor.offset[0], pass_width), sy = std::min(scissor.offset[1], height);
++    const std::array<NSUInteger, 4> sc{sx, sy, std::min(scissor.extent[0], pass_width - sx), std::min(scissor.extent[1], height - sy)};
 +    if (es.scissor != sc) {
 +      if (auto* c = Queue(EncoderQueue::Op::kScissor)) { c->a = uint32_t(sc[0]); c->b = uint32_t(sc[1]); c->c = uint32_t(sc[2]); c->r.extra = sc[3]; }
 +      else [encoder_ setScissorRect:MTLScissorRect{sc[0], sc[1], sc[2], sc[3]}];
@@ -2701,6 +2811,18 @@ new file mode 100644
 +      case xenos::PrimitiveType::kTriangleStrip: topology = MTLPrimitiveTypeTriangleStrip; break;
 +      default: ++failures_; return false;
 +    }
++    // Occlusion queries count the draws between their begin and end (a clear or transfer drawn in the pass
++    // before them does not count).
++    if (encoder_query_slot_ != query_slot_ && (pass_visibility_ || encoder_query_slot_ >= 0)) {
++      const MTLVisibilityResultMode mode = query_slot_ >= 0 ? MTLVisibilityResultModeCounting
++                                                            : MTLVisibilityResultModeDisabled;
++      const NSUInteger offset = query_slot_ >= 0 ? NSUInteger(query_slot_) * 8 : 0;
++      if (auto* c = Queue(EncoderQueue::Op::kVisibility)) { c->a = uint32_t(mode); c->r.offset = offset; }
++      else [encoder_ setVisibilityResultMode:mode offset:offset];
++      encoder_query_slot_ = query_slot_;
++    }
++    ++draws_recorded_;
++    if (query_slot_ >= 0) ++query_draws_;
 +    if (!REXCVAR_GET(metal_draw_calls)) {
 +      // Diagnostic: everything of the draw but the draw itself.
 +    } else if (primitive.index_buffer_type == PrimitiveProcessor::kNone) {
@@ -4972,7 +5094,7 @@ diff --git a/src/graphics/metal/metal_encoder_queue.h b/src/graphics/metal/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_encoder_queue.h
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,223 @@
 +/** Native Metal draw path: a render encoder's per-draw calls on a thread of their own. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#import <Metal/Metal.h>
@@ -5002,7 +5124,7 @@ new file mode 100644
 + public:
 +  enum class Op : uint8_t {
 +    kEncoder, kPipeline, kDepthStencil, kStencilRef, kDepthClip, kViewport, kScissor, kWinding, kCull,
-+    kBlendColor, kBuffer, kBufferOffset, kBytes, kTexture, kSampler, kDraw, kDrawIndexed,
++    kBlendColor, kBuffer, kBufferOffset, kBytes, kTexture, kSampler, kDraw, kDrawIndexed, kVisibility,
 +  };
 +  struct Cmd {
 +    Op op;
@@ -5173,6 +5295,7 @@ new file mode 100644
 +        if (c.vertex) [e setVertexSamplerState:(__bridge id<MTLSamplerState>)c.r.obj atIndex:c.index];
 +        else [e setFragmentSamplerState:(__bridge id<MTLSamplerState>)c.r.obj atIndex:c.index];
 +        break;
++      case Op::kVisibility: [e setVisibilityResultMode:MTLVisibilityResultMode(c.a) offset:c.r.offset]; break;
 +      case Op::kDraw: [e drawPrimitives:MTLPrimitiveType(c.a) vertexStart:c.b vertexCount:c.c]; break;
 +      case Op::kDrawIndexed:
 +        [e drawIndexedPrimitives:MTLPrimitiveType(c.a) indexCount:c.b indexType:MTLIndexType(c.c)
@@ -5199,7 +5322,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,310 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -5452,6 +5575,18 @@ new file mode 100644
 +  bool HdrClearTexture(HdrTexture texture) override;
 +  void HdrReleaseTextures() override;
 +  bool TaaCheckAvailable() override;
++  // Occlusion queries (the sun's glare in MCLA): MetalDraw's visibility buffer.
++  bool HostOcclusionQueriesUsable() const override;
++  bool HostOcclusionQueryBegin() override;
++  bool HostOcclusionQueryRecording() const override;
++  bool HostOcclusionQueryEnd(uint32_t& host_index_out, uint64_t& submission_out, uint32_t& draws_out) override;
++  void HostOcclusionQueryAbandon() override;
++  bool HostOcclusionQueryRead(uint32_t host_index, uint64_t submission, uint64_t& samples_out,
++                              uint64_t& raw_samples_out) override;
++  // Whether the open query's draws were the upscaled scene's (drawn at the render size), and each slot's scale
++  // to the output size.
++  bool query_squeezed_ = false;
++  std::array<float, 1024> query_scale_{};
 +
 + private:
 +  // Starts the translation and compile of the draw's shaders (M1: coverage of the shader path).
