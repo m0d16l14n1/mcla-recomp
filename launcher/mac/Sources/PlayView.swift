@@ -139,7 +139,14 @@ struct PlayView: View {
 
     private var fpsSummary: String {
         let fps = Int(launcher.value("mcla_fps")?.asDouble ?? 30)
-        return fps == 0 ? "Uncapped" : "\(fps) FPS cap"
+        let cap = fps == 0 ? "Uncapped" : "\(fps) FPS cap"
+        let metal = (launcher.value("mcla_gpu_backend")?.asString ?? "metal") != "vulkan"
+        let generation = (launcher.value("frame_generation")?.asString ?? "off") != "off"
+            && launcher.value("mcla_anti_aliasing")?.asString == "fsr"
+        guard metal && generation else { return cap }
+        let drawn = Int(launcher.value("mcla_fps_frame_generation")?.asDouble ?? -1)
+        return (drawn < 0 ? "Just under half the display's rate" : drawn == 0 ? "Uncapped" : "\(drawn) FPS")
+            + " drawn, MetalFX frame generation doubling it"
     }
 
     private var screenSummary: String {

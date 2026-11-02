@@ -599,3 +599,33 @@ change at thermal pressure 2 (runs of one build differ by 20%). The pipeline sto
 (five starved the game's threads, audio among them, with a cold cache). `MCLA.app` also opts into Game Mode
 (`LSSupportsGameMode`; macOS turns it on in full screen only).
 
+**Seventeenth pass (2026-11-02): MetalFX frame generation.** The SDK's `frame_generation` (FSR 3.1 on D3D12 and
+Vulkan) is MetalFX's frame interpolator on Metal (`MTLFXFrameInterpolator`, macOS 26; `SupportsFrameGeneration`). At
+the swap the SDK's refresher with frame generation (`hdr_refresh_fg.cs`, its SPIR-V through SPIRV-Cross like
+`hdr_refresh.cs`) also writes the scene's code values without the UI (flag bit 13; in SDR after the normal present,
+bits 13 to 15), into one of two RGBA16Float images. MetalFX makes the frame between the last image and this one from
+the temporal AA's depth (Depth32Float, reversed) and motion vectors (pixels at the render size, the scaler's), its
+jitter, and the camera the SDK's TAA reads (near, far, vertical FOV, cuts reset the history); the refresher then
+composes it under this frame's UI layer (bit 12, bit 15 in SDR) into the presenter's texture for the generated frame
+of that mailbox image. Only frames whose temporal AA ran and that are put together from the UI layer (or have no UI)
+with the tone map are generated; menus and loading screens are shown alone. In SDR the presenter keeps the UI layer
+apart while frame generation is on (`SetFrameGenerationUiSeparation`), as Vulkan does.
+Presenting: two drawables a frame is more than CAMetalLayer's three allow without waiting, and a first version that
+presented both from the UI thread waited up to a whole frame there for every paint. Now the UI thread copies the new
+frame and the generated one (two 1280x720 blits) and gives them to a present thread, which gets the drawables and
+presents each with `presentDrawable:afterMinimumDuration:` (90% of half the time between the guest's frames, measured
+at the refresher, not at the paints: a paint-measured interval fed back into the durations and settled at 133 ms). A
+job the thread hasn't started when the next comes is replaced; a late paint (it skipped refreshes) and paints with
+the presenter's UI drawers present the new frame alone. At exactly half the display's rate (30 on 60 Hz) the queue
+never catches up after a late frame (5 to 9 frames skipped in 10 s); HALF DISPLAY (`mcla_fps_frame_generation = -1`,
+floor of 97% of half the refresh) now applies on macOS from 50 Hz, the refresh read from CoreGraphics (the SDK's
+display reader has none on macOS): 29 rendered, 0 to 1 skipped in 10 s. The game counts frame generation as on only
+with MetalFX anti-aliasing (`MclaFrameGenerationRuns`).
+Measured on the MacBook Air M5 (route test, MetalFX Performance 640x360 to 1280x720, 60 Hz): every frame of free roam
+generated, 290 generated frames presented in 10 s, UI thread paint 25 us (it was up to 33 ms); GPU busy 25.2 ms a
+frame at 30 FPS without and 26.0 with it (the interpolation's command buffer spans 4.4 to 6 ms, overlapping the
+frame); the command thread's CPU time +2 ms a frame. Generated frames captured with `--frame_generation_debug=3`
+(only generated frames shown) and `--metal_present_capture` look like the real ones, HUD included, in HDR and SDR.
+The log has a `Metal frame generation` line every 150 frames (generated, and why not) and one every 10 s from the
+presenter (presented, held back, skipped).
+

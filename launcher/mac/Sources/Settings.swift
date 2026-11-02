@@ -60,6 +60,20 @@ enum Catalogue {
         + "game's Vulkan renderer through MoltenVK; it is slower, but it is there to compare with if something "
         + "looks wrong on Metal.")
 
+    static let frameGeneration = Setting("frame_generation", "Frame generation", .choice([
+        c("Off", s("off")), c("MetalFX (macOS 26)", s("fsr")),
+    ]), s("off"), live: true,
+        "MetalFX frame interpolation: the game draws just under half the display's frames (29 FPS on a 60 Hz screen, "
+        + "58 on 120 Hz) and Apple's MetalFX makes one between every two, so motion looks as smooth as at the full "
+        + "rate while the GPU does about half the work: cooler and steadier on a MacBook Air. It adds about half a "
+        + "frame of delay. Needs Metal with MetalFX anti-aliasing (it works from its depth and motion). Changes during "
+        + "play in the pause menu (DISPLAY).")
+    static let fpsFrameGeneration = Setting("mcla_fps_frame_generation", "Frames drawn with frame generation", .choice([
+        c("Half the display's rate (29 on 60 Hz, 58 on 120 Hz)", n(-1)), c("30 FPS", n(30)), c("40 FPS", n(40)),
+        c("60 FPS", n(60)), c("Uncapped", n(0)),
+    ]), n(-1), live: true,
+        "The cap while frame generation is on (the frame rate cap above applies while it is off). Just under half "
+        + "the display's rate keeps the generated and drawn frames evenly paced; higher rates are for a 120 Hz screen.")
     static let fps = Setting("mcla_fps", "Frame rate cap", .choice([
         c("30 FPS (as on the console)", n(30)), c("40 FPS", n(40)), c("45 FPS", n(45)), c("50 FPS", n(50)),
         c("60 FPS", n(60)), c("120 FPS (ProMotion displays)", n(120)), c("Uncapped", n(0)),

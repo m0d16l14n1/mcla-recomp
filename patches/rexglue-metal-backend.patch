@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,666 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -625,10 +625,11 @@ new file mode 100644
 +            const bool use_hdr = hdr_state.active && REXCVAR_GET(metal_gamma_ramp) &&
 +                                 metal_context.texture().pixelFormat == MTLPixelFormatRGB10A2Unorm;
 +            MetalDraw::HdrRefresh refresh{};
++            HdrComposite composite = HdrComposite::kWholeFrame;
 +            if (use_hdr) {
 +              const uint32_t width = uint32_t(metal_context.texture().width);
 +              const uint32_t height = uint32_t(metal_context.texture().height);
-+              HdrComposite composite = HdrGetComposite(width, height);
++              composite = HdrGetComposite(width, height);
 +              refresh.layer = composite == HdrComposite::kMask || composite == HdrComposite::kLayer;
 +              if (refresh.layer && !draw_->HdrEnsureTextures(width, height)) {
 +                composite = HdrComposite::kWholeFrame;
@@ -643,10 +644,41 @@ new file mode 100644
 +                                       hdr_state.rolloff_start_nits, hdr_state.peak_nits};
 +              std::memcpy(&refresh.constants[4], levels, sizeof(levels));
 +            }
++            // Frame generation (the presenter gives a texture for it while it's on): for frames of the game's 3D
++            // scene put together from the UI layer, or without UI, and with the tone map (menus, loading and legal
++            // screens are shown alone), with the temporal AA's camera; HDR or SDR (not with the PWL ramp).
++            MetalDraw::FrameGeneration fg{};
++            fg.generated = metal_context.generated();
++            if (fg.generated && !use_hdr && REXCVAR_GET(metal_gamma_ramp)) {
++              // SDR: the refresher's constants for the HUD-less image and the compose (the UI layer is kept apart
++              // while frame generation is on, Presenter::SetFrameGenerationUiSeparation).
++              const uint32_t width = uint32_t(metal_context.texture().width);
++              const uint32_t height = uint32_t(metal_context.texture().height);
++              composite = HdrGetComposite(width, height);
++              fg.sdr.layer = composite == HdrComposite::kMask || composite == HdrComposite::kLayer;
++              if (fg.sdr.layer && !draw_->HdrEnsureTextures(width, height)) {
++                composite = HdrComposite::kWholeFrame;
++                fg.sdr.layer = false;
++              }
++              fg.sdr.scene = hdr_frame_.scene && composite != HdrComposite::kWholeFrame;
++              fg.sdr.constants[0] = width;
++              fg.sdr.constants[1] = height;
++              HdrRefreshFlags(composite, 0, &fg.sdr.constants[2]);
++            }
++            if (fg.generated) {
++              fg.allowed = (composite == HdrComposite::kLayer || composite == HdrComposite::kScene) &&
++                           hdr_frame_.tonemap && (!use_hdr || (!hdr_state.debug_ui && !hdr_state.test_pattern));
++              fg.near_plane = taa_camera_.near_plane;
++              fg.far_plane = taa_camera_.far_plane;
++              fg.fov_vertical = taa_camera_.fov_vertical;
++              fg.delta_time = taa_frame_time_ms_ / 1000.0f;
++              fg.reset = taa_camera_.reset;
++            }
 +            bool wrote_pq = false;
 +            if (draw_ && draw_->Present(frontbuffer_ptr, metal_context.texture(), gamma.get(),
-+                                        use_hdr ? &refresh : nullptr, &wrote_pq)) {
++                                        use_hdr ? &refresh : nullptr, &wrote_pq, fg.generated ? &fg : nullptr)) {
 +              if (wrote_pq) context.SetHdr({true, hdr_state.sdr_white_nits, hdr_state.sdr_pure_gamma_2_2});
++              metal_context.SetGenerated(fg.generated_out);
 +              return true;
 +            }
 +            // The placeholder: a slow pulse, so that a moving picture shows that the swaps arrive.
@@ -769,7 +801,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,449 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -848,9 +880,24 @@ new file mode 100644
 +    uint32_t constants[8];  // CommandProcessor's HdrRefreshConstants: size, flags, levels
 +    bool layer, scene;      // the UI layer and underlay, the HDR scene and tone map output, are this frame's
 +  };
++  // Frame generation (the SDK's frame_generation; MetalFX's frame interpolator, macOS 26), with the HDR refresher:
++  // the scene's code values without the UI (hdr_refresh_fg.cs, flag bit 13) for this frame and the last, MetalFX's
++  // frame between the two from the temporal AA's depth and vectors, and that frame composed under this frame's UI
++  // layer (bit 12) into `generated`. Only for frames whose temporal AA ran (the depth and vectors are its).
++  struct FrameGeneration {
++    id<MTLTexture> generated;  // the presenter's texture for it (the destination's size and format)
++    bool allowed;              // this frame's composite can (the UI layer or a frame without UI, the tone map found)
++    float near_plane, far_plane, fov_vertical;  // the camera (radians)
++    float delta_time;                           // seconds since the last frame
++    bool reset;                                 // a cut
++    // SDR output: the refresher's constants and layers for this frame (as for HDR, levels 0); size 0: none.
++    HdrRefresh sdr{};
++    bool generated_out = false;                 // set: a frame was generated into `generated`
++  };
++  static bool FrameGenerationSupported(id<MTLDevice> device);
 +  // wrote_pq (if given): whether HDR10 code values were written.
 +  bool Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma, const HdrRefresh* hdr = nullptr,
-+               bool* wrote_pq = nullptr);
++               bool* wrote_pq = nullptr, FrameGeneration* fg = nullptr);
 +  // HDR output's textures, at the output's size, in CommandProcessor::HdrTexture order: the underlay (screen
 +  // space), the underlay in render target space, the UI layer, the HDR scene (RGBA16Float), the tone map's output.
 +  static constexpr uint32_t kHdrTextureCount = 5;
@@ -898,7 +945,22 @@ new file mode 100644
 +  id<MTLComputePipelineState> HdrComputePipeline(const uint32_t* words, size_t count,
 +                                                 const std::vector<std::array<uint32_t, 3>>& slots, const char* name);
 +  std::array<id<MTLTexture>, kHdrTextureCount> hdr_textures_{};
-+  id<MTLComputePipelineState> hdr_refresh_ = nil, hdr_scene_ = nil;
++  id<MTLComputePipelineState> hdr_refresh_ = nil, hdr_scene_ = nil, hdr_refresh_fg_ = nil;
++  // Frame generation: the interpolator (id<MTLFXFrameInterpolator>) for the temporal AA's render size to the output,
++  // the HUD-less images of this frame and the last (fg_index_ this one's), MetalFX's output (RGBA16Float).
++  bool FgEnsure(uint32_t width, uint32_t height);
++  id fg_interpolator_ = nil;
++  std::array<id<MTLTexture>, 2> fg_hudless_{};
++  id<MTLTexture> fg_output_ = nil;
++  uint32_t fg_index_ = 0, fg_in_width_ = 0, fg_in_height_ = 0;
++  bool fg_history_ = false, fg_failed_ = false;
++  // Set by TaaRun when it ran (the frame's depth and vectors are there), with its jitter; Present takes it.
++  bool fg_taa_ran_ = false;
++  float fg_jitter_[2] = {};
++  // For the stats line: frames generated, and why the others weren't (no temporal AA, the composite, the first
++  // after a gap), and the GPU time of the interpolation and its compose.
++  uint32_t fg_generated_ = 0, fg_no_taa_ = 0, fg_not_allowed_ = 0, fg_first_ = 0;
++  std::shared_ptr<std::atomic<uint64_t>> fg_gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  id<MTLRenderPipelineState> hdr_restore_ = nil;
 +  bool hdr_pipelines_failed_ = false;
 +  // The last draw's translations, for the scene pass's textures.
@@ -1193,7 +1255,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3017 @@
+@@ -0,0 +1,3179 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1289,6 +1351,7 @@ new file mode 100644
 +// HDR output's compute shaders, the Vulkan backend's SPIR-V (made from the SDK's XeSL), as MSL at first use.
 +namespace hdr_spirv {
 +#include "../shaders/vulkan_spirv/hdr_refresh_cs.h"
++#include "../shaders/vulkan_spirv/hdr_refresh_fg_cs.h"
 +#include "../shaders/vulkan_spirv/hdr_scene_mcla_cs.h"
 +}  // namespace hdr_spirv
 +// Puts an 8_8_8_8 target back after the UI layer: target + underlay x (1 - target alpha), by the blend.
@@ -1592,6 +1655,14 @@ new file mode 100644
 +        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_ / 150.0, textures_composed_ / 150.0, texture_rows_loaded_ / 150.0, textures_reused_ / 150.0,
 +        snapshot_hashed_ / 1048576.0 / 150, snapshot_copied_ / 1048576.0 / 150, snapshot_persistent_hits_ / 150.0, texture_hashed_ / 1048576.0 / 150,
 +        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0, prebuilt_used_, prebuilt_wait_us_ / 1000.0, async_skipped_);
++    if (fg_generated_ || fg_no_taa_ || fg_not_allowed_ || fg_first_) {
++      const uint64_t fg_us = fg_gpu_us_->exchange(0);
++      REXGPU_INFO("Metal frame generation: {} frames generated in 150 ({:.2f} ms of GPU time each for MetalFX and the "
++                  "compose); not for {} without temporal AA, {} without the UI layer or tone map, {} first after a gap",
++                  fg_generated_, fg_generated_ ? fg_us / 1000.0 / fg_generated_ : 0.0, fg_no_taa_, fg_not_allowed_,
++                  fg_first_);
++      fg_generated_ = 0; fg_no_taa_ = 0; fg_not_allowed_ = 0; fg_first_ = 0;
++    }
 +    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0; prebuilt_used_ = 0; prebuilt_wait_us_ = 0; async_skipped_ = 0;
 +    stats_frames_ = 0; wait_us_ = 0; texture_loads_ = 0; textures_composed_ = 0; texture_rows_loaded_ = 0; textures_reused_ = 0; snapshot_hashed_ = 0; snapshot_copied_ = 0; snapshot_persistent_hits_ = 0; texture_hashed_ = 0; texture_watch_hits_ = 0; stats_start_ = std::chrono::steady_clock::now();
 +  }
@@ -3840,6 +3911,9 @@ new file mode 100644
 +        sourceSize:MTLSizeMake(width, height, 1) toTexture:scene_base destinationSlice:0 destinationLevel:0
 +        destinationOrigin:MTLOriginMake(0, 0, 0)];
 +    [blit endEncoding];
++    // Frame generation's depth and vectors are this frame's.
++    fg_taa_ran_ = true;
++    fg_jitter_[0] = inputs.jitter[0]; fg_jitter_[1] = inputs.jitter[1];
 +    return '+';
 +  }
 +  }
@@ -3930,8 +4004,75 @@ new file mode 100644
 +  commands_ = [queue_ commandBuffer];
 +}
 +
++bool MetalDraw::FrameGenerationSupported(id<MTLDevice> device) {
++  if (@available(macOS 26.0, *)) return device && [MTLFXFrameInterpolatorDescriptor supportsDevice:device];
++  return false;
++}
++
++bool MetalDraw::FgEnsure(uint32_t width, uint32_t height) {
++  if (@available(macOS 26.0, *)) {
++    if (fg_failed_ || !taa_depth_ || !taa_motion_) return false;
++    const uint32_t in_width = uint32_t(taa_depth_.width), in_height = uint32_t(taa_depth_.height);
++    if (fg_interpolator_ && fg_output_.width == width && fg_output_.height == height && fg_in_width_ == in_width &&
++        fg_in_height_ == in_height)
++      return true;
++    fg_interpolator_ = nil; fg_output_ = nil; fg_hudless_ = {}; fg_history_ = false;
++    if (!hdr_refresh_fg_ && !hdr_pipelines_failed_)
++      hdr_refresh_fg_ = HdrComputePipeline(hdr_spirv::hdr_refresh_fg_cs, std::size(hdr_spirv::hdr_refresh_fg_cs),
++          {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3}, {3, 1, 4}, {3, 2, 5}, {3, 3, 6}, {4, 0, 7}},
++          "hdr refresh (frame generation)");
++    if (!hdr_refresh_fg_) { fg_failed_ = true; return false; }
++    // The HUD-less images at the output's size, the depth and vectors at the temporal AA's render size.
++    auto desc = [MTLFXFrameInterpolatorDescriptor new];
++    desc.colorTextureFormat = MTLPixelFormatRGBA16Float;
++    desc.outputTextureFormat = MTLPixelFormatRGBA16Float;
++    desc.depthTextureFormat = MTLPixelFormatDepth32Float;
++    desc.motionTextureFormat = MTLPixelFormatRG16Float;
++    desc.inputWidth = in_width; desc.inputHeight = in_height;
++    desc.outputWidth = width; desc.outputHeight = height;
++    id<MTLFXFrameInterpolator> interpolator = [desc newFrameInterpolatorWithDevice:device_];
++    if (!interpolator) {
++      REXGPU_ERROR("Metal frame generation: no MetalFX frame interpolator for {}x{} to {}x{}", in_width, in_height,
++                   width, height);
++      fg_failed_ = true;
++      return false;
++    }
++    if ((taa_depth_.usage & interpolator.depthTextureUsage) != interpolator.depthTextureUsage ||
++        (taa_motion_.usage & interpolator.motionTextureUsage) != interpolator.motionTextureUsage) {
++      REXGPU_ERROR("Metal frame generation: the temporal AA's depth or vectors can't be the interpolator's");
++      fg_failed_ = true;
++      return false;
++    }
++    auto texture = [&](MTLTextureUsage usage, NSString* label) {
++      auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:width
++                                                                 height:height mipmapped:NO];
++      d.storageMode = MTLStorageModePrivate; d.usage = usage;
++      id<MTLTexture> t = [device_ newTextureWithDescriptor:d];
++      t.label = label;
++      return t;
++    };
++    for (uint32_t i = 0; i < 2; ++i)
++      fg_hudless_[i] = texture(interpolator.colorTextureUsage | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
++                               [NSString stringWithFormat:@"frame generation HUD-less %u", i]);
++    fg_output_ = texture(interpolator.outputTextureUsage | MTLTextureUsageShaderRead, @"frame generation output");
++    if (!fg_hudless_[0] || !fg_hudless_[1] || !fg_output_) { fg_failed_ = true; return false; }
++    fg_interpolator_ = interpolator;
++    fg_in_width_ = in_width; fg_in_height_ = in_height;
++    REXGPU_INFO("Metal frame generation: MetalFX frame interpolator ready for {}x{} (depth and vectors {}x{})", width,
++                height, in_width, in_height);
++    return true;
++  }
++  return false;
++}
++
 +bool MetalDraw::Present(uint32_t address, id<MTLTexture> destination, const GammaRamp* gamma, const HdrRefresh* hdr,
-+                        bool* wrote_pq) {
++                        bool* wrote_pq, FrameGeneration* fg) {
++  // Frame generation's depth and vectors, if this frame's temporal AA ran.
++  const bool fg_taa_ran = fg_taa_ran_;
++  fg_taa_ran_ = false;
++  if (fg) fg->generated_out = false;
++  if (!fg || !fg->generated) fg_history_ = false;
++  if (wrote_pq) *wrote_pq = false;
 +  // EndFrame has committed the frame; the front buffer's load and the copy follow it on the queue.
 +  Submit(false);
 +  // The swap packet installs the front buffer's texture fetch constant in slot 0; it goes through
@@ -3953,50 +4094,133 @@ new file mode 100644
 +  if (!commands_) commands_ = [queue_ commandBuffer];
 +  auto commands = commands_; commands.label = @"Xenos front buffer";
 +  commands_ = nil;
-+  if (hdr && gamma && !pwl && destination.pixelFormat == MTLPixelFormatRGB10A2Unorm) {
++  // The SDK's refresher (hdr_refresh.cs): HDR output, and SDR with frame generation (its HUD-less image and the
++  // generated frame's compose; the frame itself as without it). Its inputs: the ramp as the Vulkan backend gives it
++  // (a texel buffer of the 256 raw words, A2B10G10R10 - RGB10A2 here), and the source as a 2D texture.
++  const bool use_hdr = hdr && gamma && !pwl && destination.pixelFormat == MTLPixelFormatRGB10A2Unorm;
++  const HdrRefresh* sdr_refresh = !use_hdr && fg && fg->generated && fg->sdr.constants[0] && c.mode == 1 &&
++      destination.pixelFormat == MTLPixelFormatRGBA8Unorm ? &fg->sdr : nullptr;
++  const HdrRefresh* refresh = use_hdr ? hdr : sdr_refresh;
++  id<MTLTexture> ramp_texture = nil, source_2d = nil;
++  if (refresh) {
 +    if (!hdr_refresh_ && !hdr_pipelines_failed_)
 +      hdr_refresh_ = HdrComputePipeline(hdr_spirv::hdr_refresh_cs, std::size(hdr_spirv::hdr_refresh_cs),
 +          {{0, 0, 0}, {1, 0, 1}, {2, 0, 2}, {3, 0, 3}, {3, 1, 4}, {3, 2, 5}, {3, 3, 6}}, "hdr refresh");
-+    // The ramp as the Vulkan backend gives it: a texel buffer of the 256 raw words, A2B10G10R10 (RGB10A2 here).
 +    id<MTLBuffer> ramp = hdr_refresh_ ? [device_ newBufferWithBytes:gamma->table length:sizeof(gamma->table)
 +                                                            options:MTLResourceStorageModeShared] : nil;
 +    auto ramp_desc = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGB10A2Unorm
 +                                                                           width:256
 +                                                                 resourceOptions:MTLResourceStorageModeShared
 +                                                                           usage:MTLTextureUsageShaderRead];
-+    id<MTLTexture> ramp_texture = ramp ? [ramp newTextureWithDescriptor:ramp_desc offset:0 bytesPerRow:1024] : nil;
-+    id<MTLTexture> source_2d = source.textureType == MTLTextureType2D ? source
++    ramp_texture = ramp ? [ramp newTextureWithDescriptor:ramp_desc offset:0 bytesPerRow:1024] : nil;
++    source_2d = source.textureType == MTLTextureType2D ? source
 +        : [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2D
 +                                         levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
-+    if (ramp_texture && source_2d) {
-+      auto compute = [commands computeCommandEncoder];
-+      [compute setComputePipelineState:hdr_refresh_];
-+      [compute setBytes:hdr->constants length:sizeof(hdr->constants) atIndex:0];
-+      [compute setTexture:ramp_texture atIndex:0];
-+      [compute setTexture:source_2d atIndex:1];
-+      [compute setTexture:destination atIndex:2];
-+      // Unused ones are the source again, as on Vulkan.
-+      [compute setTexture:hdr->layer && hdr_textures_[0] ? hdr_textures_[0] : source_2d atIndex:3];
-+      [compute setTexture:hdr->layer && hdr_textures_[2] ? hdr_textures_[2] : source_2d atIndex:4];
-+      [compute setTexture:hdr->scene && hdr_textures_[3] ? hdr_textures_[3] : source_2d atIndex:5];
-+      [compute setTexture:hdr->scene && hdr_textures_[4] ? hdr_textures_[4] : source_2d atIndex:6];
-+      [compute dispatchThreadgroups:MTLSizeMake((destination.width + 15) / 16, (destination.height + 7) / 8, 1)
-+              threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-+      [compute endEncoding]; [commands commit];
-+      if (wrote_pq) *wrote_pq = true;
-+      return true;
++    if (!ramp_texture || !source_2d) refresh = nullptr;
++  }
++  // Frame generation: this frame's HUD-less image (bit 13), where this frame can have one.
++  const uint32_t width = uint32_t(destination.width), height = uint32_t(destination.height);
++  id<MTLTexture> hudless = nil;
++  if (refresh && fg && fg->generated) {
++    if (!fg_taa_ran) ++fg_no_taa_;
++    else if (!fg->allowed) ++fg_not_allowed_;
++    else if (fg->generated.width == width && fg->generated.height == height &&
++             fg->generated.pixelFormat == destination.pixelFormat && FgEnsure(width, height))
++      hudless = fg_hudless_[fg_index_];
++  }
++  auto bind = [&](id<MTLComputeCommandEncoder> compute, id<MTLTexture> output, id<MTLTexture> scene) {
++    [compute setTexture:ramp_texture atIndex:0];
++    [compute setTexture:source_2d atIndex:1];
++    [compute setTexture:output atIndex:2];
++    // Unused ones are the source again, as on Vulkan.
++    [compute setTexture:refresh->layer && hdr_textures_[0] ? hdr_textures_[0] : source_2d atIndex:3];
++    [compute setTexture:refresh->layer && hdr_textures_[2] ? hdr_textures_[2] : source_2d atIndex:4];
++    [compute setTexture:scene ? scene : refresh->scene && hdr_textures_[3] ? hdr_textures_[3] : source_2d atIndex:5];
++    [compute setTexture:refresh->scene && hdr_textures_[4] ? hdr_textures_[4] : source_2d atIndex:6];
++    if (hudless) [compute setTexture:hudless atIndex:7];
++    [compute dispatchThreadgroups:MTLSizeMake((width + 15) / 16, (height + 7) / 8, 1)
++            threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++    [compute endEncoding];
++  };
++  uint32_t constants[8] = {};
++  if (refresh) std::memcpy(constants, refresh->constants, sizeof(constants));
++  if (use_hdr && refresh) {
++    // HDR10 code values (PQ, BT.2020), with the HUD-less image too (bit 13).
++    if (hudless) constants[2] |= 1u << 13;
++    auto compute = [commands computeCommandEncoder];
++    [compute setComputePipelineState:hudless ? hdr_refresh_fg_ : hdr_refresh_];
++    [compute setBytes:constants length:sizeof(constants) atIndex:0];
++    bind(compute, destination, nil);
++    if (wrote_pq) *wrote_pq = true;
++  } else {
++    // SDR code values, also into an RGB10A2 destination (the presenter then shows them as SDR content).
++    auto compute = [commands computeCommandEncoder];
++    [compute setComputePipelineState:present_];
++    [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
++    [compute setBytes:&c length:sizeof(c) atIndex:0];
++    static const GammaRamp kIdentity{};
++    [compute setBytes:(gamma ? gamma : &kIdentity) length:sizeof(GammaRamp) atIndex:1];
++    [compute dispatchThreads:MTLSizeMake(c.size[0], c.size[1], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++    [compute endEncoding];
++    if (hudless) {
++      // SDR: the HUD-less image alone (bits 13 to 15; the destination bound, not written).
++      constants[2] |= (1u << 13) | (1u << 14) | (1u << 15);
++      auto fg_compute = [commands computeCommandEncoder];
++      [fg_compute setComputePipelineState:hdr_refresh_fg_];
++      [fg_compute setBytes:constants length:sizeof(constants) atIndex:0];
++      bind(fg_compute, destination, nil);
 +    }
 +  }
-+  // Otherwise SDR code values, also into an RGB10A2 destination (the presenter then shows them as SDR content).
-+  if (wrote_pq) *wrote_pq = false;
-+  auto compute = [commands computeCommandEncoder];
-+  [compute setComputePipelineState:present_];
-+  [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
-+  [compute setBytes:&c length:sizeof(c) atIndex:0];
-+  static const GammaRamp kIdentity{};
-+  [compute setBytes:(gamma ? gamma : &kIdentity) length:sizeof(GammaRamp) atIndex:1];
-+  [compute dispatchThreads:MTLSizeMake(c.size[0], c.size[1], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
-+  [compute endEncoding]; [commands commit];
++  [commands commit];
++  if (!hudless) {
++    fg_history_ = false;
++    return true;
++  }
++  if (!fg_history_) {
++    // The first since a gap: the next frame generates from this one.
++    ++fg_first_;
++    fg_history_ = true;
++    fg_index_ ^= 1;
++    return true;
++  }
++  if (@available(macOS 26.0, *)) {
++    // MetalFX's frame between the last frame and this one, then its compose under this frame's UI layer (bit 12,
++    // its scene from the generated code values, bit 15 in SDR; the UI layer's size in y), into the presenter's
++    // texture.
++    id<MTLCommandBuffer> fg_commands = [queue_ commandBuffer];
++    fg_commands.label = @"MetalFX frame interpolation";
++    id<MTLFXFrameInterpolator> interpolator = fg_interpolator_;
++    interpolator.colorTexture = hudless;
++    interpolator.prevColorTexture = fg_hudless_[fg_index_ ^ 1];
++    interpolator.depthTexture = taa_depth_;
++    interpolator.motionTexture = taa_motion_;
++    interpolator.motionVectorScaleX = 1.0f; interpolator.motionVectorScaleY = 1.0f;
++    interpolator.jitterOffsetX = fg_jitter_[0]; interpolator.jitterOffsetY = fg_jitter_[1];
++    interpolator.depthReversed = YES;  // 1 near, 0 far, as the temporal AA's
++    interpolator.deltaTime = fg->delta_time;
++    interpolator.nearPlane = fg->near_plane; interpolator.farPlane = fg->far_plane;
++    interpolator.fieldOfView = fg->fov_vertical * (180.0f / 3.14159265f);
++    interpolator.aspectRatio = float(width) / float(height);
++    interpolator.shouldResetHistory = fg->reset;
++    interpolator.outputTexture = fg_output_;
++    [interpolator encodeToCommandBuffer:fg_commands];
++    constants[2] = refresh->constants[2] | (1u << 12) | (use_hdr ? 0u : 1u << 15);
++    constants[3] = width | (height << 16);
++    auto compose = [fg_commands computeCommandEncoder];
++    if (REXCVAR_GET(metal_debug_labels)) compose.label = @"frame generation compose";
++    [compose setComputePipelineState:hdr_refresh_fg_];
++    [compose setBytes:constants length:sizeof(constants) atIndex:0];
++    bind(compose, fg->generated, fg_output_);
++    auto gpu_us = fg_gpu_us_;
++    [fg_commands addCompletedHandler:^(id<MTLCommandBuffer> done) {
++      if (done.GPUEndTime > done.GPUStartTime)
++        gpu_us->fetch_add(uint64_t((done.GPUEndTime - done.GPUStartTime) * 1e6), std::memory_order_relaxed);
++    }];
++    [fg_commands commit];
++    fg->generated_out = true;
++    ++fg_generated_;
++  }
++  fg_index_ ^= 1;
 +  return true;
 +}
 +
@@ -4215,7 +4439,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,290 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -4243,6 +4467,10 @@ new file mode 100644
 +
 +#include <array>
 +#include <atomic>
++#include <mutex>
++#include <optional>
++#include <condition_variable>
++#include <thread>
 +#include <cstdint>
 +#include <memory>
 +#include <chrono>
@@ -4287,17 +4515,26 @@ new file mode 100644
 +class MetalGuestOutputRefreshContext final : public ui::Presenter::GuestOutputRefreshContext {
 + public:
 +  MetalGuestOutputRefreshContext(bool& is_8bpc_out_ref, ui::Presenter::GuestOutputHdr& hdr_out_ref,
-+                                 id<MTLTexture> texture, id<MTLCommandQueue> command_queue)
++                                 id<MTLTexture> texture, id<MTLCommandQueue> command_queue,
++                                 id<MTLTexture> generated = nil)
 +      : GuestOutputRefreshContext(is_8bpc_out_ref, hdr_out_ref),
 +        texture_(texture),
-+        command_queue_(command_queue) {}
++        command_queue_(command_queue),
++        generated_(generated) {}
 +
 +  id<MTLTexture> texture() const { return texture_; }
 +  id<MTLCommandQueue> command_queue() const { return command_queue_; }
++  // Frame generation: the texture for the frame generated between the last frame and this one (texture()'s size
++  // and format; nil while frame generation is off); the refresher says whether it wrote one there.
++  id<MTLTexture> generated() const { return generated_; }
++  void SetGenerated(bool written) { generated_written_ = written; }
++  bool generated_written() const { return generated_written_; }
 +
 + private:
 +  id<MTLTexture> texture_;
 +  id<MTLCommandQueue> command_queue_;
++  id<MTLTexture> generated_;
++  bool generated_written_ = false;
 +};
 +
 +class MetalPresenter final : public ui::Presenter {
@@ -4308,6 +4545,9 @@ new file mode 100644
 +
 +  ui::Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 +  bool CaptureGuestOutput(ui::RawImage& image_out) override;
++  // Frame generation: MetalFX's frame interpolator (macOS 26), with HDR output.
++  bool SupportsFrameGeneration() const override;
++  const char* FrameGenerationUnsupportedReason() const override;
 +
 +  // The guest output is RGBA8, with the guest's own gamma (as the display would get it).
 +  static constexpr MTLPixelFormat kGuestOutputFormat = MTLPixelFormatRGBA8Unorm;
@@ -4349,6 +4589,50 @@ new file mode 100644
 +  id<MTLSamplerState> paint_sampler_ = nil;
 +  CAMetalLayer* layer_ = nil;
 +  std::array<id<MTLTexture>, kGuestOutputMailboxSize> guest_output_textures_{};
++  // Frame generation: each guest output image's generated frame (shown before it), whether it has one, and which
++  // refresh it holds (so that a repaint shows neither twice nor counts as a new frame).
++  std::array<id<MTLTexture>, kGuestOutputMailboxSize> generated_textures_{};
++  std::array<bool, kGuestOutputMailboxSize> generated_{};
++  std::array<uint64_t, kGuestOutputMailboxSize> refresh_serial_{};
++  uint64_t next_refresh_serial_ = 0, painted_refresh_serial_ = 0;
++  // The paints' pacing: the time between the guest's refreshes (averaged; the refresher's thread measures it, from
++  // the game's own pacing, not from the paints, which wait for drawables).
++  std::chrono::steady_clock::time_point last_refresh_{};
++  std::atomic<double> refresh_interval_{0.0};
++  double display_hz_ = 0.0;
++  std::chrono::steady_clock::time_point display_hz_checked_{};
++  bool fg_logged_presenting_ = false;
++  uint32_t fg_presented_ = 0, fg_held_back_ = 0, fg_dropped_ = 0;
++  std::chrono::steady_clock::time_point fg_log_time_{};
++  // Where an image goes in the drawable (the paint flow's last size and offset), and the HDR paint's constants.
++  struct PaintPlacement {
++    bool draw = false;
++    MTLViewport viewport{};
++    struct { float sdr_nits; uint32_t is_pq, gamma22; } hdr{};
++  };
++  id<MTLCommandBuffer> EncodePaint(id<CAMetalDrawable> target, id<MTLTexture> image, const PaintPlacement& placement,
++                                   bool ui, const HdrOutputState& hdr_state);
++  // Frame generation's present thread: the UI thread copies a new frame and the generated one before it into a
++  // slot of fg_copies_ ([0] generated, [1] the new frame) and leaves them to the thread, which waits for drawables
++  // (two a frame, more than the layer's three let the UI thread have without waiting) and presents them half the
++  // time between frames apart. A job not started yet when the next comes is replaced (its frames are skipped).
++  struct FgJob {
++    CAMetalLayer* layer;
++    uint32_t slot;
++    PaintPlacement placement;
++    double half;
++  };
++  void FgPresentThread();
++  // Until the thread has presented what it was given (a paint of the UI thread's own comes after it).
++  void FgPresentWaitIdle();
++  void FgPresentStop();
++  std::thread fg_thread_;
++  std::mutex fg_mutex_;
++  std::condition_variable fg_cv_;
++  std::optional<FgJob> fg_job_;
++  uint32_t fg_busy_slot_ = UINT32_MAX;
++  bool fg_quit_ = false;
++  std::array<std::array<id<MTLTexture>, 2>, 3> fg_copies_{};
 +};
 +
 +class MetalGraphicsSystem final : public GraphicsSystem {
@@ -4450,7 +4734,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,748 @@
+@@ -0,0 +1,934 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -4469,6 +4753,7 @@ new file mode 100644
 + */
 +
 +#include "metal_internal.h"
++#import <MetalFX/MetalFX.h>
 +#include <chrono>
 +#include <cstdio>
 +#include <algorithm>
@@ -4490,6 +4775,7 @@ new file mode 100644
 +    "every 2 seconds");
 +
 +REXCVAR_DECLARE(std::string, hdr);
++REXCVAR_DECLARE(int32_t, frame_generation_debug);
 +REXCVAR_DEFINE_BOOL(metal_hdr_auto_edr, true, "GPU/Metal",
 +    "With hdr = auto: HDR output when the display can show extended dynamic range (EDR) at all (macOS has no HDR "
 +    "switch; on a Mac the built-in displays and HDR monitors can)");
@@ -4850,6 +5136,7 @@ new file mode 100644
 +}
 +
 +MetalPresenter::~MetalPresenter() {
++  FgPresentStop();
 +  // Nothing on the queue may still read the guest output textures or the layer's drawables.
 +  @autoreleasepool {
 +    id<MTLCommandBuffer> drain = [command_queue_ commandBuffer];
@@ -4896,6 +5183,16 @@ new file mode 100644
 +  sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
 +  paint_sampler_ = [device_ newSamplerStateWithDescriptor:sampler_desc];
 +  return paint_sampler_ != nil;
++}
++
++bool MetalPresenter::SupportsFrameGeneration() const {
++  if (@available(macOS 26.0, *)) return device_ && [MTLFXFrameInterpolatorDescriptor supportsDevice:device_];
++  return false;
++}
++
++const char* MetalPresenter::FrameGenerationUnsupportedReason() const {
++  if (@available(macOS 26.0, *)) return "NOT ON THIS GPU";
++  return "NEEDS MACOS 26";
 +}
 +
 +ui::Surface::TypeFlags MetalPresenter::GetSupportedSurfaceTypes() const {
@@ -4951,6 +5248,8 @@ new file mode 100644
 +    is_vsync_implicit_out = layer.displaySyncEnabled;
 +    return SurfacePaintConnectResult::kSuccessUnchanged;
 +  }
++  // Not while frame generation's thread is getting drawables from the layer.
++  FgPresentWaitIdle();
 +  layer.device = device_;
 +  layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 +  layer.wantsExtendedDynamicRangeContent = NO;
@@ -4971,6 +5270,7 @@ new file mode 100644
 +}
 +
 +void MetalPresenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
++  FgPresentStop();
 +  layer_ = nil;
 +  layer_hdr_ = false;
 +  SetHdrOutputActive(false);
@@ -5042,10 +5342,43 @@ new file mode 100644
 +      texture.label = [NSString stringWithFormat:@"rexglue guest output %u", mailbox_index];
 +      guest_output_textures_[mailbox_index] = texture;
 +    }
-+    MetalGuestOutputRefreshContext context(is_8bpc_out_ref, hdr_out_ref, texture, command_queue_);
++    // Frame generation: a texture for the generated frame like this one; in SDR too the guest output's UI layer is
++    // kept apart while it's on (for the compose of generated frames).
++    id<MTLTexture> generated = nil;
++    const bool fg_wanted = frame_generation_wanted();
++    SetFrameGenerationUiSeparation(fg_wanted);
++    if (fg_wanted) {
++      {
++        generated = generated_textures_[mailbox_index];
++        if (!generated || generated.width != texture.width || generated.height != texture.height ||
++            generated.pixelFormat != texture.pixelFormat) {
++          MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:texture.pixelFormat
++                                                                                          width:texture.width
++                                                                                         height:texture.height
++                                                                                      mipmapped:NO];
++          desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++          desc.storageMode = MTLStorageModePrivate;
++          generated = [device_ newTextureWithDescriptor:desc];
++          generated.label = [NSString stringWithFormat:@"rexglue generated frame %u", mailbox_index];
++          generated_textures_[mailbox_index] = generated;
++        }
++      }
++    } else {
++      generated_textures_[mailbox_index] = nil;
++    }
++    MetalGuestOutputRefreshContext context(is_8bpc_out_ref, hdr_out_ref, texture, command_queue_, generated);
 +    context.SetIs8bpc(format == kGuestOutputFormat);
 +    const bool refreshed = refresher(context);
 +    guest_output_hdr_[mailbox_index] = hdr_out_ref;
++    generated_[mailbox_index] = refreshed && generated && context.generated_written();
++    refresh_serial_[mailbox_index] = ++next_refresh_serial_;
++    const auto now = std::chrono::steady_clock::now();
++    const double interval = std::chrono::duration<double>(now - last_refresh_).count();
++    if (last_refresh_ != std::chrono::steady_clock::time_point{} && interval < 0.25) {
++      const double average = refresh_interval_.load(std::memory_order_relaxed);
++      refresh_interval_.store(average ? average * 0.8 + interval * 0.2 : interval, std::memory_order_relaxed);
++    }
++    last_refresh_ = now;
 +    return refreshed;
 +  }
 +}
@@ -5108,6 +5441,86 @@ new file mode 100644
 +  }];
 +}
 +
++id<MTLCommandBuffer> MetalPresenter::EncodePaint(id<CAMetalDrawable> target, id<MTLTexture> image,
++                                                 const PaintPlacement& placement, bool ui,
++                                                 const HdrOutputState& hdr_state) {
++  id<MTLCommandBuffer> command_buffer = [command_queue_ commandBuffer];
++  command_buffer.label = @"rexglue paint";
++  MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
++  pass.colorAttachments[0].texture = target.texture;
++  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
++  pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
++  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++  id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
++  const bool hdr_target = target.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm;
++  if (image && placement.draw) {
++    // Bilinear to the final size and place, whatever effects the configuration asked for.
++    [encoder setViewport:placement.viewport];
++    [encoder setRenderPipelineState:hdr_target ? paint_hdr_pipeline_ : paint_pipeline_];
++    if (hdr_target) [encoder setFragmentBytes:&placement.hdr length:sizeof(placement.hdr) atIndex:0];
++    [encoder setFragmentTexture:image atIndex:0];
++    [encoder setFragmentSamplerState:paint_sampler_ atIndex:0];
++    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
++  }
++  if (ui) {
++    const uint32_t width = uint32_t(target.texture.width), height = uint32_t(target.texture.height);
++    [encoder setViewport:MTLViewport{0.0, 0.0, double(width), double(height), 0.0, 1.0}];
++    MetalUIDrawContext ui_draw_context(*this, width, height, encoder, hdr_target, hdr_state.sdr_white_nits,
++                                       hdr_state.sdr_pure_gamma_2_2);
++    ExecuteUIDrawersFromUIThread(ui_draw_context);
++  }
++  [encoder endEncoding];
++  return command_buffer;
++}
++
++void MetalPresenter::FgPresentThread() {
++  pthread_setname_np("rexglue frame generation present");
++  std::unique_lock<std::mutex> lock(fg_mutex_);
++  for (;;) {
++    fg_cv_.wait(lock, [this] { return fg_quit_ || fg_job_.has_value(); });
++    if (fg_quit_) return;
++    FgJob job = std::move(*fg_job_);
++    fg_job_.reset();
++    fg_busy_slot_ = job.slot;
++    lock.unlock();
++    @autoreleasepool {
++      // frame_generation_debug 3: the generated frames only (in place of the new frames too).
++      const bool generated_only = REXCVAR_GET(frame_generation_debug) == 3;
++      const HdrOutputState hdr_state = GetHdrOutputState();
++      for (uint32_t i = 0; i < 2; ++i) {
++        id<CAMetalDrawable> drawable = [job.layer nextDrawable];
++        if (!drawable) continue;
++        id<MTLCommandBuffer> command_buffer =
++            EncodePaint(drawable, fg_copies_[job.slot][generated_only ? 0 : i], job.placement, false, hdr_state);
++        if (!i) command_buffer.label = @"rexglue paint (generated frame)";
++        else CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
++        [command_buffer presentDrawable:drawable afterMinimumDuration:job.half];
++        [command_buffer commit];
++      }
++    }
++    lock.lock();
++    fg_busy_slot_ = UINT32_MAX;
++    fg_cv_.notify_all();
++  }
++}
++
++void MetalPresenter::FgPresentWaitIdle() {
++  std::unique_lock<std::mutex> lock(fg_mutex_);
++  fg_cv_.wait(lock, [this] { return !fg_thread_.joinable() || (!fg_job_ && fg_busy_slot_ == UINT32_MAX); });
++}
++
++void MetalPresenter::FgPresentStop() {
++  if (!fg_thread_.joinable()) return;
++  FgPresentWaitIdle();
++  {
++    std::lock_guard<std::mutex> lock(fg_mutex_);
++    fg_quit_ = true;
++  }
++  fg_cv_.notify_all();
++  fg_thread_.join();
++  fg_quit_ = false;
++}
++
 +ui::Presenter::PaintResult MetalPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
 +  @autoreleasepool {
 +    CAMetalLayer* layer = layer_;
@@ -5119,81 +5532,138 @@ new file mode 100644
 +    if (!drawable_width || !drawable_height) {
 +      return PaintResult::kNotPresented;
 +    }
-+    // HDR output follows the setting (and, for auto, the display) during play: the layer switches in place.
++    // HDR output follows the setting (and, for auto, the display) during play: the layer switches in place (not
++    // while frame generation's thread is getting its drawables).
 +    const bool hdr = HdrWanted();
 +    if (hdr != layer_hdr_) {
++      FgPresentWaitIdle();
 +      ConfigureLayerHdr(layer, hdr);
 +      REXGPU_INFO("Metal presenter: HDR output (HDR10 with EDR) {}", hdr ? "on" : "off");
 +    }
 +    const HdrOutputState hdr_state = GetHdrOutputState();
 +    if (hdr && (hdr_state.peak_nits != edr_metadata_peak_ || hdr_state.paper_white_nits != edr_metadata_white_)) {
 +      // Paper white at EDR 1.0 (the display's SDR white); macOS maps the light above it into the headroom there is.
++      FgPresentWaitIdle();
 +      edr_metadata_peak_ = hdr_state.peak_nits;
 +      edr_metadata_white_ = hdr_state.paper_white_nits;
 +      layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0.005f
 +                                                           maxLuminance:hdr_state.peak_nits
 +                                                     opticalOutputScale:hdr_state.paper_white_nits];
 +    }
++
++    // Held while the guest output texture is used: no refresher may write the acquired image meanwhile,
++    // and the command buffer reading it is committed on the same queue before any later write to it.
++    uint32_t mailbox_index;
++    GuestOutputProperties properties;
++    GuestOutputPaintConfig paint_config;
++    std::unique_lock<std::mutex> consumer_lock = ConsumeGuestOutput(mailbox_index, &properties, &paint_config);
++    const bool have_output = mailbox_index < kGuestOutputMailboxSize;
++    id<MTLTexture> guest_output = have_output ? guest_output_textures_[mailbox_index] : nil;
++    PaintPlacement placement;
++    if (guest_output) {
++      const GuestOutputPaintFlow flow = GetGuestOutputPaintFlow(properties, drawable_width, drawable_height,
++                                                                drawable_width, drawable_height, paint_config);
++      if (flow.effect_count) {
++        const std::pair<uint32_t, uint32_t>& size = flow.effect_output_sizes[flow.effect_count - 1];
++        placement.draw = true;
++        placement.viewport = {double(flow.output_x), double(flow.output_y), double(size.first), double(size.second),
++                              0.0, 1.0};
++        placement.hdr = {hdr_state.sdr_white_nits,
++                         properties.hdr.is_pq && guest_output.pixelFormat == MTLPixelFormatRGB10A2Unorm,
++                         hdr_state.sdr_pure_gamma_2_2};
++      }
++    }
++
++    // Frame generation: a new frame with a generated one before it is shown in two halves of the time between the
++    // guest's frames, the generated one first - while that time is at least about two refreshes of the display (a
++    // display that shows the new frames alone has no room for more), not under the presenter's UI (drawn once a
++    // paint), and not for a paint that is late (it skipped frames: the new frame alone, to catch up).
++    const auto now = std::chrono::steady_clock::now();
++    const uint64_t serial = have_output ? refresh_serial_[mailbox_index] : 0;
++    const bool new_frame = serial && serial != painted_refresh_serial_;
++    const bool late = new_frame && painted_refresh_serial_ && serial > painted_refresh_serial_ + 1;
++    if (new_frame) painted_refresh_serial_ = serial;
++    // The display's refresh rate (the presenter's display reader has none on macOS): the main screen's, read
++    // about once a second.
++    if (now - display_hz_checked_ > std::chrono::seconds(1)) {
++      display_hz_checked_ = now;
++      NSScreen* screen = [NSScreen mainScreen];
++      display_hz_ = screen ? double(screen.maximumFramesPerSecond) : 0.0;
++    }
++    double refresh_hz = display_hz_ >= 24.0 ? display_hz_ : double(GetDisplayRefreshHz());
++    if (!(refresh_hz >= 24.0)) refresh_hz = 60.0;
++    const double frame_interval = refresh_interval_.load(std::memory_order_relaxed);
++    bool show_generated = false;
++    if (new_frame && generated_[mailbox_index] && generated_textures_[mailbox_index] && guest_output) {
++      show_generated = !execute_ui_drawers && !late && frame_interval >= 1.6 / refresh_hz;
++      if (!show_generated) ++fg_held_back_;
++    }
++    if (fg_presented_ || fg_held_back_) {
++      if (now - fg_log_time_ > std::chrono::seconds(10)) {
++        if (fg_log_time_ != std::chrono::steady_clock::time_point{})
++          REXGPU_INFO("Metal frame generation: {} generated frames presented in 10 s, {} held back, {} skipped as the "
++                      "present thread was behind ({:.1f} ms between new frames, a {:.0f} Hz display)",
++                      fg_presented_, fg_held_back_, fg_dropped_, frame_interval * 1000.0, refresh_hz);
++        fg_log_time_ = now;
++        fg_presented_ = 0;
++        fg_held_back_ = 0;
++        fg_dropped_ = 0;
++      }
++    }
++    if (show_generated) {
++      id<MTLTexture> generated = generated_textures_[mailbox_index];
++      std::unique_lock<std::mutex> lock(fg_mutex_);
++      if (!fg_copies_[0][0] || fg_copies_[0][0].width != guest_output.width ||
++          fg_copies_[0][0].height != guest_output.height || fg_copies_[0][0].pixelFormat != guest_output.pixelFormat) {
++        // New copies once the thread is done with the old ones.
++        fg_cv_.wait(lock, [this] { return !fg_job_ && fg_busy_slot_ == UINT32_MAX; });
++        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:guest_output.pixelFormat
++                                                                                        width:guest_output.width
++                                                                                       height:guest_output.height
++                                                                                    mipmapped:NO];
++        desc.usage = MTLTextureUsageShaderRead;
++        desc.storageMode = MTLStorageModePrivate;
++        for (auto& slot : fg_copies_)
++          for (auto& copy : slot) copy = [device_ newTextureWithDescriptor:desc];
++      }
++      // A slot neither the thread's job nor the one waiting for it (which this one replaces).
++      uint32_t slot = 0;
++      while (slot == fg_busy_slot_ || (fg_job_ && slot == fg_job_->slot)) ++slot;
++      if (fg_job_) ++fg_dropped_;
++      if (!fg_thread_.joinable()) fg_thread_ = std::thread([this] { FgPresentThread(); });
++      lock.unlock();
++      id<MTLCommandBuffer> copy = [command_queue_ commandBuffer];
++      copy.label = @"rexglue frame generation present copies";
++      id<MTLBlitCommandEncoder> blit = [copy blitCommandEncoder];
++      [blit copyFromTexture:generated toTexture:fg_copies_[slot][0]];
++      [blit copyFromTexture:guest_output toTexture:fg_copies_[slot][1]];
++      [blit endEncoding];
++      [copy commit];
++      lock.lock();
++      // Each half shown for at least most of half the time between the guest's frames (vsync rounds it up to
++      // refreshes of the display).
++      fg_job_ = FgJob{layer, slot, placement, frame_interval * 0.5 * 0.9};
++      lock.unlock();
++      fg_cv_.notify_all();
++      ++fg_presented_;
++      if (!fg_logged_presenting_) {
++        fg_logged_presenting_ = true;
++        REXGPU_INFO("Metal frame generation: presenting generated frames ({:.1f} ms between new frames, a {:.0f} Hz "
++                    "display)", frame_interval * 1000.0, refresh_hz);
++      }
++      return PaintResult::kPresented;
++    }
++
++    // A paint of this thread's own: after what the frame generation thread was given.
++    FgPresentWaitIdle();
 +    id<CAMetalDrawable> drawable = [layer nextDrawable];
 +    if (!drawable) {
 +      return PaintResult::kNotPresented;
 +    }
-+
-+    id<MTLCommandBuffer> command_buffer = [command_queue_ commandBuffer];
-+    command_buffer.label = @"rexglue paint";
-+    MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-+    pass.colorAttachments[0].texture = drawable.texture;
-+    pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-+    pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
-+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-+    id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
-+
-+    {
-+      // Held while the guest output texture is used: no refresher may write the acquired image meanwhile,
-+      // and the command buffer reading it is committed on the same queue before any later write to it.
-+      uint32_t mailbox_index;
-+      GuestOutputProperties properties;
-+      GuestOutputPaintConfig paint_config;
-+      std::unique_lock<std::mutex> consumer_lock =
-+          ConsumeGuestOutput(mailbox_index, &properties, &paint_config);
-+      id<MTLTexture> guest_output = mailbox_index < kGuestOutputMailboxSize
-+                                        ? guest_output_textures_[mailbox_index]
-+                                        : nil;
-+      if (guest_output) {
-+        const GuestOutputPaintFlow flow =
-+            GetGuestOutputPaintFlow(properties, drawable_width, drawable_height, drawable_width,
-+                                    drawable_height, paint_config);
-+        if (flow.effect_count) {
-+          // Bilinear to the final size and place, whatever effects the configuration asked for.
-+          const std::pair<uint32_t, uint32_t>& size = flow.effect_output_sizes[flow.effect_count - 1];
-+          MTLViewport viewport = {double(flow.output_x), double(flow.output_y), double(size.first),
-+                                  double(size.second), 0.0, 1.0};
-+          [encoder setViewport:viewport];
-+          const bool hdr_target = drawable.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm;
-+          [encoder setRenderPipelineState:hdr_target ? paint_hdr_pipeline_ : paint_pipeline_];
-+          if (hdr_target) {
-+            struct { float sdr_nits; uint32_t is_pq, gamma22; } c{
-+                hdr_state.sdr_white_nits, properties.hdr.is_pq && guest_output.pixelFormat == MTLPixelFormatRGB10A2Unorm,
-+                hdr_state.sdr_pure_gamma_2_2};
-+            [encoder setFragmentBytes:&c length:sizeof(c) atIndex:0];
-+          }
-+          [encoder setFragmentTexture:guest_output atIndex:0];
-+          [encoder setFragmentSamplerState:paint_sampler_ atIndex:0];
-+          [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-+        }
-+      }
-+      if (execute_ui_drawers) {
-+        [encoder setViewport:MTLViewport{0.0, 0.0, double(drawable_width), double(drawable_height), 0.0, 1.0}];
-+        MetalUIDrawContext ui_draw_context(*this, drawable_width, drawable_height, encoder,
-+                                           drawable.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm,
-+                                           hdr_state.sdr_white_nits, hdr_state.sdr_pure_gamma_2_2);
-+        ExecuteUIDrawersFromUIThread(ui_draw_context);
-+      }
-+      [encoder endEncoding];
-+      CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
-+      [command_buffer presentDrawable:drawable];
-+      [command_buffer commit];
-+    }
++    id<MTLCommandBuffer> command_buffer = EncodePaint(drawable, guest_output, placement, execute_ui_drawers, hdr_state);
++    CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
++    [command_buffer presentDrawable:drawable];
++    [command_buffer commit];
 +    return PaintResult::kPresented;
 +  }
 +}

@@ -76,6 +76,10 @@ struct GraphicsView: View {
                 resolutionRow
                 Divider()
                 SettingRow(setting: Catalogue.fps)
+                if metal {
+                    Divider()
+                    frameGenerationRows
+                }
                 Divider()
                 SettingRow(setting: Catalogue.vsync)
                 Divider()
@@ -108,6 +112,27 @@ struct GraphicsView: View {
                 }
                 .disabled(matches)
             }
+        }
+    }
+
+    /// MetalFX frame generation: macOS 26 and MetalFX anti-aliasing (it works from that pass's depth and motion).
+    @ViewBuilder private var frameGenerationRows: some View {
+        let macOS26 = ProcessInfo.processInfo.isOperatingSystemAtLeast(
+            OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
+        let metalFXAA = AntiAliasing.current(launcher).aa == "fsr"
+        let on = (launcher.value("frame_generation")?.asString ?? "off") != "off"
+        SettingRow(setting: Catalogue.frameGeneration, disabled: !macOS26 || !metalFXAA)
+        if !macOS26 {
+            Label("Needs macOS 26 or later.", systemImage: "exclamationmark.triangle")
+                .font(.caption).foregroundStyle(.orange)
+        } else if !metalFXAA {
+            Label("Needs MetalFX anti-aliasing (above): the frames are made from its depth and motion.",
+                  systemImage: "info.circle")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        if on && macOS26 && metalFXAA {
+            Divider()
+            SettingRow(setting: Catalogue.fpsFrameGeneration)
         }
     }
 

@@ -10,6 +10,9 @@
 // Hook addresses and the timer analysis come from LARecomp (see
 // config/frame_timing.toml).
 
+#ifdef __APPLE__
+#include <CoreGraphics/CoreGraphics.h>
+#endif
 #include "generated/default/mcla_init.h"
 
 #include "mcla_app.h"
@@ -99,9 +102,16 @@ REXCVAR_DEFINE_BOOL(mcla_pace_at_swap, true, "MCLA",
 // HALF DISPLAY (mcla_fps_frame_generation = -1): floor(97% of half the refresh rate) rendered,
 // so the presents (twice as many) stay just under what the display takes; 0 where the
 // refresh rate isn't known or is under 100 Hz, where half is under 50 and the
-// player's own cap stays.
+// player's own cap stays. On macOS from 50 Hz: the Metal backend's frame generation (MetalFX)
+// is for Macs' 60 Hz displays too (29 rendered, 58 shown; at exactly half the presents never
+// catch up after a late frame).
 int32_t MclaHalfDisplayCap(float refresh_hz) {
-  if (!(refresh_hz >= 100.0f)) {
+#ifdef __APPLE__
+  constexpr float kMinRefreshHz = 50.0f;
+#else
+  constexpr float kMinRefreshHz = 100.0f;
+#endif
+  if (!(refresh_hz >= kMinRefreshHz)) {
     return 0;
   }
   return int32_t(std::floor(double(refresh_hz) * 0.97 / 2.0));
@@ -139,11 +149,46 @@ uint64_t NowMicros();
 // Once per engine update (mcla_ui_pace_log; defined with the UI movie hooks below).
 void UiPaceLogTick();
 
-int32_t CapFromSettings() {
-  const int32_t fps = REXCVAR_GET(mcla_fps);
-  if (fps < 0 || rex::cvar::GetFlagByName("frame_generation") == "off" ||
+}  // namespace
+
+// The display's refresh rate (0 if unknown): the presenter's display reader, which has none
+// on macOS, where it is the main display's mode.
+float MclaDisplayRefreshHz() {
+  float refresh = rex::ui::Presenter::GetDisplayRefreshHz();
+#ifdef __APPLE__
+  if (!(refresh > 0.0f)) {
+    if (CGDisplayModeRef mode = CGDisplayCopyDisplayMode(CGMainDisplayID())) {
+      refresh = float(CGDisplayModeGetRefreshRate(mode));
+      CGDisplayModeRelease(mode);
+    }
+  }
+#endif
+  return refresh;
+}
+
+// Whether frame generation runs (for the cap and the settings menu): asked for, and not said
+// it can't. On macOS (the Metal backend's MetalFX frame interpolation) also only with MetalFX
+// anti-aliasing, whose depth and motion vectors it generates from: without them no frame is
+// generated, and the cap stays the player's.
+bool MclaFrameGenerationRuns() {
+  if (rex::cvar::GetFlagByName("frame_generation") == "off" ||
       rex::ui::Presenter::GetFrameGenerationStatus().state ==
           rex::ui::Presenter::FrameGenerationState::kUnavailable) {
+    return false;
+  }
+#ifdef __APPLE__
+  if (rex::cvar::GetFlagByName("mcla_anti_aliasing") != "fsr") {
+    return false;
+  }
+#endif
+  return true;
+}
+
+namespace {
+
+int32_t CapFromSettings() {
+  const int32_t fps = REXCVAR_GET(mcla_fps);
+  if (fps < 0 || !MclaFrameGenerationRuns()) {
     return fps;
   }
   const int32_t cap = REXCVAR_GET(mcla_fps_frame_generation);
@@ -163,6 +208,9 @@ int32_t CapFromSettings() {
     asked_us.store(now, std::memory_order_relaxed);
     rex::ui::Presenter::RefreshHdrDisplayInfo(asked == 0 && !(refresh > 0.0f) ? 100 : 0);
     refresh = rex::ui::Presenter::GetDisplayRefreshHz();
+  }
+  if (!(refresh > 0.0f)) {
+    refresh = MclaDisplayRefreshHz();
   }
   const int32_t half = MclaHalfDisplayCap(refresh);
   return half > 0 ? half : fps;
@@ -639,9 +687,7 @@ class ReflexSleepAssist {
       diagnosis_ = "NVIDIA Reflex is off or given up (low_latency, or the wait took too long)";
     } else if (rex::cvar::GetFlagByName("low_latency_limiter") == "fork") {
       diagnosis_ = "low_latency_limiter is fork: the game's own limiter holds the cap";
-    } else if (rex::cvar::GetFlagByName("frame_generation") != "off" &&
-               rex::ui::Presenter::GetFrameGenerationStatus().state !=
-                   rex::ui::Presenter::FrameGenerationState::kUnavailable) {
+    } else if (MclaFrameGenerationRuns()) {
       diagnosis_ = "frame generation is on: the game's own limiter holds the cap";
     } else if (fps <= 0) {
       diagnosis_ = "no frame-rate cap: the driver's own pacing has no known deadline";

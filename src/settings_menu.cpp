@@ -75,6 +75,8 @@ void MclaPcTriggersShutdown();  // src/pc_triggers.cpp: the DualSense's triggers
 #endif
 bool MclaSingleTileAvailable();  // src/render_perf.cpp
 int32_t MclaHalfDisplayCap(float refresh_hz);  // src/frame_timing.cpp
+bool MclaFrameGenerationRuns();                // src/frame_timing.cpp
+float MclaDisplayRefreshHz();                  // src/frame_timing.cpp
 bool MclaFsrAvailable();  // src/perf_options.cpp
 bool MclaFsrNextStart();  // src/perf_options.cpp
 bool MclaUpscalingAvailable();  // src/perf_options.cpp
@@ -446,6 +448,9 @@ constexpr int kFpsTargetHalfCount = int(sizeof(kFpsTargetsHalf) / sizeof(kFpsTar
 constexpr const char* kFrameGenerationValues[] = {"off", "fsr"};
 #if REX_PLATFORM_WIN32
 constexpr const char* kFrameGenerationLabels[] = {"OFF", "FSR 3.1"};
+#elif REX_PLATFORM_MAC
+// On macOS the same setting is MetalFX's frame interpolation (the Metal backend, macOS 26).
+constexpr const char* kFrameGenerationLabels[] = {"OFF", "METALFX"};
 #else
 constexpr const char* kFrameGenerationLabels[] = {"OFF", "FSR 3.1 (UNTESTED)"};
 #endif
@@ -588,7 +593,7 @@ bool FrameGenerationUnavailable() {
 }
 
 bool FrameGenerationOn() {
-  return OptionGet("frame_generation") != "off" && !FrameGenerationNo();
+  return MclaFrameGenerationRuns();
 }
 
 // The low latency row: the SDK's status (the driver's feature, which GPU, working or not).
@@ -616,7 +621,7 @@ FpsMode CurrentFpsMode() {
     return FpsMode::kNormal;
   }
 #if !REX_PLATFORM_PS5
-  if (MclaHalfDisplayCap(rex::ui::Presenter::GetDisplayRefreshHz()) > 0) {
+  if (MclaHalfDisplayCap(MclaDisplayRefreshHz()) > 0) {
     return FpsMode::kHalf;
   }
 #endif
@@ -934,12 +939,12 @@ bool RestartOnly(const char* option) {
 
 #if REX_PLATFORM_MAC
 // On macOS the pause menu has only what changes during play: the options read at start are the launcher's
-// (launcher/mac, or mcla.toml), and the rows for what a Mac doesn't have go (FSR 3.1 frame generation, NVIDIA
-// Reflex and AMD Anti-Lag 2, FSR's sharpening, which MetalFX doesn't take, single-tile rendering where it can't
-// be had). The menus' item lists are replaced
+// (launcher/mac, or mcla.toml), and the rows for what a Mac doesn't have go (NVIDIA Reflex and AMD Anti-Lag 2,
+// FSR's sharpening, which MetalFX doesn't take, single-tile rendering where it can't be had). Frame generation
+// stays: MetalFX's on the Metal backend (the row says why where it can't run). The menus' item lists are replaced
 // once, before the submenus are made, so every lookup by row index sees the same rows.
 bool ShownOnMac(const ItemDef& item) {
-  static constexpr const char* kNotOnMac[] = {"frame_generation", "low_latency", "temporal_aa_sharpness"};
+  static constexpr const char* kNotOnMac[] = {"low_latency", "temporal_aa_sharpness"};
   for (const char* option : kNotOnMac) {
     if (std::strcmp(item.option, option) == 0) return false;
   }
@@ -1198,7 +1203,7 @@ std::string ItemValueLabelFull(const ItemDef& item, int index) {
       }
       char buffer[96];
       if (item.half_first && index == 0) {
-        const int32_t cap = MclaHalfDisplayCap(rex::ui::Presenter::GetDisplayRefreshHz());
+        const int32_t cap = MclaHalfDisplayCap(MclaDisplayRefreshHz());
         std::snprintf(buffer, sizeof buffer, "HALF DISPLAY %d", int(cap));
         return buffer;
       }
