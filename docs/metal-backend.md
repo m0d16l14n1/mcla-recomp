@@ -812,5 +812,19 @@ and 60.0 FPS against 47.5 and 50.7 (the second run held 60 with no hitch, its lo
 free roam at sunset, 59.2 FPS. Pictures checked: races and a sunset drive, no z-fighting or flicker on decals,
 plates, road markings and shadows. Off brings the calls back.
 
-Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
-second), every mode with no warning or error.
+Check after the pass (a VM running, before the inlining): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation
+29.0 (57.9 shown a second), every mode with no warning or error.
+
+The modes again after the inlining (one race each, cooled to nominal first, M5 Air):
+
+| mode | FPS | GPU ms | command thread ms | notes |
+|---|---|---|---|---|
+| MSAA 2x, 60 | 39.5 | 19.4 | 24.9 | was about 30 |
+| TAA, 60 | 47.4 | 17.3 | 20.0 | |
+| MetalFX Quality, 60 | 51.7 | 15.6 | 17.7 | 18 hitches (texture streaming) |
+| MetalFX Performance, 60 | 58.9 | 13.7 | 13.9 | 1 hitch, longest frame 35 ms; was 45 to 50 |
+| MetalFX Performance, uncapped | 56.9 | 15.1 | 16.1 | |
+| frame generation (30 drawn) | 29.0 | 16.1 | 10.6 | |
+| no AA, 60 | 59.7 | 20.1 | 12.4 | no hitch |
+
+No warning or error, no new pipeline in the race and no draw left out in any of them.

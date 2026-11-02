@@ -126,8 +126,8 @@ struct Suggestion {
         if mac.tier == .base {
             return Suggestion(antiAliasing: "fsr", upscaling: "performance", fps: 60,
                               why: "Measured on an M5 MacBook Air with MetalFX Performance: about 90 FPS in the city when "
-                                 + "cool, 45 to 57 in a race once it is warm (a fanless Mac slows down as it heats). For "
-                                 + "the smoothest motion there, turn on frame generation: 30 drawn, 60 shown.")
+                                 + "cool, close to 60 in a race (a fanless Mac slows down as it heats, so a long session "
+                                 + "can dip). For the steadiest motion, turn on frame generation: 30 drawn, 60 shown.")
         }
         // The game's command thread takes about 8 ms of CPU a frame on an M5, so even a big GPU tops out near
         // 110 FPS: 60 is the steady choice, and a 120 Hz screen shows 60 evenly.
