@@ -5322,7 +5322,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,322 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -5347,6 +5347,7 @@ new file mode 100644
 +
 +#import <Metal/Metal.h>
 +#import <QuartzCore/CAMetalLayer.h>
++#import <MetalFX/MetalFX.h>
 +
 +#include <array>
 +#include <atomic>
@@ -5495,6 +5496,17 @@ new file mode 100644
 +  };
 +  id<MTLCommandBuffer> EncodePaint(id<CAMetalDrawable> target, id<MTLTexture> image, const PaintPlacement& placement,
 +                                   bool ui, const HdrOutputState& hdr_state);
++  // The picture enlarged by MetalFX's spatial upscaler (metal_present_scaling), nil: painted as it is. One output
++  // texture: paints are encoded one at a time on one queue (the frame generation thread's and the UI thread's
++  // never at once), so each reads it before the next writes.
++  id<MTLTexture> SpatialUpscale(id<MTLCommandBuffer> command_buffer, id<MTLTexture> image,
++                                const PaintPlacement& placement);
++  std::mutex spatial_mutex_;
++  id<MTLFXSpatialScaler> spatial_ = nil;
++  id<MTLTexture> spatial_output_ = nil;
++  uint32_t spatial_in_[2] = {}, spatial_out_[2] = {};
++  MTLPixelFormat spatial_format_ = MTLPixelFormatInvalid;
++  bool spatial_failed_ = false;
 +  // Frame generation's present thread: the UI thread copies a new frame and the generated one before it into a
 +  // slot of fg_copies_ ([0] generated, [1] the new frame) and leaves them to the thread, which waits for drawables
 +  // (two a frame, more than the layer's three let the UI thread have without waiting) and presents them half the
@@ -5637,7 +5649,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,1038 @@
+@@ -0,0 +1,1101 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -5675,6 +5687,10 @@ new file mode 100644
 +#import <AppKit/AppKit.h>
 +#import <QuartzCore/QuartzCore.h>
 +
++REXCVAR_DEFINE_STRING(metal_present_scaling, "metalfx", "GPU/Metal",
++    "How the game's picture (720p times resolution_scale, the HUD in it) is enlarged to the window or screen: "
++    "metalfx (MetalFX's spatial upscaler, then the bilinear paint at its size) or bilinear")
++    .allowed({"metalfx", "bilinear"});
 +REXCVAR_DEFINE_STRING(metal_present_capture, "", "GPU/Metal",
 +    "Development: write what the presenter paints (the guest output and the UI overlays) to this PPM file, at most "
 +    "every 2 seconds");
@@ -6445,8 +6461,15 @@ new file mode 100644
 +  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 +  pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 +  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-+  id<MTLRenderCommandEncoder> encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
++  id<MTLRenderCommandEncoder> encoder = nil;
 +  const bool hdr_target = target.texture.pixelFormat == MTLPixelFormatBGR10A2Unorm;
++  // Enlarged by MetalFX's spatial upscaler first (before the pass: it is compute work), then painted 1:1.
++  if (image && placement.draw) {
++    if (id<MTLTexture> up = SpatialUpscale(command_buffer, image, placement)) {
++      image = up;
++    }
++  }
++  if (!encoder) encoder = [command_buffer renderCommandEncoderWithDescriptor:pass];
 +  if (image && placement.draw) {
 +    // Bilinear to the final size and place, whatever effects the configuration asked for.
 +    [encoder setViewport:placement.viewport];
@@ -6465,6 +6488,58 @@ new file mode 100644
 +  }
 +  [encoder endEncoding];
 +  return command_buffer;
++}
++
++id<MTLTexture> MetalPresenter::SpatialUpscale(id<MTLCommandBuffer> command_buffer, id<MTLTexture> image,
++                                              const PaintPlacement& placement) {
++  if (REXCVAR_GET(metal_present_scaling) != "metalfx") return nil;
++  const uint32_t out_width = uint32_t(placement.viewport.width + 0.5), out_height = uint32_t(placement.viewport.height + 0.5);
++  // Only to enlarge (a picture shown at its size or smaller is painted as it is), up to the upscaler's 2x a side
++  // and a bit (a 720p picture on a 1440p window; more is enlarged by 2x and the rest bilinear).
++  if (out_width <= image.width || out_height <= image.height) return nil;
++  const uint32_t width = std::min<uint32_t>(out_width, uint32_t(image.width) * 2);
++  const uint32_t height = std::min<uint32_t>(out_height, uint32_t(image.height) * 2);
++  std::lock_guard<std::mutex> lock(spatial_mutex_);
++  if (spatial_failed_) return nil;
++  if (!spatial_ || spatial_in_[0] != image.width || spatial_in_[1] != image.height || spatial_out_[0] != width ||
++      spatial_out_[1] != height || spatial_format_ != image.pixelFormat) {
++    spatial_ = nil; spatial_output_ = nil;
++    if (![MTLFXSpatialScalerDescriptor supportsDevice:device_]) {
++      spatial_failed_ = true;
++      REXGPU_WARN("Metal presenter: MetalFX spatial upscaling is not supported on this GPU (bilinear)");
++      return nil;
++    }
++    MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
++    desc.inputWidth = image.width; desc.inputHeight = image.height;
++    desc.outputWidth = width; desc.outputHeight = height;
++    desc.colorTextureFormat = image.pixelFormat; desc.outputTextureFormat = image.pixelFormat;
++    // SDR in sRGB gamma, HDR in PQ: both perceptual encodings.
++    desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
++    spatial_ = [desc newSpatialScalerWithDevice:device_];
++    if (spatial_) {
++      MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat
++                                                                                    width:width height:height
++                                                                                mipmapped:NO];
++      td.usage = spatial_.outputTextureUsage | MTLTextureUsageShaderRead;
++      td.storageMode = MTLStorageModePrivate;
++      spatial_output_ = [device_ newTextureWithDescriptor:td];
++    }
++    if (!spatial_ || !spatial_output_) {
++      spatial_failed_ = true; spatial_ = nil;
++      REXGPU_WARN("Metal presenter: no MetalFX spatial upscaler for {}x{} to {}x{} (bilinear)", uint32_t(image.width),
++                  uint32_t(image.height), width, height);
++      return nil;
++    }
++    spatial_in_[0] = uint32_t(image.width); spatial_in_[1] = uint32_t(image.height);
++    spatial_out_[0] = width; spatial_out_[1] = height; spatial_format_ = image.pixelFormat;
++    REXGPU_INFO("Metal presenter: MetalFX spatial upscaling {}x{} to {}x{} (shown at {}x{})", uint32_t(image.width),
++                uint32_t(image.height), width, height, out_width, out_height);
++  }
++  spatial_.colorTexture = image;
++  spatial_.outputTexture = spatial_output_;
++  spatial_.inputContentWidth = image.width; spatial_.inputContentHeight = image.height;
++  [spatial_ encodeToCommandBuffer:command_buffer];
++  return spatial_output_;
 +}
 +
 +void MetalPresenter::FgPresentThread() {

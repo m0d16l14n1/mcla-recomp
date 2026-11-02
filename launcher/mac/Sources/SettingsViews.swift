@@ -84,6 +84,10 @@ struct GraphicsView: View {
                 SettingRow(setting: Catalogue.vsync)
                 Divider()
                 SettingRow(setting: Catalogue.anisotropic)
+                if metal {
+                    Divider()
+                    SettingRow(setting: Catalogue.screenScaling)
+                }
             }
             SettingsCard(title: "Effects", settings: Catalogue.detail)
             SettingsCard(title: "Detail and distance", settings: Catalogue.distance,

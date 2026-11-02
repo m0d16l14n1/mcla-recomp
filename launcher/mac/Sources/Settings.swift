@@ -92,6 +92,13 @@ enum Catalogue {
     ]), n(5),
         "Keeps roads and walls sharp when seen at an angle. 16x costs little on Apple GPUs.")
 
+    static let screenScaling = Setting("metal_present_scaling", "Screen scaling", .choice([
+        c("MetalFX (sharper)", s("metalfx")), c("Bilinear (softer)", s("bilinear")),
+    ]), s("metalfx"),
+        "How the game's 720p picture is enlarged to the window or screen (a Retina or 4K screen has two or three "
+        + "times its pixels across). MetalFX's spatial upscaler keeps edges and the HUD's text sharp; bilinear is "
+        + "the plain stretch, softer. Metal only.")
+
     static let shadows = Setting("mcla_shadows", "Shadows", .toggle, on(true), live: true,
         "Real-time shadows of the city, cars and people.")
     static let foliageShadows = Setting("mcla_foliage_shadows", "Tree and plant shadows", .toggle, on(true), live: true,

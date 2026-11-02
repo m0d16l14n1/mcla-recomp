@@ -767,5 +767,16 @@ and 55.4 in those drives). Works with `metal_encoder_thread` too.
   the narrower passes, but 50.6 and 50.2 FPS against 50.0 and 49.9 (GPU 20.3 to 20.5 ms either way): the GPU
   skips tiles nothing touched. Kept as an option.
 
+*The picture enlarged with MetalFX* (`--metal_present_scaling`, `metalfx` by default, or `bilinear`; the macOS
+launcher's Screen scaling). The game's picture is 1280x720 and the presenter stretched it bilinearly to the window
+(2560x1440 for a 1280x720-point window on a Retina panel): soft, the HUD's text too. Now MetalFX's spatial upscaler
+(`MTLFXSpatialScaler`, perceptual mode, SDR and PQ alike) enlarges it by up to 2x a side before the paint (the rest,
+on a bigger screen, bilinear); it only enlarges. Edge detail in the window (mean |Laplacian|) 3.49 against 1.41,
+with no halos on the HUD's digits. Cost not measurable: Performance 60 45.7 and 47.4 FPS against 47.8 and 45.2
+bilinear, frame generation 60.0 shown a second either way, GPU 20.5 to 21.3 ms in all (`20261103-025919-spatial2`
+in out/bench-race). The SDK's FSR 1 and CAS `present_effect` filters stay unbuilt on macOS (their macro changes
+the presenter's class layout in shared headers). A paint capture (`metal_present_capture`) every 2 s costs a
+freeze each (an 11 MB readback written on Metal's completion thread): not for benchmarks.
+
 Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
 second), every mode with no warning or error.
