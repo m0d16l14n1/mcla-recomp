@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,727 @@
+@@ -0,0 +1,759 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -176,6 +176,11 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_taa_upscale, true, "GPU/Metal",
 +                    "MetalFX upscaling with temporal_aa_upscale above 1 (the game's FSR upscaling setting): the scene drawn "
 +                    "into the render-size corner of its targets and stretched back by its resolves");
++REXCVAR_DEFINE_INT32(metal_slow_frame_ms, 50, "GPU/Metal",
++    "Log a frame whose swap came this many ms or more after the last one, with what the command thread did in it "
++    "(CPU time, waits for the GPU, shaders and pipelines made, texture loads) and how long it waited for the game; "
++    "0: off. At most 20 a 10 s")
++    .range(0, 10000);
 +REXCVAR_DEFINE_BOOL(metal_resolves, true, "GPU/Metal", "Resolves (diagnostic: false skips them)");
 +REXCVAR_DEFINE_DOUBLE(metal_motion_blur_fps, 60.0, "GPU/Metal",
 +    "MCLA's motion blur as long as at this frame rate at most: the game blurs by one frame's motion, so at 30 FPS "
@@ -653,6 +658,33 @@ new file mode 100644
 +    const double interval = std::chrono::duration<double>(now - last_swap_time_).count();
 +    if (last_swap_time_ != std::chrono::steady_clock::time_point{} && interval < 0.25)
 +      frame_interval_ = frame_interval_ > 0.0 ? frame_interval_ * 0.9 + interval * 0.1 : interval;
++    // The slow frame log: where a long frame's time went on this thread.
++    const uint32_t translated = shader_compiler_ ? shader_compiler_->stats().translated.load() : 0;
++    const uint64_t translate_us = shader_compiler_ ? shader_compiler_->stats().translate_us.load() : 0;
++    const int32_t slow_ms = REXCVAR_GET(metal_slow_frame_ms);
++    if (slow_ms > 0 && draw_ && last_swap_time_ != std::chrono::steady_clock::time_point{} &&
++        interval * 1000.0 >= slow_ms) {
++      if (now - slow_window_ > std::chrono::seconds(10)) {
++        slow_window_ = now;
++        slow_logged_ = 0;
++      }
++      if (slow_logged_++ < 20) {
++        const MetalDraw::FrameReport& r = draw_->last_frame();
++        const double wall_ms = interval * 1000.0;
++        const double cpu_ms = r.cpu_us / 1000.0, wait_ms = r.wait_us / 1000.0;
++        REXGPU_INFO("Metal slow frame: {:.1f} ms (swap {}): command thread CPU {:.1f} ms, waiting for the GPU {:.1f} ms, "
++                    "the rest {:.1f} ms (waiting for the game, or not scheduled); {} shaders translated ({:.1f} ms), "
++                    "{} pipelines made ({:.1f} ms), {:.1f} ms waited for stored pipelines, {} draws left out; {} texture "
++                    "loads ({} made from resolves, {} rows from memory), {:.1f} MB of textures hashed, {:.1f} MB of "
++                    "vertices copied; {} passes, {} EDRAM transfers",
++                    wall_ms, swaps_ + 1, cpu_ms, wait_ms, std::max(0.0, wall_ms - cpu_ms - wait_ms),
++                    translated - slow_translated_, (translate_us - slow_translate_us_) / 1000.0, r.pipelines,
++                    r.pipeline_us / 1000.0, r.prebuilt_wait_us / 1000.0, r.async_skipped, r.texture_loads, r.composed,
++                    r.rows_loaded, r.texture_hashed / 1048576.0, r.snapshot_copied / 1048576.0, r.passes, r.transfers);
++      }
++    }
++    slow_translated_ = translated;
++    slow_translate_us_ = translate_us;
 +    last_swap_time_ = now;
 +  }
 +  ++stats_swaps_;
@@ -862,11 +894,12 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,499 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
 +#include "metal_shaders.h"
++#include "metal_encoder_queue.h"
 +#include <rex/graphics/pipeline/texture/info.h>
 +#include <rex/graphics/pipeline/texture/util.h>
 +#include <rex/graphics/pipeline/texture/conversion.h>
@@ -896,6 +929,13 @@ new file mode 100644
 +  // false: the caller stores it.
 +  bool WriteFence(uint32_t address, uint32_t value);
 +  void EndFrame();
++  // What the frame just ended cost the command thread (for the slow frame log, metal_slow_frame_ms).
++  struct FrameReport {
++    uint64_t cpu_us = 0, wait_us = 0, pipeline_us = 0, prebuilt_wait_us = 0, texture_hashed = 0, snapshot_copied = 0;
++    uint64_t texture_loads = 0, composed = 0, rows_loaded = 0, pipelines = 0, async_skipped = 0, passes = 0,
++             transfers = 0;
++  };
++  const FrameReport& last_frame() const { return frame_report_; }
 +  // Temporal anti-aliasing with MetalFX (the SDK's temporal_aa, which the fork's mcla_anti_aliasing = fsr
 +  // turns on): the jitter of the scene's draws (the command processor's TaaJitterNdcOffset), and the pass
 +  // before the game's motion blur draw. TaaRun returns the status for temporal_aa_debug 4 ('+' when it ran).
@@ -1059,10 +1099,13 @@ new file mode 100644
 +  // An entry is good for the frame it was looked up in, and in later frames while the write watch of its
 +  // texture (if it has one armed) has seen no CPU write.
 +  struct TextureWatch;
++  struct TextureEntry;
 +  struct FastTexture {
 +    std::array<uint32_t, 7> key{}; uint64_t epoch = 0, frame = 0; id<MTLTexture> view = nil; uint32_t start = 0, end = 0;
 +    TextureWatch* watch = nullptr;
++    TextureEntry* owner = nullptr;  // the texture entry it came from (its last use is kept for eviction)
 +  };
++  TextureEntry* last_texture_entry_ = nullptr;
 +  TextureWatch* last_texture_watch_ = nullptr;
 +  // The memory range of the texture TextureSlow last returned: a resolve or a new texture over it drops only
 +  // the lookups of textures there (a resolve dropped them all, some 50 times a frame).
@@ -1078,6 +1121,7 @@ new file mode 100644
 +  // Swizzle views by texture, then by swizzle bits (dropping a texture's views was a scan of all).
 +  std::unordered_map<uintptr_t, std::unordered_map<uint32_t, id<MTLTexture>>> views_;
 +  id<MTLSamplerState> Sampler(const MetalSamplerBinding& binding);
++  id<MTLSamplerState> SamplerSlow(const MetalSamplerBinding& binding);
 +  uint32_t Snapshot(uint32_t address, uint32_t size);
 +  bool SnapshotDraw(Shader& vertex, PrimitiveProcessor::ProcessingResult& primitive);
 +  void Bind(Shader& shader, Shader::Translation* translation, bool vertex, const std::vector<uint8_t>& system);
@@ -1101,6 +1145,8 @@ new file mode 100644
 +  std::shared_ptr<std::atomic<uint64_t>> gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  std::chrono::steady_clock::time_point stats_start_ = std::chrono::steady_clock::now();
 +  uint64_t stats_frames_ = 0, wait_us_ = 0, stats_cpu_us_ = 0;
++  FrameReport frame_report_, frame_base_;
++  uint64_t frame_cpu_us_ = 0;
 +  std::shared_ptr<std::atomic<uint64_t>> gpu_errors_ = std::make_shared<std::atomic<uint64_t>>(0);
 +  size_t snapshot_used_ = 0;
 +  // Offset in the snapshot buffer and the hash of the copied data, by address and size.
@@ -1139,7 +1185,39 @@ new file mode 100644
 +  std::unordered_map<const Shader::Translation*, id<MTLLibrary>> library_cache_;
 +  id<MTLLibrary> CachedLibrary(const Shader::Translation* translation);
 +  std::array<std::array<void*, 32>, 2> bound_textures_{}, bound_samplers_{};
-+  std::array<std::array<id<MTLTexture>, 32>, 2> draw_textures_{};  // this draw's textures, VS then PS
++  // This draw's textures, VS then PS: not retained (the views stay in views_ for the frame at least).
++  std::array<std::array<__unsafe_unretained id<MTLTexture>, 32>, 2> draw_textures_{};
++  // The open encoder's fixed-function state as last set (metal_encoder_state_cache): unchanged state between
++  // draws in a pass is not sent again. Reset with a new encoder.
++  struct EncoderState {
++    void* encoder = nullptr;
++    void* pipeline = nullptr;
++    void* depth_stencil = nullptr;
++    uint32_t stencil_front = UINT32_MAX, stencil_back = UINT32_MAX;
++    int32_t clip = -1, winding = -1, cull = -1;
++    std::array<double, 6> viewport{-1, -1, -1, -1, -1, -1};
++    std::array<NSUInteger, 4> scissor{~NSUInteger(0), 0, 0, 0};
++    std::array<float, 4> blend{-1.0f, -1.0f, -1.0f, -1.0f};
++    std::array<void*, 2> memory{};  // slot 5 of each stage
++  } enc_state_;
++  // Samplers by their fetch constant's words and the binding's filters (Sampler's work was a fifth of Bind).
++  struct FastSampler { std::array<uint32_t, 8> key{}; id<MTLSamplerState> state = nil; };
++  std::array<FastSampler, 1024> fast_samplers_;
++  // Memory hashed for textures this frame (a texture's memory may be fetched with several layouts).
++  struct FrameHash { uint32_t start, length; uint64_t hash; };
++  std::vector<FrameHash> frame_hashes_;
++  uint64_t frame_hashes_frame_ = UINT64_MAX;
++  // The render encoder's per-draw calls on a thread of their own (metal_encoder_thread): the encoder handed to it
++  // (null: none, or the command thread's again), and what queued calls may still use that would otherwise go.
++  std::unique_ptr<EncoderQueue> equeue_;
++  void* queued_encoder_ = nullptr;
++  uint64_t equeue_cpu_us_ = 0, end_us_ = 0, commit_us_ = 0;
++  uint32_t equeue_batch_ = 96;
++  std::vector<id> retired_;
++  EncoderQueue::Cmd* Queue(EncoderQueue::Op op);
++  // Each shader's float constants as runs of consecutive registers (first, count), and per stage the last used.
++  std::unordered_map<const Shader*, std::vector<std::pair<uint16_t, uint16_t>>> float_runs_;
++  std::array<std::pair<const Shader*, const std::vector<std::pair<uint16_t, uint16_t>>*>, 2> last_float_runs_{};
 +  std::array<uint32_t, 2> draw_texture_count_{};
 +  // Generations of the vertex floats, pixel floats, fetch and bool/loop constants, and per stage what the
 +  // open encoder was last given: the float constants' gather and compare are skipped when neither the
@@ -1166,11 +1244,15 @@ new file mode 100644
 +    bool has_hash = false, has_range = false;
 +    uint64_t hash = 0, checked_frame = 0;
 +    uint32_t range_start = 0, range_length = 0;
++    uint64_t used_frame = 0;  // the last frame a draw looked it up in (least recently used go first)
 +    std::unique_ptr<TextureWatch> watch;
 +  };
 +  std::unordered_map<std::string, TextureEntry> texture_entries_;
 +  size_t cached_textures_ = 0;
 +  void DropTexture(TextureEntry& entry);
++  // Over metal_texture_cache_size textures: the least recently used are dropped, down to three quarters of it.
++  void EvictTextures(size_t keep);
++  uint64_t textures_evicted_ = 0;
 +  // One buffer for the vertex and index snapshots: a ring per frame slot, then the persistent region, where a
 +  // range the CPU leaves alone stays from frame to frame (metal_persistent_vertex_size).
 +  static constexpr size_t kSnapshotRing = size_t(64) << 20, kSnapshotPersistent = size_t(192) << 20;
@@ -1316,7 +1398,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3309 @@
+@@ -0,0 +1,3569 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1348,6 +1430,9 @@ new file mode 100644
 +REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal", "Resolves write guest memory (diagnostic: false keeps them on the GPU only)");
 +REXCVAR_DEFINE_BOOL(metal_draw_cpu_only, false, "GPU/Metal", "Draws stop after the primitive processor and the vertex snapshot (diagnostic)");
 +REXCVAR_DEFINE_BOOL(metal_texture_loads, true, "GPU/Metal", "Load textures from guest memory (diagnostic: false binds a blank texture)");
++REXCVAR_DEFINE_INT32(metal_texture_cache_size, 4096, "GPU/Metal",
++    "Textures kept loaded; over it, the least recently used are dropped (to three quarters of it)")
++    .range(256, 65536);
 +REXCVAR_DEFINE_BOOL(metal_texture_mips, true, "GPU/Metal",
 +                    "Load textures' mip levels and sample them with the fetch's mip filter and anisotropic "
 +                    "filtering (anisotropic_override); false: the base level only, as before (shimmering "
@@ -1408,6 +1493,18 @@ new file mode 100644
 +    "A texture lookup stays good across frames while the texture's write watch has seen no CPU write");
 +REXCVAR_DEFINE_BOOL(metal_constant_generations, true, "GPU/Metal",
 +    "Shader constants are resent to an encoder only when their registers (or the shader) changed since");
++REXCVAR_DEFINE_BOOL(metal_encoder_state_cache, true, "GPU/Metal",
++    "Draws in a render pass send only the fixed-function state (pipeline, depth-stencil, viewport, scissor, "
++    "culling, blend colour) that changed since the previous draw, and samplers come from a lookup by fetch constant");
++REXCVAR_DEFINE_BOOL(metal_encoder_thread, false, "GPU/Metal",
++    "The render encoder's per-draw Metal calls (state, bindings, the draw) are made on a thread of their own while "
++    "the command processor goes on with the next draw (restart to change). Off: on an M5 MacBook Air it moved 6 ms "
++    "a frame of calls off the command thread in a race and gained nothing (the CPU and GPU share one power budget)");
++REXCVAR_DEFINE_INT32(metal_encoder_batch, 96, "GPU/Metal",
++    "With metal_encoder_thread: the queued Metal calls are handed to the encoder thread once this many are waiting "
++    "(and at the end of each render pass)");
++REXCVAR_DEFINE_INT32(metal_encoder_spin, 64, "GPU/Metal",
++    "With metal_encoder_thread: how long (yields) the encoder thread looks for more work before it sleeps");
 +REXCVAR_DEFINE_BOOL(metal_debug_labels, false, "GPU/Metal",
 +    "Label every encoder with what it does (render pass targets, texture loads, resolves, clears) for GPU traces");
 +REXCVAR_DEFINE_BOOL(metal_debug_capture, false, "GPU/Metal", "Dump the next swap frame like metal_debug_frame (for pad scripts: set metal_debug_capture true)");
@@ -1548,6 +1645,11 @@ new file mode 100644
 +  Submit(); primitives_.reset(); shared_.reset();
 +}
 +bool MetalDraw::Initialize() {
++  if (REXCVAR_GET(metal_encoder_thread)) {
++    equeue_ = std::make_unique<EncoderQueue>();
++    equeue_batch_ = uint32_t(std::max(1, REXCVAR_GET(metal_encoder_batch)));
++    equeue_->Start(uint32_t(std::max(0, REXCVAR_GET(metal_encoder_spin))));
++  }
 +  snapshot_buffer_ = [device_ newBufferWithLength:2 * kSnapshotRing + kSnapshotPersistent options:MTLResourceStorageModeShared];
 +  if (REXCVAR_GET(metal_constant_ring)) {
 +    constant_ring_ = [device_ newBufferWithLength:2 * kConstantRing options:MTLResourceStorageModeShared];
@@ -1592,12 +1694,21 @@ new file mode 100644
 +  return primitives_->Initialize();
 +}
 +void MetalDraw::EndEncoder() {
++  if (equeue_ && queued_encoder_) {
++    // The encoder thread's calls into it first; then what they used may go.
++    equeue_->Drain();
++    queued_encoder_ = nullptr;
++  }
++  retired_.clear();
 +  if (encoder_) {
 +    // The command buffer before a pass takes texture work only while that pass is open (a later encoder may get
 +    // the same address).
 +    if (pre_encoder_ == (__bridge void*)encoder_) pre_encoder_ = nullptr;
++    const auto end_start = std::chrono::steady_clock::now();
 +    [encoder_ endEncoding]; encoder_ = nil;
++    end_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - end_start).count());
 +    bound_encoder_ = nullptr;  // A new encoder may be allocated at the same address.
++    enc_state_.encoder = nullptr;
 +    if (commands_ && DebugFrame() && REXCVAR_GET(metal_debug_profile)) ProfileCut(pass_label_, draws_ - pass_first_draw_);
 +  }
 +  attachments_ = {};
@@ -1619,7 +1730,9 @@ new file mode 100644
 +    if (done.status == MTLCommandBufferStatusError && errors->fetch_add(1) < 16)
 +      REXGPU_ERROR("Metal draw command buffer failed: {}", done.error.localizedDescription.UTF8String);
 +  }];
++  const auto commit_start = std::chrono::steady_clock::now();
 +  [pre_commands_ commit];
++  commit_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - commit_start).count());
 +  last_committed_ = pre_commands_; pre_commands_ = nil; pre_encoder_ = nullptr;
 +}
 +id<MTLCommandBuffer> MetalDraw::TextureWorkCommands() {
@@ -1645,7 +1758,9 @@ new file mode 100644
 +      if (done.status == MTLCommandBufferStatusError && errors->fetch_add(1) < 16)
 +        REXGPU_ERROR("Metal draw command buffer failed: {}", done.error.localizedDescription.UTF8String);
 +    }];
++    const auto commit_start = std::chrono::steady_clock::now();
 +    [commands_ commit];
++    commit_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - commit_start).count());
 +    last_committed_ = commands_; commands_ = nil;
 +  }
 +  // Command buffers keep what they use alive; the uploads list only has to outlive the encoding.
@@ -1689,6 +1804,25 @@ new file mode 100644
 +    [frame_done_[slot_] waitUntilCompleted]; frame_done_[slot_] = nil;
 +    wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - wait_start).count());
 +  }
++  {
++    // This frame's share of the 150-frame counters (they are reset below every 150 frames).
++    timespec cpu{}; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
++    const uint64_t cpu_us = uint64_t(cpu.tv_sec) * 1000000 + uint64_t(cpu.tv_nsec) / 1000;
++    FrameReport now;
++    now.cpu_us = 0; now.wait_us = wait_us_; now.pipeline_us = pipeline_us_; now.prebuilt_wait_us = prebuilt_wait_us_;
++    now.texture_hashed = texture_hashed_; now.snapshot_copied = snapshot_copied_; now.texture_loads = texture_loads_;
++    now.composed = textures_composed_; now.rows_loaded = texture_rows_loaded_; now.pipelines = pipelines_created_;
++    now.async_skipped = async_skipped_; now.passes = passes_; now.transfers = edram_transfers_;
++    auto& r = frame_report_; const auto& b = frame_base_;
++    r.cpu_us = frame_cpu_us_ ? cpu_us - frame_cpu_us_ : 0; frame_cpu_us_ = cpu_us;
++    r.wait_us = now.wait_us - b.wait_us; r.pipeline_us = now.pipeline_us - b.pipeline_us;
++    r.prebuilt_wait_us = now.prebuilt_wait_us - b.prebuilt_wait_us; r.texture_hashed = now.texture_hashed - b.texture_hashed;
++    r.snapshot_copied = now.snapshot_copied - b.snapshot_copied; r.texture_loads = now.texture_loads - b.texture_loads;
++    r.composed = now.composed - b.composed; r.rows_loaded = now.rows_loaded - b.rows_loaded;
++    r.pipelines = now.pipelines - b.pipelines; r.async_skipped = now.async_skipped - b.async_skipped;
++    r.passes = now.passes - b.passes; r.transfers = now.transfers - b.transfers;
++    frame_base_ = stats_frames_ + 1 == 150 ? FrameReport{} : now;
++  }
 +  if (++stats_frames_ == 150) {
 +    double wall = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - stats_start_).count();
 +    if (uint32_t rejected = *static_cast<uint32_t*>(resolve_rejected_.contents)) {
@@ -1718,10 +1852,22 @@ new file mode 100644
 +    snapshot_changed_ = 0; snapshot_changed_bytes_ = 0;
 +    REXGPU_INFO("Metal frame time: {:.1f} ms a frame, GPU busy {:.1f} ms, CPU waiting for the GPU {:.1f} ms; {:.1f} texture loads ({:.1f} made from resolves, {:.0f} rows loaded for them), {:.1f} resolve textures reused, "
 +        "{:.1f} MB of vertices and indices hashed and {:.1f} MB copied ({:.0f} kept from earlier frames), {:.1f} MB of textures hashed ({:.1f} skipped by watches), "
-+        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers, {:.1f} ended for texture loads, {:.1f} loads before their pass) a frame; {} pipelines created ({:.1f} ms), {} from the storage ({:.1f} ms waited for), {} draws left out while Metal compiled",
++        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers, {:.1f} ended for texture loads, {:.1f} loads before their pass) a frame; {} pipelines created ({:.1f} ms), {} from the storage ({:.1f} ms waited for), {} draws left out while Metal compiled; {} textures evicted ({} cached)",
 +        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_ / 150.0, textures_composed_ / 150.0, texture_rows_loaded_ / 150.0, textures_reused_ / 150.0,
 +        snapshot_hashed_ / 1048576.0 / 150, snapshot_copied_ / 1048576.0 / 150, snapshot_persistent_hits_ / 150.0, texture_hashed_ / 1048576.0 / 150,
-+        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0, prebuilt_used_, prebuilt_wait_us_ / 1000.0, async_skipped_);
++        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0, prebuilt_used_, prebuilt_wait_us_ / 1000.0, async_skipped_, textures_evicted_, cached_textures_);
++    textures_evicted_ = 0;
++    REXGPU_INFO("Metal encoders ended in {:.2f} ms a frame, command buffers committed in {:.2f} ms", end_us_ / 1000.0 / 150,
++                commit_us_ / 1000.0 / 150);
++    end_us_ = 0; commit_us_ = 0;
++    if (equeue_) {
++      const uint64_t calls = equeue_->TakeCommands(), waits = equeue_->TakeDrainWaits();
++      const uint64_t wait_us = equeue_->TakeDrainWaitUs(), cpu = equeue_->ThreadCpuUs();
++      REXGPU_INFO("Metal encoder thread: {:.0f} calls a frame, {:.1f} ms of its CPU time a frame; the command thread "
++                  "waited for it {:.1f} times a frame, {:.2f} ms", calls / 150.0,
++                  equeue_cpu_us_ ? (cpu - equeue_cpu_us_) / 1000.0 / 150 : 0.0, waits / 150.0, wait_us / 1000.0 / 150);
++      equeue_cpu_us_ = cpu;
++    }
 +    if (fg_generated_ || fg_no_taa_ || fg_not_allowed_ || fg_first_ || fg_cuts_) {
 +      const uint64_t fg_us = fg_gpu_us_->exchange(0);
 +      REXGPU_INFO("Metal frame generation: {} frames generated in 150 ({:.2f} ms of GPU time each for MetalFX and the "
@@ -1751,14 +1897,43 @@ new file mode 100644
 +    rex::cvar::SetFlagByName("metal_debug_capture", "false");
 +    REXGPU_INFO("Metal debug capture: frame {}", frame_);
 +  }
-+  if (cached_textures_ > 4096) {
-+    ++texture_epoch_;
-+    for (auto& [key, entry] : texture_entries_) {
-+      entry.texture = nil; entry.cached = false; entry.has_hash = false; entry.hash = 0; entry.checked_frame = 0;
-+      entry.has_range = false;
++  // The texture cache's size: once over it, the textures no draw has used for longest are dropped. (It was
++  // emptied at once, and in a race through the city, which streams new textures in, every 10 s or so a frame
++  // then loaded its whole working set again: some 2,500 loads and 750 passes, 110 to 130 ms of this thread and
++  // a 50 to 65 ms GPU frame after it.)
++  const size_t cache_size = size_t(std::max(256, REXCVAR_GET(metal_texture_cache_size)));
++  if (cached_textures_ > cache_size) EvictTextures(cache_size * 3 / 4);
++}
++void MetalDraw::EvictTextures(size_t keep) {
++  std::vector<std::pair<uint64_t, TextureEntry*>> cached;
++  cached.reserve(cached_textures_);
++  for (auto& [key, entry] : texture_entries_)
++    if (entry.cached) cached.emplace_back(entry.used_frame, &entry);
++  if (cached.size() <= keep) { cached_textures_ = cached.size(); return; }
++  const size_t drop = cached.size() - keep;
++  std::nth_element(cached.begin(), cached.begin() + drop, cached.end(),
++                   [](const auto& a, const auto& b) { return a.first < b.first; });
++  size_t dropped = 0;
++  for (size_t i = 0; i < drop; ++i) {
++    TextureEntry& entry = *cached[i].second;
++    // Not what the last frames used (a working set larger than the cache would thrash: let it grow instead).
++    if (entry.used_frame + 2 >= frame_) continue;
++    if (entry.has_range) {
++      for (auto [it, e] = range_index_.equal_range(entry.range_start); it != e; ++it)
++        if (it->second.second == &entry) { range_index_.erase(it); break; }
 +    }
-+    cached_textures_ = 0; range_index_.clear(); max_range_length_ = 0; views_.clear();
++    DropTexture(entry);
++    ++dropped;
 +  }
++  // The fast lookups of dropped textures go too (the rest stay good).
++  for (size_t i = 0; i < fast_textures_.size(); ++i) {
++    FastTexture& f = fast_textures_[i];
++    if (f.owner && !f.owner->cached) {
++      f = FastTexture{};
++      fast_start_[i] = 0; fast_end_[i] = 0;
++    }
++  }
++  textures_evicted_ += dropped;
 +}
 +void MetalDraw::DropTexture(TextureEntry& entry) {
 +  // What a resolve over the texture's memory drops (the watch stays). The caller removes the range index entry.
@@ -1768,12 +1943,32 @@ new file mode 100644
 +}
 +void MetalDraw::DropViews(id<MTLTexture> texture) {
 +  if (!texture) return;
-+  views_.erase(reinterpret_cast<uintptr_t>((__bridge void*)texture));
++  auto found = views_.find(reinterpret_cast<uintptr_t>((__bridge void*)texture));
++  if (found == views_.end()) return;
++  // Calls still queued for the encoder thread may bind them: kept until it has made them.
++  if (queued_encoder_) for (auto& [swizzle, view] : found->second) retired_.push_back(view);
++  views_.erase(found);
++}
++EncoderQueue::Cmd* MetalDraw::Queue(EncoderQueue::Op op) {
++  if (!equeue_) return nullptr;
++  if (queued_encoder_ != (__bridge void*)encoder_) {
++    // Handed over: from here until EndEncoder only the queue uses it.
++    queued_encoder_ = (__bridge void*)encoder_;
++    equeue_->Next(EncoderQueue::Op::kEncoder).r.obj = queued_encoder_;
++  }
++  return &equeue_->Next(op);
 +}
 +void MetalDraw::InvalidateRange(uint32_t start, uint32_t length) {
 +  if (!length) return;
 +  uint64_t end = uint64_t(start) + length;
 +  DropFastTextures(start, end);  // resolved_ and textures_ change here.
++  for (size_t i = 0; i < frame_hashes_.size();) {  // hashed before this write: hashed again at the next use
++    if (frame_hashes_[i].start < end && uint64_t(frame_hashes_[i].start) + frame_hashes_[i].length > start) {
++      frame_hashes_[i] = frame_hashes_.back(); frame_hashes_.pop_back();
++    } else {
++      ++i;
++    }
++  }
 +  for (auto it = resolved_.begin(); it != resolved_.end();) {
 +    if (it->second.start < end && uint64_t(it->second.start) + it->second.length > start) {
 +      Recycle(it->second.texture);
@@ -2398,7 +2593,17 @@ new file mode 100644
 +      for (uint32_t i = 0; i < 4; ++i) if (next[i]) MarkWritten(next[i], kinds[i], y0, y1, &pass_ranges_[i]);
 +      if (depth_writes) MarkWritten(next[4], kinds[4], y0, y1, &pass_ranges_[4]);
 +    }
-+    [encoder_ setRenderPipelineState:pipeline];
++    const bool cache_state = REXCVAR_GET(metal_encoder_state_cache);
++    auto& es = enc_state_;
++    if (!cache_state || es.encoder != (__bridge void*)encoder_) {
++      es = EncoderState{};
++      es.encoder = cache_state ? (__bridge void*)encoder_ : nullptr;
++    }
++    if (es.pipeline != (__bridge void*)pipeline) {
++      if (auto* c = Queue(EncoderQueue::Op::kPipeline)) c->r.obj = (__bridge void*)pipeline;
++      else [encoder_ setRenderPipelineState:pipeline];
++      if (cache_state) es.pipeline = (__bridge void*)pipeline;
++    }
 +    auto sf = regs_.Get<reg::RB_STENCILREFMASK>();
 +    auto sb = regs_.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF);
 +    const uint64_t dk = dc.value | (uint64_t((sf.value >> 8) & 0xFFFF) << 32) | (uint64_t((sb.value >> 8) & 0xFFFF) << 48);
@@ -2425,21 +2630,64 @@ new file mode 100644
 +      }
 +      state = [device_ newDepthStencilStateWithDescriptor:desc]; depth_states_[dk] = state;
 +    }
-+    [encoder_ setDepthStencilState:state];
-+    [encoder_ setStencilFrontReferenceValue:sf.stencilref backReferenceValue:dc.backface_enable ? sb.stencilref : sf.stencilref];
++    if (es.depth_stencil != (__bridge void*)state) {
++      if (auto* c = Queue(EncoderQueue::Op::kDepthStencil)) c->r.obj = (__bridge void*)state;
++      else [encoder_ setDepthStencilState:state];
++      if (cache_state) es.depth_stencil = (__bridge void*)state;
++    }
++    const uint32_t stencil_back = dc.backface_enable ? sb.stencilref : sf.stencilref;
++    if (es.stencil_front != sf.stencilref || es.stencil_back != stencil_back) {
++      if (auto* c = Queue(EncoderQueue::Op::kStencilRef)) { c->a = sf.stencilref; c->b = stencil_back; }
++      else [encoder_ setStencilFrontReferenceValue:sf.stencilref backReferenceValue:stencil_back];
++      if (cache_state) { es.stencil_front = sf.stencilref; es.stencil_back = stencil_back; }
++    }
 +    // Clipping off (PA_CL_CLIP_CNTL.clip_disable, as screen-space clears draw): depth is clamped to the
 +    // viewport's range instead of the primitive being cut away, as the Vulkan backend's depth clamp does.
-+    [encoder_ setDepthClipMode:regs_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
-+    [encoder_ setViewport:MTLViewport{double(viewport.xy_offset[0]), double(viewport.xy_offset[1]),
-+        double(viewport.xy_extent[0]), double(viewport.xy_extent[1]), viewport.z_min, viewport.z_max}];
++    const int32_t clip = regs_.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ? 1 : 0;
++    if (es.clip != clip) {
++      const MTLDepthClipMode clip_mode = clip ? MTLDepthClipModeClamp : MTLDepthClipModeClip;
++      if (auto* c = Queue(EncoderQueue::Op::kDepthClip)) c->a = uint32_t(clip_mode);
++      else [encoder_ setDepthClipMode:clip_mode];
++      if (cache_state) es.clip = clip;
++    }
++    const std::array<double, 6> vp{double(viewport.xy_offset[0]), double(viewport.xy_offset[1]),
++        double(viewport.xy_extent[0]), double(viewport.xy_extent[1]), viewport.z_min, viewport.z_max};
++    if (es.viewport != vp) {
++      if (auto* c = Queue(EncoderQueue::Op::kViewport)) std::memcpy(c->d, vp.data(), sizeof(c->d));
++      else [encoder_ setViewport:MTLViewport{vp[0], vp[1], vp[2], vp[3], vp[4], vp[5]}];
++      if (cache_state) es.viewport = vp;
++    }
 +    uint32_t height = pass_height_;
 +    uint32_t sx = std::min(scissor.offset[0], width), sy = std::min(scissor.offset[1], height);
-+    [encoder_ setScissorRect:MTLScissorRect{sx, sy, std::min(scissor.extent[0], width - sx), std::min(scissor.extent[1], height - sy)}];
++    const std::array<NSUInteger, 4> sc{sx, sy, std::min(scissor.extent[0], width - sx), std::min(scissor.extent[1], height - sy)};
++    if (es.scissor != sc) {
++      if (auto* c = Queue(EncoderQueue::Op::kScissor)) { c->a = uint32_t(sc[0]); c->b = uint32_t(sc[1]); c->c = uint32_t(sc[2]); c->r.extra = sc[3]; }
++      else [encoder_ setScissorRect:MTLScissorRect{sc[0], sc[1], sc[2], sc[3]}];
++      if (cache_state) es.scissor = sc;
++    }
 +    auto raster = regs_.Get<reg::PA_SU_SC_MODE_CNTL>();
-+    [encoder_ setFrontFacingWinding:raster.face ? MTLWindingClockwise : MTLWindingCounterClockwise];
-+    [encoder_ setCullMode:!polygonal ? MTLCullModeNone : raster.cull_front ? MTLCullModeFront : raster.cull_back ? MTLCullModeBack : MTLCullModeNone];
-+    [encoder_ setBlendColorRed:regs_.Get<float>(XE_GPU_REG_RB_BLEND_RED) green:regs_.Get<float>(XE_GPU_REG_RB_BLEND_GREEN)
-+                        blue:regs_.Get<float>(XE_GPU_REG_RB_BLEND_BLUE) alpha:regs_.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)];
++    const int32_t winding = raster.face ? 1 : 0;
++    if (es.winding != winding) {
++      const MTLWinding front = winding ? MTLWindingClockwise : MTLWindingCounterClockwise;
++      if (auto* c = Queue(EncoderQueue::Op::kWinding)) c->a = uint32_t(front);
++      else [encoder_ setFrontFacingWinding:front];
++      if (cache_state) es.winding = winding;
++    }
++    const MTLCullMode cull = !polygonal ? MTLCullModeNone : raster.cull_front ? MTLCullModeFront
++                           : raster.cull_back ? MTLCullModeBack : MTLCullModeNone;
++    if (es.cull != int32_t(cull)) {
++      if (auto* c = Queue(EncoderQueue::Op::kCull)) c->a = uint32_t(cull);
++      else [encoder_ setCullMode:cull];
++      if (cache_state) es.cull = int32_t(cull);
++    }
++    const std::array<float, 4> blend{regs_.Get<float>(XE_GPU_REG_RB_BLEND_RED), regs_.Get<float>(XE_GPU_REG_RB_BLEND_GREEN),
++                                     regs_.Get<float>(XE_GPU_REG_RB_BLEND_BLUE), regs_.Get<float>(XE_GPU_REG_RB_BLEND_ALPHA)};
++    // Compared as bits (a NaN from the registers is sent once, not every draw).
++    if (std::memcmp(es.blend.data(), blend.data(), sizeof(blend))) {
++      if (auto* c = Queue(EncoderQueue::Op::kBlendColor)) std::memcpy(c->f, blend.data(), sizeof(c->f));
++      else [encoder_ setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
++      if (cache_state) es.blend = blend;
++    }
 +    BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data(), param_gen_scale);
 +    const auto& system = system_bytes_;
 +    debug_draw_log_ = DebugFrame() && primitive.host_draw_vertex_count <= 6;
@@ -2456,15 +2704,28 @@ new file mode 100644
 +    if (!REXCVAR_GET(metal_draw_calls)) {
 +      // Diagnostic: everything of the draw but the draw itself.
 +    } else if (primitive.index_buffer_type == PrimitiveProcessor::kNone) {
-+      [encoder_ drawPrimitives:topology vertexStart:0 vertexCount:primitive.host_draw_vertex_count];
++      if (auto* c = Queue(EncoderQueue::Op::kDraw)) { c->a = uint32_t(topology); c->b = 0; c->c = primitive.host_draw_vertex_count; }
++      else [encoder_ drawPrimitives:topology vertexStart:0 vertexCount:primitive.host_draw_vertex_count];
 +    } else {
 +      id<MTLBuffer> buffer; size_t offset;
 +      if (primitive.index_buffer_type == PrimitiveProcessor::kGuestDMA) { buffer = REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_; offset = primitive.guest_index_base; }
-+      else { auto b = primitives_->Buffer(primitive); buffer = b.first; offset = b.second; }
-+      [encoder_ drawIndexedPrimitives:topology indexCount:primitive.host_draw_vertex_count
-+          indexType:primitive.host_index_format == xenos::IndexFormat::kInt16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32
-+          indexBuffer:buffer indexBufferOffset:offset];
++      else {
++        auto b = primitives_->Buffer(primitive); buffer = b.first; offset = b.second;
++        // Made for this draw and dropped at the next one: kept until the encoder thread has drawn with it.
++        if (equeue_ && primitive.index_buffer_type == PrimitiveProcessor::kHostConverted) retired_.push_back(buffer);
++      }
++      const MTLIndexType index_type =
++          primitive.host_index_format == xenos::IndexFormat::kInt16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
++      if (auto* c = Queue(EncoderQueue::Op::kDrawIndexed)) {
++        c->a = uint32_t(topology); c->b = primitive.host_draw_vertex_count; c->c = uint32_t(index_type);
++        c->r.obj = (__bridge void*)buffer; c->r.offset = offset;
++      } else {
++        [encoder_ drawIndexedPrimitives:topology indexCount:primitive.host_draw_vertex_count indexType:index_type
++                            indexBuffer:buffer indexBufferOffset:offset];
++      }
 +    }
++    // Published every few draws: each publish may wake the encoder thread (a system call on both sides).
++    if (equeue_ && equeue_->staged() >= equeue_batch_) equeue_->Push();
 +    if (DebugFrame() && (REXCVAR_GET(metal_debug_all_draws) || (draws_ % 64) == 0)) {
 +      auto fetch = regs_.GetTextureFetch(0); auto vf = regs_.GetVertexFetch(0);
 +      REXGPU_INFO("Metal draw debug: draw {} VS {:016X} PS {:016X}, prim {} index {} count {}, RT {:08X} depth {:08X} info {:08X}, "
@@ -2644,7 +2905,9 @@ new file mode 100644
 +
 +void MetalDraw::Bind(Shader& shader, Shader::Translation* translation, bool vertex, const std::vector<uint8_t>& system) {
 +  auto buffer = [&](id<MTLBuffer> b, uint32_t slot) {
-+    if (vertex) [encoder_ setVertexBuffer:b offset:0 atIndex:slot];
++    if (auto* c = Queue(EncoderQueue::Op::kBuffer)) {
++      c->vertex = vertex; c->index = uint16_t(slot); c->r.obj = (__bridge void*)b; c->r.offset = 0;
++    } else if (vertex) [encoder_ setVertexBuffer:b offset:0 atIndex:slot];
 +    else [encoder_ setFragmentBuffer:b offset:0 atIndex:slot];
 +  };
 +  // Inline constants (Metal copies up to 4 KB with the command); a buffer only if larger. Bindings last
@@ -2658,6 +2921,7 @@ new file mode 100644
 +    bound_floats_ = {}; bound_bools_ = {}; bound_fetch_ = {};
 +    for (auto& stage : bound_samplers_) stage.fill(nullptr);
 +  }
++  // data may already be at the ring's next free byte (gathered there): then it is not copied again.
 +  auto bytes = [&](const void* data, size_t size, uint32_t slot) {
 +    if (constant_ring_) {
 +      // Into this frame's half of the ring; compared with the slot's last upload there.
@@ -2667,14 +2931,17 @@ new file mode 100644
 +      const size_t aligned = (size + 255) & ~size_t(255);
 +      if (constant_used_ + aligned <= kConstantRing) {
 +        const uint32_t offset = uint32_t(constant_used_);
-+        std::memcpy(ring + offset, data, size);
++        if (data != ring + offset) std::memcpy(ring + offset, data, size);
 +        constant_used_ += aligned;
 +        const NSUInteger at = slot_ * kConstantRing + offset;
 +        if (bound.ring) {
-+          if (vertex) [encoder_ setVertexBufferOffset:at atIndex:slot];
++          if (auto* c = Queue(EncoderQueue::Op::kBufferOffset)) { c->vertex = vertex; c->index = uint16_t(slot); c->r.offset = at; }
++          else if (vertex) [encoder_ setVertexBufferOffset:at atIndex:slot];
 +          else [encoder_ setFragmentBufferOffset:at atIndex:slot];
 +        } else {
-+          if (vertex) [encoder_ setVertexBuffer:constant_ring_ offset:at atIndex:slot];
++          if (auto* c = Queue(EncoderQueue::Op::kBuffer)) {
++            c->vertex = vertex; c->index = uint16_t(slot); c->r.obj = (__bridge void*)constant_ring_; c->r.offset = at;
++          } else if (vertex) [encoder_ setVertexBuffer:constant_ring_ offset:at atIndex:slot];
 +          else [encoder_ setFragmentBuffer:constant_ring_ offset:at atIndex:slot];
 +        }
 +        bound = {offset, uint32_t(size), true};
@@ -2687,7 +2954,15 @@ new file mode 100644
 +    auto& bound = bound_bytes_[vertex][slot];
 +    if (bound.size() == size && !std::memcmp(bound.data(), data, size)) return;
 +    bound.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
-+    if (vertex) [encoder_ setVertexBytes:data length:size atIndex:slot];
++    if (equeue_) {
++      uint32_t at;
++      if (!equeue_->PutBytes(data, uint32_t(size), at)) {
++        equeue_->Drain();  // the copies' space is free again once the encoder thread has sent them
++        equeue_->PutBytes(data, uint32_t(size), at);
++      }
++      auto* c = Queue(EncoderQueue::Op::kBytes);
++      c->vertex = vertex; c->index = uint16_t(slot); c->a = at; c->b = uint32_t(size);
++    } else if (vertex) [encoder_ setVertexBytes:data length:size atIndex:slot];
 +    else [encoder_ setFragmentBytes:data length:size atIndex:slot];
 +  };
 +  bytes(system.data(), system.size(), 0);
@@ -2697,17 +2972,39 @@ new file mode 100644
 +  uint64_t float_generation = constant_generation_[vertex ? 0 : 1];
 +  if (!generations || bound_floats.first != translation || bound_floats.second != float_generation) {
 +  bound_floats = {translation, float_generation};
-+  std::array<uint32_t, 1024> floats; size_t count = 0;
-+  std::memset(floats.data(), 0, 16);
-+  uint32_t base = vertex ? XE_GPU_REG_SHADER_CONSTANT_000_X : XE_GPU_REG_SHADER_CONSTANT_256_X;
-+  const auto& map = shader.constant_register_map();
-+  for (uint32_t word = 0; word < 4; ++word) {
-+    for (uint64_t bits = map.float_bitmap[word]; bits; bits &= bits - 1) {
-+      uint32_t i = word * 64 + uint32_t(__builtin_ctzll(bits));
-+      std::memcpy(floats.data() + count * 4, &regs_[base + i * 4], 16); ++count;
++  const uint32_t base = vertex ? XE_GPU_REG_SHADER_CONSTANT_000_X : XE_GPU_REG_SHADER_CONSTANT_256_X;
++  // The shader's float constants as runs of consecutive registers (a copy a run, not a register).
++  auto& last = last_float_runs_[vertex];
++  if (last.first != &shader) {
++    auto& runs = float_runs_[&shader];
++    if (runs.empty()) {
++      const auto& map = shader.constant_register_map();
++      uint32_t total = 0;
++      for (uint32_t i = 0; i < 256; ++i) {
++        if (!(map.float_bitmap[i / 64] & (uint64_t(1) << (i % 64)))) continue;
++        if (!runs.empty() && runs.back().first + runs.back().second == i) ++runs.back().second;
++        else runs.push_back({uint16_t(i), uint16_t(1)});
++        ++total;
++      }
++      if (!total) runs.push_back({0, 0});  // a zero register: Metal needs a buffer
 +    }
++    last = {&shader, &runs};
 +  }
-+  bytes(floats.data(), std::max(count, size_t(1)) * 16, vertex ? 1 : 2);
++  uint32_t count = 0;
++  for (const auto& run : *last.second) count += run.second;
++  const size_t size = size_t(std::max(count, 1u)) * 16;
++  const size_t aligned = (size + 255) & ~size_t(255);
++  std::array<uint32_t, 1024> floats;
++  uint8_t* dst = reinterpret_cast<uint8_t*>(floats.data());
++  if (constant_ring_ && constant_used_ + aligned <= kConstantRing)
++    dst = static_cast<uint8_t*>(constant_ring_.contents) + slot_ * kConstantRing + constant_used_;
++  if (!count) std::memset(dst, 0, 16);
++  size_t at = 0;
++  for (const auto& run : *last.second) {
++    std::memcpy(dst + at, &regs_[base + run.first * 4], size_t(run.second) * 16);
++    at += size_t(run.second) * 16;
++  }
++  bytes(dst, size, vertex ? 1 : 2);
 +  }
 +  if (!generations || bound_bools_[vertex] != constant_generation_[3]) {
 +    bound_bools_[vertex] = constant_generation_[3];
@@ -2719,7 +3016,15 @@ new file mode 100644
 +    bound_fetch_[vertex] = constant_generation_[2];
 +    bytes(&regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], 32 * 6 * 4, 4);
 +  }
-+  buffer(REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_, 5);
++  {
++    id<MTLBuffer> memory = REXCVAR_GET(metal_snapshot_vertices) ? snapshot_buffer_ : memory_buffer_;
++    // Slot 5 holds the same buffer for the encoder's life (enc_state_ is reset with each encoder, in Draw).
++    void*& bound_memory = enc_state_.memory[vertex ? 0 : 1];
++    if (!enc_state_.encoder || bound_memory != (__bridge void*)memory) {
++      buffer(memory, 5);
++      bound_memory = (__bridge void*)memory;
++    }
++  }
 +  const auto& bindings = shaders_.translator().bindings(translation);
 +  uint32_t stage = vertex ? 0 : 1, texture_index = 0;
 +  for (auto& t : bindings.textures) {
@@ -2741,7 +3046,9 @@ new file mode 100644
 +      if (bound == (__bridge void*)texture) continue;
 +      bound = (__bridge void*)texture;
 +    }
-+    if (vertex) [encoder_ setVertexTexture:texture atIndex:t.index];
++    if (auto* c = Queue(EncoderQueue::Op::kTexture)) {
++      c->vertex = vertex; c->index = uint16_t(t.index); c->r.obj = (__bridge void*)texture;
++    } else if (vertex) [encoder_ setVertexTexture:texture atIndex:t.index];
 +    else [encoder_ setFragmentTexture:texture atIndex:t.index];
 +  }
 +  for (auto& s : bindings.samplers) {
@@ -2751,7 +3058,9 @@ new file mode 100644
 +      if (bound == (__bridge void*)sampler) continue;
 +      bound = (__bridge void*)sampler;
 +    }
-+    if (vertex) [encoder_ setVertexSamplerState:sampler atIndex:s.index];
++    if (auto* c = Queue(EncoderQueue::Op::kSampler)) {
++      c->vertex = vertex; c->index = uint16_t(s.index); c->r.obj = (__bridge void*)sampler;
++    } else if (vertex) [encoder_ setVertexSamplerState:sampler atIndex:s.index];
 +    else [encoder_ setFragmentSamplerState:sampler atIndex:s.index];
 +  }
 +}
@@ -2931,6 +3240,7 @@ new file mode 100644
 +      if (entry.watch && entry.watch->pending.load(std::memory_order_acquire) &&
 +          !entry.watch->dirty.load(std::memory_order_acquire)) {
 +        entry.frame = frame_; ++texture_watch_hits_;
++        if (entry.owner) entry.owner->used_frame = frame_;
 +        return entry.view;
 +      }
 +      victim = &entry;  // known but due for a look: the same slot
@@ -2939,9 +3249,10 @@ new file mode 100644
 +    if (victim->epoch == texture_epoch_ && (entry.epoch != texture_epoch_ || entry.frame < victim->frame)) victim = &entry;
 +  }
 +  FastTexture& entry = *victim;
-+  last_texture_range_ = {0, 0}; last_texture_watch_ = nullptr;
++  last_texture_range_ = {0, 0}; last_texture_watch_ = nullptr; last_texture_entry_ = nullptr;
 +  id<MTLTexture> view = TextureSlow(binding);
 +  entry.key = key; entry.epoch = texture_epoch_; entry.frame = frame_; entry.view = view;
++  entry.owner = last_texture_entry_;
 +  entry.watch = REXCVAR_GET(metal_fast_texture_frames) ? last_texture_watch_ : nullptr;
 +  entry.start = last_texture_range_.first;
 +  entry.end = last_texture_range_.first + std::max(1u, last_texture_range_.second);
@@ -2964,6 +3275,8 @@ new file mode 100644
 +  Key(key, fetch_mip_max);
 +  bool cube = binding.dimension == xenos::FetchOpDimension::kCube;
 +  TextureEntry& entry = texture_entries_[key];
++  entry.used_frame = frame_;
++  last_texture_entry_ = &entry;
 +  const bool cached = entry.cached;
 +  // What the fast lookup keeps with its entry: the texture's memory, and its write watch if it is armed and
 +  // clean (a texture without one, or made from resolves, is looked at again every frame).
@@ -3058,8 +3371,18 @@ new file mode 100644
 +        if (DebugFrame())
 +          REXGPU_INFO("Metal texture hash debug: addr {:08X} range {} fmt {} {}x{} {}", span_start, span_length,
 +              uint32_t(fetch.format), w + 1, h + 1, watch ? "written" : "unwatched");
-+        content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(span_start), span_length);
-+        texture_hashed_ += span_length;
++        // The same memory under another fetch layout (each is an entry of its own) is hashed once a frame.
++        const FrameHash* memo = nullptr;
++        if (frame_hashes_frame_ != frame_) { frame_hashes_.clear(); frame_hashes_frame_ = frame_; }
++        for (const auto& f : frame_hashes_)
++          if (f.start == span_start && f.length == span_length) { memo = &f; break; }
++        if (memo) {
++          content_hash = memo->hash;
++        } else {
++          content_hash = XXH3_64bits(memory_.TranslatePhysical<const void*>(span_start), span_length);
++          texture_hashed_ += span_length;
++          if (frame_hashes_.size() < 256) frame_hashes_.push_back({span_start, span_length, content_hash});
++        }
 +      }
 +    }
 +  }
@@ -3265,6 +3588,24 @@ new file mode 100644
 +}
 +
 +id<MTLSamplerState> MetalDraw::Sampler(const MetalSamplerBinding& b) {
++  FastSampler* fast = nullptr;
++  std::array<uint32_t, 8> fast_key;
++  if (REXCVAR_GET(metal_encoder_state_cache) && b.fetch_constant < 32) {
++    std::memcpy(fast_key.data(), &regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + b.fetch_constant * 6], 24);
++    fast_key[6] = uint32_t(b.mag_filter) | (uint32_t(b.min_filter) << 4) | (uint32_t(b.mip_filter) << 8) |
++                  (uint32_t(b.aniso_filter) << 12) | (REXCVAR_GET(metal_texture_mips) ? 1u << 16 : 0u);
++    fast_key[7] = uint32_t(REXCVAR_GET(anisotropic_override));
++    uint32_t h = 2166136261u;
++    for (uint32_t v : fast_key) h = (h ^ v) * 16777619u;
++    fast = &fast_samplers_[(h ^ (h >> 13)) & (fast_samplers_.size() - 1)];
++    if (fast->state && fast->key == fast_key) return fast->state;
++  }
++  id<MTLSamplerState> state = SamplerSlow(b);
++  if (fast) { fast->key = fast_key; fast->state = state; }
++  return state;
++}
++
++id<MTLSamplerState> MetalDraw::SamplerSlow(const MetalSamplerBinding& b) {
 +  auto fetch = regs_.GetTextureFetch(b.fetch_constant);
 +  auto mag = b.mag_filter == xenos::TextureFilter::kUseFetchConst ? fetch.mag_filter : b.mag_filter;
 +  auto min = b.min_filter == xenos::TextureFilter::kUseFetchConst ? fetch.min_filter : b.min_filter;
@@ -3761,7 +4102,7 @@ new file mode 100644
 +    [encoder_ drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 +    ++clears_in_pass_; drew = true;
 +  }
-+  if (drew) bound_encoder_ = nullptr;  // the clears' fragment bytes are not the draw's
++  if (drew) { bound_encoder_ = nullptr; enc_state_.encoder = nullptr; }  // the clears' bytes and state are not the draw's
 +}
 +
 +void MetalDraw::EncodeClear(const PendingClear& pc) {
@@ -3951,6 +4292,7 @@ new file mode 100644
 +  }
 +  pending_transfers_.clear();
 +  bound_encoder_ = nullptr;  // the transfers' fragment bytes are not the draw's
++  enc_state_.encoder = nullptr;
 +}
 +
 +bool MetalDraw::TaaSupported(id<MTLDevice> device) {
@@ -4626,11 +4968,238 @@ new file mode 100644
 +  return true;
 +}
 +}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/metal_encoder_queue.h b/src/graphics/metal/metal_encoder_queue.h
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/metal/metal_encoder_queue.h
+@@ -0,0 +1,222 @@
++/** Native Metal draw path: a render encoder's per-draw calls on a thread of their own. BSD-3-Clause, see LICENSE. */
++#pragma once
++#import <Metal/Metal.h>
++#include <pthread/qos.h>
++#include <atomic>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <chrono>
++#include <mach/mach.h>
++#include <thread>
++
++namespace rex::graphics::metal {
++
++// The command thread decides each draw's state (pipeline, depth-stencil, viewport, buffers, textures, samplers)
++// and the draw; the Metal calls that send them to the open render encoder (a quarter of that thread's time in a
++// race) are queued here and made by the encoder thread, in order, while the command thread goes on with the
++// next draw. One producer (the command thread), one consumer.
++//
++// The rules that keep it correct, kept by MetalDraw:
++//  - The encoder is handed over (Encoder) after the command thread's own work in it at the pass's start (clears,
++//    EDRAM transfers); from then until Drain() returns, only the queue uses it. EndEncoder drains first.
++//  - Objects are queued unretained: everything queued must live until the next Drain() (pipelines, samplers,
++//    depth-stencil states and buffers live as long as the backend; texture views dropped while queued and
++//    per-draw index buffers are kept in MetalDraw's retired list until then).
++class EncoderQueue {
++ public:
++  enum class Op : uint8_t {
++    kEncoder, kPipeline, kDepthStencil, kStencilRef, kDepthClip, kViewport, kScissor, kWinding, kCull,
++    kBlendColor, kBuffer, kBufferOffset, kBytes, kTexture, kSampler, kDraw, kDrawIndexed,
++  };
++  struct Cmd {
++    Op op;
++    uint8_t vertex;  // the stage of a binding: 1 vertex, 0 fragment
++    uint16_t index;
++    uint32_t a, b, c;
++    union {
++      double d[6];
++      struct { void* obj; uint64_t offset; uint64_t extra; } r;
++      float f[4];
++    };
++  };
++  static_assert(sizeof(Cmd) == 64, "a cache line a command");
++
++  EncoderQueue() : ring_(new Cmd[kSize]), bytes_(new uint8_t[kBytes]) {}
++  ~EncoderQueue() { Stop(); }
++
++  void Start(uint32_t spin) {
++    if (thread_.joinable()) return;
++    spin_ = spin;
++    stop_.store(false);
++    thread_ = std::thread([this] {
++      pthread_setname_np("Metal encoder");
++      pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
++      mach_port_.store(pthread_mach_thread_np(pthread_self()));
++      Run();
++    });
++  }
++  void Stop() {
++    if (!thread_.joinable()) return;
++    stop_.store(true, std::memory_order_seq_cst);
++    wake_.fetch_add(1, std::memory_order_seq_cst);
++    wake_.notify_all();
++    thread_.join();
++  }
++  bool active() const { return thread_.joinable(); }
++
++  // The next command's slot, filled by the caller; sent with the others since the last Push() by Push() (once a
++  // draw: a store and a load, and a wake-up only if the encoder thread went to sleep).
++  Cmd& Next(Op op) {
++    if (staged_ - tail_.load(std::memory_order_acquire) >= kSize) {
++      Push();
++      WaitForRoom(staged_);
++    }
++    Cmd& c = ring_[staged_ & (kSize - 1)];
++    ++staged_;
++    c.op = op;
++    return c;
++  }
++  void Push() {
++    if (head_.load(std::memory_order_relaxed) == staged_) return;
++    head_.store(staged_, std::memory_order_seq_cst);
++    if (sleeping_.load(std::memory_order_seq_cst)) {
++      wake_.fetch_add(1, std::memory_order_seq_cst);
++      wake_.notify_one();
++    }
++  }
++  // Inline bytes (setVertexBytes and the like, at most 4 KB): copied here, for the encoder thread to send.
++  // Returns false when the space is full until the next Drain (the caller drains and retries).
++  bool PutBytes(const void* data, uint32_t size, uint32_t& offset) {
++    if (bytes_used_ + size > kBytes) return false;
++    offset = bytes_used_;
++    std::memcpy(bytes_.get() + offset, data, size);
++    bytes_used_ += (size + 15) & ~uint32_t(15);
++    return true;
++  }
++  // Waits until the encoder thread has made every queued call; the encoder is the command thread's again.
++  void Drain() {
++    Push();
++    const uint64_t h = staged_;
++    for (uint32_t spin = 0; spin < 1000 && tail_.load(std::memory_order_acquire) != h; ++spin) {
++      __builtin_arm_yield();
++    }
++    if (tail_.load(std::memory_order_acquire) != h) {
++      ++drain_waits_;
++      const auto wait_start = std::chrono::steady_clock::now();
++      draining_.store(true, std::memory_order_seq_cst);
++      for (uint64_t t; (t = tail_.load(std::memory_order_seq_cst)) != h;) tail_.wait(t, std::memory_order_seq_cst);
++      draining_.store(false, std::memory_order_seq_cst);
++      drain_wait_us_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++          std::chrono::steady_clock::now() - wait_start).count());
++    }
++    bytes_used_ = 0;
++  }
++  uint64_t TakeDrainWaits() { uint64_t n = drain_waits_; drain_waits_ = 0; return n; }
++  uint64_t TakeDrainWaitUs() { uint64_t n = drain_wait_us_; drain_wait_us_ = 0; return n; }
++  // The encoder thread's CPU time so far, microseconds.
++  uint64_t ThreadCpuUs() const {
++    const mach_port_t port = mach_port_.load();
++    if (!port) return 0;
++    thread_basic_info_data_t info{};
++    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++    if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count) != KERN_SUCCESS) return 0;
++    return uint64_t(info.user_time.seconds + info.system_time.seconds) * 1000000 + info.user_time.microseconds +
++           info.system_time.microseconds;
++  }
++  uint64_t staged() const { return staged_ - head_.load(std::memory_order_relaxed); }
++  uint64_t TakeCommands() { uint64_t n = staged_ - counted_; counted_ = staged_; return n; }
++
++ private:
++  static constexpr uint64_t kSize = 1 << 15;
++  static constexpr uint32_t kBytes = 1 << 22;
++
++  void WaitForRoom(uint64_t h) {
++    draining_.store(true, std::memory_order_seq_cst);
++    for (uint64_t t; h - (t = tail_.load(std::memory_order_seq_cst)) >= kSize - 1024;) tail_.wait(t, std::memory_order_seq_cst);
++    draining_.store(false, std::memory_order_seq_cst);
++  }
++
++  void Run() {
++    uint64_t t = tail_.load(std::memory_order_relaxed);
++    __strong id<MTLRenderCommandEncoder> encoder = nil;
++    while (true) {
++      uint64_t h = head_.load(std::memory_order_acquire);
++      if (h == t) {
++        // A short spin before sleeping (the command thread publishes every few draws).
++        for (uint32_t spin = 0; spin < spin_ && h == t; ++spin) {
++          __builtin_arm_yield();
++          h = head_.load(std::memory_order_acquire);
++        }
++        if (h == t) {
++          if (stop_.load()) break;
++          const uint32_t w = wake_.load(std::memory_order_seq_cst);
++          sleeping_.store(true, std::memory_order_seq_cst);
++          h = head_.load(std::memory_order_seq_cst);
++          if (h == t && !stop_.load()) wake_.wait(w, std::memory_order_seq_cst);
++          sleeping_.store(false, std::memory_order_seq_cst);
++          continue;
++        }
++      }
++      @autoreleasepool {
++        for (; t != h; ++t) Execute(ring_[t & (kSize - 1)], encoder);
++      }
++      tail_.store(t, std::memory_order_seq_cst);
++      if (draining_.load(std::memory_order_seq_cst)) tail_.notify_all();
++    }
++  }
++
++  void Execute(const Cmd& c, __strong id<MTLRenderCommandEncoder>& e) {
++    switch (c.op) {
++      case Op::kEncoder: e = (__bridge id<MTLRenderCommandEncoder>)c.r.obj; break;
++      case Op::kPipeline: [e setRenderPipelineState:(__bridge id<MTLRenderPipelineState>)c.r.obj]; break;
++      case Op::kDepthStencil: [e setDepthStencilState:(__bridge id<MTLDepthStencilState>)c.r.obj]; break;
++      case Op::kStencilRef: [e setStencilFrontReferenceValue:c.a backReferenceValue:c.b]; break;
++      case Op::kDepthClip: [e setDepthClipMode:MTLDepthClipMode(c.a)]; break;
++      case Op::kViewport: [e setViewport:MTLViewport{c.d[0], c.d[1], c.d[2], c.d[3], c.d[4], c.d[5]}]; break;
++      case Op::kScissor: [e setScissorRect:MTLScissorRect{c.a, c.b, c.c, NSUInteger(c.r.extra)}]; break;
++      case Op::kWinding: [e setFrontFacingWinding:MTLWinding(c.a)]; break;
++      case Op::kCull: [e setCullMode:MTLCullMode(c.a)]; break;
++      case Op::kBlendColor: [e setBlendColorRed:c.f[0] green:c.f[1] blue:c.f[2] alpha:c.f[3]]; break;
++      case Op::kBuffer:
++        if (c.vertex) [e setVertexBuffer:(__bridge id<MTLBuffer>)c.r.obj offset:c.r.offset atIndex:c.index];
++        else [e setFragmentBuffer:(__bridge id<MTLBuffer>)c.r.obj offset:c.r.offset atIndex:c.index];
++        break;
++      case Op::kBufferOffset:
++        if (c.vertex) [e setVertexBufferOffset:c.r.offset atIndex:c.index];
++        else [e setFragmentBufferOffset:c.r.offset atIndex:c.index];
++        break;
++      case Op::kBytes:
++        if (c.vertex) [e setVertexBytes:bytes_.get() + c.a length:c.b atIndex:c.index];
++        else [e setFragmentBytes:bytes_.get() + c.a length:c.b atIndex:c.index];
++        break;
++      case Op::kTexture:
++        if (c.vertex) [e setVertexTexture:(__bridge id<MTLTexture>)c.r.obj atIndex:c.index];
++        else [e setFragmentTexture:(__bridge id<MTLTexture>)c.r.obj atIndex:c.index];
++        break;
++      case Op::kSampler:
++        if (c.vertex) [e setVertexSamplerState:(__bridge id<MTLSamplerState>)c.r.obj atIndex:c.index];
++        else [e setFragmentSamplerState:(__bridge id<MTLSamplerState>)c.r.obj atIndex:c.index];
++        break;
++      case Op::kDraw: [e drawPrimitives:MTLPrimitiveType(c.a) vertexStart:c.b vertexCount:c.c]; break;
++      case Op::kDrawIndexed:
++        [e drawIndexedPrimitives:MTLPrimitiveType(c.a) indexCount:c.b indexType:MTLIndexType(c.c)
++                     indexBuffer:(__bridge id<MTLBuffer>)c.r.obj indexBufferOffset:c.r.offset];
++        break;
++    }
++  }
++
++  std::unique_ptr<Cmd[]> ring_;
++  std::unique_ptr<uint8_t[]> bytes_;
++  uint32_t bytes_used_ = 0;  // the command thread's: reset by Drain
++  uint64_t staged_ = 0, counted_ = 0, drain_waits_ = 0, drain_wait_us_ = 0;  // the command thread's
++  std::atomic<mach_port_t> mach_port_{0};
++  uint32_t spin_ = 64;
++  alignas(64) std::atomic<uint64_t> head_{0};
++  alignas(64) std::atomic<uint64_t> tail_{0};
++  alignas(64) std::atomic<uint32_t> wake_{0};
++  std::atomic<bool> sleeping_{false}, draining_{false}, stop_{false};
++  std::thread thread_;
++};
++
++}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_internal.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,298 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -4917,6 +5486,11 @@ new file mode 100644
 +  // The time between swaps (seconds, averaged): the motion blur's scale (metal_motion_blur_fps).
 +  std::chrono::steady_clock::time_point last_swap_time_{};
 +  double frame_interval_ = 0.0;
++  // The slow frame log (metal_slow_frame_ms): shader translations so far, and lines logged in this 10 s.
++  uint32_t slow_translated_ = 0;
++  uint64_t slow_translate_us_ = 0;
++  uint32_t slow_logged_ = 0;
++  std::chrono::steady_clock::time_point slow_window_{};
 +  uint64_t stats_draws_ = 0;
 +  uint64_t stats_copies_ = 0;
 +  uint64_t stats_swaps_ = 0;
@@ -4928,7 +5502,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,944 @@
+@@ -0,0 +1,1038 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -4948,7 +5522,9 @@ new file mode 100644
 +
 +#include "metal_internal.h"
 +#import <MetalFX/MetalFX.h>
++#include <atomic>
 +#include <chrono>
++#include <mutex>
 +#include <cstdio>
 +#include <algorithm>
 +#include <cmath>
@@ -4968,6 +5544,15 @@ new file mode 100644
 +    "Development: write what the presenter paints (the guest output and the UI overlays) to this PPM file, at most "
 +    "every 2 seconds");
 +
++REXCVAR_DEFINE_STRING(metal_present_times, "", "GPU/Metal",
++    "Development: a CSV of when each presented drawable reached the display (its presentedTime, in ns of "
++    "CACurrentMediaTime; 0 for a drawable that was never shown), whether it was a generated frame (g) or not (n), and "
++    "the steady clock when Metal reported it")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(metal_present_stats, true, "GPU/Metal",
++    "Log every 10 s how evenly frames reached the display: frames shown, dropped, the longest gap between two and "
++    "the gaps longer than 1.5 and 3 refreshes (from the drawables' presentedTime)");
++
 +REXCVAR_DECLARE(std::string, hdr);
 +REXCVAR_DECLARE(int32_t, frame_generation_debug);
 +REXCVAR_DEFINE_BOOL(metal_hdr_auto_edr, true, "GPU/Metal",
@@ -4977,6 +5562,86 @@ new file mode 100644
 +namespace rex::graphics::metal {
 +
 +namespace {
++
++// What reached the display, from each drawable's presented handler (Metal's own thread): the honest measure of
++// stutter, frame generation's presents included, as the guest's swaps don't show what the display did with them.
++class PresentTimes {
++ public:
++  static PresentTimes& Get() {
++    static PresentTimes times;
++    return times;
++  }
++  bool enabled() const { return file_ || REXCVAR_GET(metal_present_stats); }
++  void Track(id<CAMetalDrawable> drawable, char kind) {
++    if (!enabled()) return;
++    [drawable addPresentedHandler:^(id<MTLDrawable> shown) {
++      Presented(shown.presentedTime, kind);
++    }];
++  }
++  void SetRefreshHz(double hz) { refresh_hz_.store(hz, std::memory_order_relaxed); }
++
++ private:
++  PresentTimes() {
++    const std::string path = REXCVAR_GET(metal_present_times);
++    if (path.empty()) return;
++    file_ = std::fopen(path.c_str(), "w");
++    if (!file_) {
++      REXGPU_ERROR("metal_present_times: can't open {}", path);
++      return;
++    }
++    std::setvbuf(file_, nullptr, _IOFBF, 1 << 20);
++    std::fprintf(file_, "presented_ns,kind,steady_ns\n");
++  }
++  void Presented(CFTimeInterval time, char kind) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    const uint64_t ns = time > 0.0 ? uint64_t(time * 1e9) : 0;
++    if (file_) {
++      // steady_ns: std::chrono::steady_clock when the handler ran (the clock of the game's own frame logs; the
++      // presented time is on CACurrentMediaTime's), to line the two up.
++      const auto steady = std::chrono::duration_cast<std::chrono::nanoseconds>(
++                              std::chrono::steady_clock::now().time_since_epoch()).count();
++      std::fprintf(file_, "%llu,%c,%lld\n", static_cast<unsigned long long>(ns), kind,
++                   static_cast<long long>(steady));
++      if (ns && ns - last_flush_ns_ > 1'000'000'000ull) {
++        std::fflush(file_);
++        last_flush_ns_ = ns;
++      }
++    }
++    if (!ns) {
++      ++dropped_;
++      return;
++    }
++    ++shown_;
++    if (kind == 'g') ++shown_generated_;
++    if (last_ns_ && ns > last_ns_) {
++      const double gap_ms = double(ns - last_ns_) * 1e-6;
++      const double refresh_ms = 1000.0 / std::max(24.0, refresh_hz_.load(std::memory_order_relaxed));
++      max_gap_ms_ = std::max(max_gap_ms_, gap_ms);
++      if (gap_ms > 1.5 * refresh_ms) ++gaps_over_1_5_;
++      if (gap_ms > 3.0 * refresh_ms) ++gaps_over_3_;
++      if (gap_ms > 100.0) ++gaps_over_100ms_;
++    }
++    last_ns_ = ns;
++    if (!window_start_ns_) window_start_ns_ = ns;
++    if (ns - window_start_ns_ >= 10'000'000'000ull) {
++      if (REXCVAR_GET(metal_present_stats))
++        REXGPU_INFO("Metal present: {} frames shown in {:.1f} s ({} generated), {} dropped; longest gap {:.1f} ms, "
++                    "{} gaps over 1.5 refreshes, {} over 3, {} over 100 ms (a {:.0f} Hz display)",
++                    shown_, double(ns - window_start_ns_) * 1e-9, shown_generated_, dropped_, max_gap_ms_,
++                    gaps_over_1_5_, gaps_over_3_, gaps_over_100ms_, refresh_hz_.load(std::memory_order_relaxed));
++      window_start_ns_ = ns;
++      shown_ = shown_generated_ = dropped_ = gaps_over_1_5_ = gaps_over_3_ = gaps_over_100ms_ = 0;
++      max_gap_ms_ = 0.0;
++    }
++  }
++  std::mutex mutex_;
++  FILE* file_ = nullptr;
++  std::atomic<double> refresh_hz_{60.0};
++  uint64_t last_ns_ = 0, window_start_ns_ = 0, last_flush_ns_ = 0;
++  uint32_t shown_ = 0, shown_generated_ = 0, dropped_ = 0, gaps_over_1_5_ = 0, gaps_over_3_ = 0,
++           gaps_over_100ms_ = 0;
++  double max_gap_ms_ = 0.0;
++};
 +
 +// HDR10 (PQ, BT.2020) in the presenter's shaders, as the SDK's hdr_output.xesli writes it.
 +#define METAL_HDR_FUNCTIONS R"(
@@ -5688,6 +6353,7 @@ new file mode 100644
 +            EncodePaint(drawable, fg_copies_[job.slot][generated_only ? 0 : i], job.placement, false, hdr_state);
 +        if (!i) command_buffer.label = @"rexglue paint (generated frame)";
 +        else CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
++        PresentTimes::Get().Track(drawable, i ? 'n' : 'g');
 +        [command_buffer presentDrawable:drawable afterMinimumDuration:job.half];
 +        [command_buffer commit];
 +      }
@@ -5786,6 +6452,7 @@ new file mode 100644
 +    }
 +    double refresh_hz = display_hz_ >= 24.0 ? display_hz_ : double(GetDisplayRefreshHz());
 +    if (!(refresh_hz >= 24.0)) refresh_hz = 60.0;
++    PresentTimes::Get().SetRefreshHz(refresh_hz);
 +    const double frame_interval = refresh_interval_.load(std::memory_order_relaxed);
 +    bool show_generated = false;
 +    if (new_frame && generated_[mailbox_index] && generated_textures_[mailbox_index] && guest_output) {
@@ -5866,6 +6533,7 @@ new file mode 100644
 +    }
 +    id<MTLCommandBuffer> command_buffer = EncodePaint(drawable, guest_output, placement, execute_ui_drawers, hdr_state);
 +    CapturePaint(command_buffer, drawable.texture, hdr_state.sdr_white_nits);
++    PresentTimes::Get().Track(drawable, 'n');
 +    [command_buffer presentDrawable:drawable];
 +    [command_buffer commit];
 +    return PaintResult::kPresented;

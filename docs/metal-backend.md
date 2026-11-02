@@ -30,7 +30,7 @@ The rows above are before the tenth pass (the 4x reflections at one sample a pix
 5% with MSAA 2x and 16% at Performance on the same Mac in the same hour. What is still missing: 3D textures (none
 sampled in free roam, drives or races so far) and frame pacing with `CAMetalDisplayLink` (put off; see
 the tenth pass). The car falling through the road ([BACKLOG](BACKLOG.md) 27) has not come back since the speed
-passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to eighteenth, record how it got here. HDR output (EDR) came with the fourteenth.
+passes, in the route tests or in play, so it is no longer a known issue. The passes below, first to nineteenth, record how it got here; the nineteenth has a race benchmark of every mode on a warm Mac. HDR output (EDR) came with the fourteenth.
 
 ## Why
 
@@ -656,3 +656,82 @@ blinking lamps (ours and the traffic's), a gold sheen on bumpers.
 
 Still missing: occlusion queries. Metal answers every query with a fixed count, so the sun's glare (the only use in
 MCLA) shows at 80% even behind buildings ([BACKLOG](BACKLOG.md) 35).
+
+**Nineteenth pass (2026-11-03): a race benchmark over every mode, and the stutter it found.**
+- *Race benchmark* (`scripts/mac_race_bench.py`): each run boots the game windowed with a scratch copy of the save
+  (`out/bench-race/user`), goes through the pause menu's Arcade into "Sunset and Vine" (7 opponents, rain, midnight;
+  `launcher/dev/scripts/boot-to-race.pad`) and drives the player's car along the leading opponent's route
+  (`sunset-and-vine.route`, about 100 km/h on average) with the dev pad's follower, for `--race-seconds` of the
+  race's own clock (default 60). From the race's start to its end mark it reports the guest swaps (FPS, median,
+  p99, 1% low, the longest frame, hitches: frames over twice the median and 25 ms, freezes over 100 ms), what
+  reached the display (from the presenter's drawables: frames shown a second, the longest gap, gaps over 1.5 and
+  3 refreshes), and from the log the GPU busy time, the command thread's CPU time, pipelines made and draws left
+  out, warnings and errors, and the thermal pressure at the start and end. Twenty named modes (`--list`: MSAA 2x,
+  AA off, MetalFX TAA, Quality, Performance at 30, 45, 60, 120 and uncapped, frame generation, SDR, single tile,
+  the low preset, smooth UI off), `quick`, `all`, or `name=<options>`. `--cool-to 1` waits before each run until
+  thermal pressure is down (a run that starts at level 0 makes 57 FPS at Performance, one at level 2 37 to 49:
+  that, not the build, is most of the run-to-run spread on this Mac). `--sample N` takes a CPU profile 15 s into
+  the race, `--gputrace` a 3 s Metal System Trace summed by encoder label. Diagnostics: `cpu-only` (draws stop
+  after the primitive processor), `nodraw`.
+- *What reached the display*: `--metal_present_times=<csv>` writes each drawable's presented time (normal and
+  generated), and every 10 s the log says how many frames were shown, the longest gap and the late ones
+  (`metal_present_stats`, on).
+- *Slow frames*: a swap over `metal_slow_frame_ms` (50) is logged with its command-thread CPU time, the wait for the
+  GPU, the rest (the game), shaders translated, pipelines made, texture loads and hashing, passes and transfers.
+- *The stutter*: every 10 s in a race, a frame of 110 to 130 ms on the command thread (2,300 to 2,800 texture loads,
+  700 to 850 passes) and a 50 to 65 ms GPU frame after it. The texture cache dropped every texture once it held
+  4,096. It now evicts the least recently used down to three quarters of `metal_texture_cache_size` (4,096),
+  keeping anything used in the last two frames: Performance went from a longest frame of 122 to 126 ms, 10 to 12
+  hitches, 2 to 3 freezes and a 183 to 200 ms gap on the display a minute, to 39.5 ms, 1 hitch, none and 50 ms.
+
+The matrix after the fix, 60 s of the race each, a minute's pause between runs, the Mac warm (thermal pressure 1
+to 2 in every run; `out/bench-race/20261102-233722-matrix1`):
+
+| Mode | FPS | p99 ms | 1% low | Longest ms | Hitches | Shown/s | Longest gap ms | GPU ms | CP ms |
+|---|---|---|---|---|---|---|---|---|---|
+| MSAA 2x, 60 cap | 28.7 | 48.2 | 19.0 | 67.8 | 0 | 28.7 | 83.3 | 43.0 | 34.6 |
+| MSAA 2x, 30 cap | 30.0 | 42.2 | 23.4 | 43.7 | 0 | 30.0 | 50.0 | 41.8 | 16.4 |
+| MSAA 2x, uncapped | 33.8 | 42.8 | 21.2 | 65.9 | 2 | 33.8 | 50.0 | 42.8 | 28.1 |
+| AA off, 60 | 46.1 | 31.8 | 28.1 | 53.9 | 1 | 46.3 | 50.0 | 33.8 | 20.7 |
+| MetalFX TAA, 60 | 40.8 | 47.7 | 17.1 | 72.7 | 25 | 40.9 | 83.3 | 29.4 | 22.8 |
+| MetalFX Quality, 60 | 46.3 | 33.4 | 25.8 | 57.4 | 6 | 46.4 | 50.0 | 22.1 | 20.9 |
+| MetalFX Performance, 60 (MCLA.app's default) | 49.4 | 29.4 | 29.2 | 49.4 | 7 | 49.5 | 50.0 | 20.3 | 18.6 |
+| Performance, uncapped | 47.7 | 32.3 | 26.7 | 59.9 | 4 | 47.7 | 50.0 | 20.5 | 20.0 |
+| Performance, 45 | 45.0 | 28.8 | 33.5 | 33.0 | 0 | 44.9 | 33.3 | 20.6 | 15.1 |
+| Frame generation, half display (29 + 29) | 29.0 | 43.4 | 22.7 | 45.6 | 0 | 57.9 | 33.3 | 21.9 | 11.2 |
+| Frame generation, 30 + 30 | 30.0 | 41.7 | 23.5 | 44.2 | 0 | 59.9 | 33.3 | 20.9 | 11.3 |
+| MSAA 2x, SDR | 36.8 | 39.0 | 23.0 | 58.1 | 2 | 36.9 | 83.3 | 38.4 | 25.1 |
+| Performance, SDR | 51.4 | 27.8 | 32.9 | 42.3 | 1 | 51.5 | 50.0 | 20.0 | 18.1 |
+| Low preset, 60 | 44.9 | 34.6 | 24.9 | 62.8 | 5 | 44.9 | 50.0 | 33.2 | 21.3 |
+
+Every mode reached the race's end with no freeze, no warning or error in the race, no pipeline compiled after the
+first run and no draw left out. Frame generation at 30 is the smoothest on a 60 Hz panel (59.9 frames shown a
+second, 5 late in a minute); Performance at 60 holds 45 to 52 on a warm Mac, so its frames land unevenly on the
+display. MSAA 2x is GPU-bound (43 ms of GPU work a frame in the race against 21 at Performance).
+
+*Where the race's time goes, at Performance uncapped.* With draws stopped after the primitive processor the game
+runs at 84 FPS and the command thread uses 2.3 ms a frame: the game's own threads are not the limit, the command
+thread is. By stage (`metal_draw_stop`, `metal_draw_calls`): 2.5 ms up to the shaders, +4.4 with textures and
+targets, +0.3 pipeline and pass, +3.9 state and bindings, +6.1 for the draw calls themselves (17.2 ms, 50 FPS).
+But a CPU profile (`sample`, which slows the game about threefold) misleads here: the command thread's CPU time a
+frame follows the whole chip's load, not only its own work. The same draws cost it 34.6 ms a frame with MSAA 2x
+at a 60 cap and 16.4 at a 30 cap, 18.6 at Performance and 11 with frame generation; on a MacBook Air the CPU and
+GPU share one power budget and the memory, so GPU work slows the command thread. Tried, and kept only as options:
+
+- *An encoder thread* (`--metal_encoder_thread=true`, off; `metal_encoder_queue.h`): the render encoder's
+  per-draw calls (state, buffers, textures, samplers, the draw, about 30,000 a frame) queued and made on a thread
+  of their own, handed over every `metal_encoder_batch` calls and drained at each pass's end. It moved 6 ms a frame
+  off the command thread, which stayed at 18 to 20 ms: 46.6 and 45.5 FPS against 47.3 and 48.3 without it.
+- *The game's threads at user-interactive QoS* (an SDK runtime change, not kept): 53.3 and 37.1 against 46.7,
+  48.9 and 57.1; the spread is thermal.
+
+Kept, for less work a draw at no cost: samplers looked up by their fetch constant (`Sampler` was a fifth of the
+bindings' time), the encoder's fixed-function state (pipeline, depth-stencil, stencil reference, clip mode,
+viewport, scissor, winding, culling, blend colour) and the memory buffer's slot sent only when changed in the pass
+(`metal_encoder_state_cache`), the float constants gathered as runs of registers straight into the constant ring,
+and linear textures (hashed every frame since the thirteenth pass) hashed once a frame when two fetch layouts read
+the same memory (13.9 MB of hashing a frame to about 7). None shows in the FPS beyond the spread. A GPU trace of
+the race at Performance (about 94% of the GPU's time is the game's): the scene's 1280x384 tiles about 4 ms a
+frame, 30 reflection passes of 160x128 about 2, the 520x256 and 320x512 passes about 1.5 each, resolves 2.3, the
+HDR scene 0.7, MetalFX 0.6. So the next speed is on the GPU: fewer and cheaper passes (the reflections),
+attachments not stored when nothing reads them back.
