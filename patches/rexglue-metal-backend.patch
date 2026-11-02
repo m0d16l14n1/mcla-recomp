@@ -7302,7 +7302,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,283 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -7324,6 +7324,10 @@ new file mode 100644
 +#include <rex/graphics/pipeline/shader/spirv_translator.h>
 +#include <rex/cvar.h>
 +REXCVAR_DEFINE_BOOL(metal_texture_signs, true, "GPU/Metal", "Apply texture signedness/gamma (disable only for diagnosis)");
++REXCVAR_DEFINE_BOOL(metal_shader_precise_inline, true, "GPU/Metal",
++    "The guest's exact float operations (SPIRV-Cross's spvFMul, spvFAdd: single-rounding fma forms) inlined instead "
++    "of optnone function calls, with safe shader math (metal_shader_math 0), where the fma forms alone keep them exact");
++REXCVAR_DECLARE(int32_t, metal_shader_math);
 +#include <rex/graphics/register_file.h>
 +#include <rex/graphics/pipeline/shader/spirv.h>
 +
@@ -7448,6 +7452,14 @@ new file mode 100644
 +          samplers[i].min_filter, samplers[i].mip_filter, samplers[i].aniso_filter});
 +    }
 +    msl_out = compiler.compile();
++    // SPIRV-Cross keeps NoContraction operations exact with fma forms (fma(l, r, 0) for a multiply, fma(1, l, r)
++    // for an add) in [[clang::optnone]] functions: about 90,000 calls in MCLA's shaders, each a real call. With
++    // safe math the compiler may neither drop the signed zero fma(l, r, 0) keeps nor fuse an fma with an add, so
++    // inlined they round the same way.
++    if (REXCVAR_GET(metal_shader_precise_inline) && REXCVAR_GET(metal_shader_math) == 0) {
++      static const std::string kOptnone = "[[clang::optnone]] ";
++      for (size_t at = 0; (at = msl_out.find(kOptnone, at)) != std::string::npos;) msl_out.replace(at, kOptnone.size(), "inline ");
++    }
 +  } catch (const std::exception& e) {
 +    error_out = e.what();
 +    return Result::kMslFailed;

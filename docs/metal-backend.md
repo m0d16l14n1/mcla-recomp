@@ -800,5 +800,17 @@ saves 0.6 ms of the command thread's 10.8 a frame. The CPU-written buffers (vert
 buffers) untracked (`--metal_ring_untracked`, off): nothing measurable. Both kept as options, off. Uncapped FPS on a
 warm Air cannot tell a 5% change from the spread; a capped run's command thread time can.
 
+*The guest's exact float operations inlined: +20% in races* (`--metal_shader_precise_inline`, on). The SDK's SPIR-V
+translator marks the guest shaders' multiplies and adds NoContraction (as the Xenos computes them: no fused
+multiply-add, so a position computed in two passes matches). SPIRV-Cross writes those as `spvFMul` (`fma(l, r, 0)`)
+and `spvFAdd` (`fma(1, l, r)`) in `[[clang::optnone]]` functions: 91,000 calls in MCLA's 633 shaders, each a real
+function call on the GPU. With safe math (`metal_shader_math` 0, the default) the fma forms alone already keep the
+rounding (the compiler may not drop the signed zero `fma(l, r, 0)` keeps, nor fuse an fma with an add), so the
+backend now rewrites `[[clang::optnone]]` to `inline` in the guest shaders' MSL. In a race at Performance 60: 56.8
+and 60.0 FPS against 47.5 and 50.7 (the second run held 60 with no hitch, its longest frame 28 ms), GPU 13.7 and
+16.4 ms a frame against 20.7 and 20.3; the scene passes' fragment work 7.6 ms a frame against 11.9 in a trace. In
+free roam at sunset, 59.2 FPS. Pictures checked: races and a sunset drive, no z-fighting or flicker on decals,
+plates, road markings and shadows. Off brings the calls back.
+
 Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
 second), every mode with no warning or error.
