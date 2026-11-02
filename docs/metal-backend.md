@@ -828,3 +828,15 @@ The modes again after the inlining (one race each, cooled to nominal first, M5 A
 | no AA, 60 | 59.7 | 20.1 | 12.4 | no hitch |
 
 No warning or error, no new pipeline in the race and no draw left out in any of them.
+
+*Checked after it, not changed:*
+
+- *Pixel shaders at pixel rate.* Every pixel shader's MSL reads `[[sample_id]]` (SPIRV-Cross reads the translator's
+  SampleRateShading capability, declared for alpha to mask's sample mask, as per-sample shading). Removing the
+  capability where the shader does not read the sample index made no difference in a trace (the scene passes'
+  fragment work 6.3 against 6.4 ms a frame): the targets are single-sample, MSAA being drawn as supersampling, so
+  it would matter only with `--metal_msaa`. Not kept.
+- *What a texture load costs.* The slow frame log now splits off making the texture
+  (`newTextureWithDescriptor`): 11 of 89 ms in the race's first frame (2,938 loads), 7 of 24 ms in a frame
+  with 468, so 12 to 28%. The rest is encoding the untiling dispatch and the blit. Reusing textures would save
+  little.
