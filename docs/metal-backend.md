@@ -562,3 +562,28 @@ shaders are translated for 1x).
 
 Known gaps in M0: no captures (`shot` in a pad script answers "no guest output yet"), no ImGui overlays (the
 provider has no immediate drawer), and the picture is a placeholder that pulses with the swaps.
+
+**Compile stalls, fifteenth pass (2026-11-02): pipeline storage and asynchronous compiles.** A play session from
+`MCLA.app` froze for up to 4.7 s while driving (46 pipelines in one 150-frame window, about 100 ms each), with
+0.3 to 0.7 s freezes after. Render pipelines were built with the synchronous `newRenderPipelineStateWithDescriptor:`
+on the command thread, and a pipeline macOS hasn't compiled before costs 50 to 100+ ms; `MCLA.app` has its own
+per-app shader cache (`$(getconf DARWIN_USER_CACHE_DIR)/local.mcla-recomp`), separate from the build folder's, so
+its first sessions met far more cold compiles than the test runs. Reproduced with that cache emptied, on the drive
+route: 246 pipelines built in draws in 11.6 s, freezes of 4.9, 3.0 and 1.7 s. Two changes:
+- **Pipeline storage** (`metal_pipeline_storage`, on): each pipeline a run builds goes to
+  `<cache>/shaders/metal/<title>.mcla-metal-pipelines` (magic `MCLAMTP1`; records of the vertex and pixel shader
+  hashes and modifications and the key's words 2 to 5, which the descriptor is now made from, `PipelineDescriptor`).
+  At boot, after the shader warm-up, a thread waits for the warm-up's libraries and builds them with the
+  asynchronous `newRenderPipelineStateWithDescriptor:completionHandler:`, half the cores' worth in flight; a draw that
+  needs one being built waits for it, one not started yet the draw builds itself. 363 pipelines in 0.4 s with a warm
+  cache, 313 in 11 s with a cold one (in the background, during the intro).
+- **Asynchronous compiles** (`metal_async_compile`, on): a draw whose shader library or pipeline is still compiling
+  waits only within the frame's budget (`metal_async_compile_budget_ms`, 4 ms in all), then is left out; new
+  pipelines are started on Metal's threads (and stored) instead of built synchronously. The shader path no longer
+  waits for every pending compile (`MetalShaderCompiler::Wait`) but for the draw's own translations
+  (`WaitForLibrary`). Cold cache, storage off: no freeze; at most 115 ms waited in a 150-frame window, a few hundred
+  draws left out in the windows where new pipelines appeared, route finished. A later play session: 337 pipelines from
+  the storage, 12 new, 140 draws left out after boot, no stall.
+The 150-frame `Metal frame time` line now ends with the pipelines created, those taken from the storage (and the time
+waited for them) and the draws left out. What remains in long sessions is heat: after about 2 minutes the MacBook Air
+reaches thermal pressure 2 and the command thread's CPU time goes from about 9 to 19-25 ms a frame (37 to 54 FPS).

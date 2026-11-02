@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,570 @@
+@@ -0,0 +1,634 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -367,6 +367,70 @@ new file mode 100644
 +    uint8_t tag = 2; uint64_t entry[2] = {hash, modification};
 +    std::fwrite(&tag, 1, 1, shader_storage_); std::fwrite(entry, 8, 2, shader_storage_);
 +    std::fflush(shader_storage_);
++  };
++  InitializePipelineStorage(dir, title_id);
++}
++
++REXCVAR_DEFINE_BOOL(metal_pipeline_storage, true, "GPU/Metal",
++                    "Keep the pipelines built in a run and build them on Metal's threads from the next start (no "
++                    "stall the first time a place or effect needs one)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++void MetalCommandProcessor::InitializePipelineStorage(const std::filesystem::path& dir, uint32_t title_id) {
++  if (!draw_ || !REXCVAR_GET(metal_pipeline_storage)) return;
++  if (pipeline_storage_) { std::fclose(pipeline_storage_); pipeline_storage_ = nullptr; }
++  auto path = dir / fmt::format("{:08X}.mcla-metal-pipelines", title_id);
++  // A new magic when the key or the descriptor made from it changes.
++  static constexpr char kMagic[8] = {'M', 'C', 'L', 'A', 'M', 'T', 'P', '1'};
++  // Records: vertex shader hash and modification, pixel shader hash (0: none) and modification, then MetalDraw's
++  // key words 2 to 5.
++  using Record = std::array<uint64_t, 8>;
++  auto record_hash = [](const Record& r) { return XXH3_64bits(r.data(), sizeof(Record)); };
++  std::vector<MetalDraw::PipelineKey> keys;
++  size_t valid_bytes = 0, records = 0;
++  if (std::FILE* in = std::fopen(path.string().c_str(), "rb")) {
++    char magic[8];
++    if (std::fread(magic, 1, 8, in) == 8 && !std::memcmp(magic, kMagic, 8)) {
++      valid_bytes = 8;
++      for (Record r; std::fread(r.data(), sizeof(Record), 1, in) == 1;) {
++        valid_bytes += sizeof(Record);
++        if (!stored_pipelines_.insert(record_hash(r)).second) continue;
++        ++records;
++        auto vs = shaders_.find(r[0]);
++        if (vs == shaders_.end()) continue;
++        const Shader::Translation* vt = vs->second->GetTranslation(r[1]);
++        const Shader::Translation* pt = nullptr;
++        if (r[2]) {
++          auto ps = shaders_.find(r[2]);
++          if (ps == shaders_.end()) continue;
++          pt = ps->second->GetTranslation(r[3]);
++          if (!pt) continue;
++        }
++        if (!vt) continue;
++        keys.push_back({uint64_t(reinterpret_cast<uintptr_t>(vt)), uint64_t(reinterpret_cast<uintptr_t>(pt)),
++                        r[4], r[5], r[6], r[7]});
++      }
++    }
++    std::fclose(in);
++  }
++  REXGPU_INFO("Metal pipeline storage: {} pipelines, {} with their shaders in the shader storage ({})", records,
++              keys.size(), path.string());
++  draw_->Prebuild(std::move(keys));
++  std::error_code error;
++  if (valid_bytes) std::filesystem::resize_file(path, valid_bytes, error);
++  pipeline_storage_ = std::fopen(path.string().c_str(), valid_bytes ? "ab" : "wb");
++  if (!pipeline_storage_) return;
++  if (!valid_bytes) std::fwrite(kMagic, 1, 8, pipeline_storage_);
++  std::fflush(pipeline_storage_);
++  draw_->on_new_pipeline_ = [this, record_hash](const MetalDraw::PipelineKey& key) {
++    if (!pipeline_storage_) return;
++    auto vt = reinterpret_cast<const Shader::Translation*>(uintptr_t(key[0]));
++    auto pt = reinterpret_cast<const Shader::Translation*>(uintptr_t(key[1]));
++    Record r{vt->shader().ucode_data_hash(), vt->modification(), pt ? pt->shader().ucode_data_hash() : 0,
++             pt ? pt->modification() : 0, key[2], key[3], key[4], key[5]};
++    if (!stored_pipelines_.insert(record_hash(r)).second) return;
++    std::fwrite(r.data(), sizeof(Record), 1, pipeline_storage_);
++    std::fflush(pipeline_storage_);
 +  };
 +}
 +
@@ -705,7 +769,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,409 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -719,6 +783,11 @@ new file mode 100644
 +#include <atomic>
 +#include <chrono>
 +#include <memory>
++#include <mutex>
++#include <condition_variable>
++#include <thread>
++#include <array>
++#include <vector>
 +
 +namespace rex::graphics::metal {
 +class MetalPrimitiveProcessor;
@@ -803,6 +872,24 @@ new file mode 100644
 +  uint64_t draws() const { return draws_; }
 +  uint64_t resolves() const { return resolves_; }
 +  uint64_t failures() const { return failures_ + gpu_errors_->load(); }
++  // A pipeline's key: the vertex and pixel translations (Shader::Translation*, the pixel one 0 for none), the
++  // color mask with the depth attachment's presence (bit 32) and the raster sample count (from bit 33), the four
++  // attachment formats (16 bits each), and the blends of the written attachments (two per word). All but the
++  // translations is what the descriptor is made from (PipelineDescriptor).
++  using PipelineKey = std::array<uint64_t, 6>;
++  struct PipelineKeyHash {
++    size_t operator()(const PipelineKey& k) const {
++      uint64_t h = 0x9E3779B97F4A7C15ull;
++      for (uint64_t v : k) h = (h ^ v) * 0x100000001B3ull ^ (h >> 29);
++      return size_t(h);
++    }
++  };
++  // The pipeline storage (metal_pipeline_storage): pipelines of earlier runs, built on Metal's threads from the
++  // start (a thread waits for the warm-up's shader compiles first). A draw that needs one already being built waits
++  // for it; one not started yet the draw builds itself. Command processor thread, before the first draw.
++  void Prebuild(std::vector<PipelineKey> keys);
++  // Each pipeline a draw built itself (the storage records it). Command processor thread.
++  std::function<void(const PipelineKey&)> on_new_pipeline_;
 + private:
 +  id<MTLTexture> HdrTarget(uint32_t key, uint32_t& kind);
 +  // Before an HDR copy, clear or restore on a target: the open pass ended, its waiting clears drawn, the EDRAM
@@ -975,17 +1062,29 @@ new file mode 100644
 +  uint64_t texture_hashed_ = 0, texture_watch_hits_ = 0, snapshot_changed_ = 0, snapshot_changed_bytes_ = 0;
 +  uint64_t frame_ = 1;
 +  std::unordered_map<uint64_t, id<MTLSamplerState>> samplers_;
-+  // The vertex and pixel translations, the color mask with the depth attachment's presence (bit 32), the four
-+  // attachment formats (16 bits each), and the blends of the written attachments (two per word).
-+  using PipelineKey = std::array<uint64_t, 6>;
-+  struct PipelineKeyHash {
-+    size_t operator()(const PipelineKey& k) const {
-+      uint64_t h = 0x9E3779B97F4A7C15ull;
-+      for (uint64_t v : k) h = (h ^ v) * 0x100000001B3ull ^ (h >> 29);
-+      return size_t(h);
-+    }
-+  };
 +  std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelines_;
++  MTLRenderPipelineDescriptor* PipelineDescriptor(id<MTLLibrary> vl, id<MTLLibrary> pl, const PipelineKey& key) const;
++  // A stored pipeline for this key: built, or waited for while Metal builds it; nil and found false when the draw
++  // has to build it (not stored, not started yet, or it failed).
++  // pending: still being built at the deadline (the draw is left out).
++  id<MTLRenderPipelineState> TakePrebuilt(const PipelineKey& key, bool& found, bool& pending,
++                                          std::chrono::steady_clock::time_point deadline);
++  // metal_async_compile: a new pipeline built on Metal's threads, as the stored ones are.
++  void StartBuild(const PipelineKey& key, id<MTLLibrary> vl, id<MTLLibrary> pl);
++  void SpendAsyncBudget(std::chrono::steady_clock::time_point since);
++  int64_t async_budget_us_ = 0;
++  uint64_t async_builds_ = 0, async_skipped_ = 0;
++  void PrebuildDone(const PipelineKey& key, id<MTLRenderPipelineState> state);
++  std::mutex prebuild_mutex_;
++  std::condition_variable prebuild_cv_;
++  std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> prebuilt_;
++  std::unordered_set<PipelineKey, PipelineKeyHash> prebuild_waiting_, prebuild_started_;
++  uint32_t prebuild_in_flight_ = 0, prebuild_built_ = 0, prebuild_failed_ = 0, prebuild_total_ = 0;
++  bool prebuild_submitted_ = false, prebuild_logged_ = false;
++  void LogPrebuildLocked();
++  std::chrono::steady_clock::time_point prebuild_start_;
++  std::thread prebuild_thread_;
++  uint64_t prebuilt_used_ = 0, prebuilt_wait_us_ = 0;
 +  // RB_DEPTHCONTROL, then the front and back stencil masks (RB_STENCILREFMASK bits 8 to 23; the reference is set
 +  // on the encoder).
 +  std::unordered_map<uint64_t, id<MTLDepthStencilState>> depth_states_;
@@ -1084,7 +1183,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2817 @@
+@@ -0,0 +1,2969 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1102,6 +1201,11 @@ new file mode 100644
 +#include <filesystem>
 +#include <fstream>
 +#include <rex/cvar.h>
++REXCVAR_DEFINE_BOOL(metal_async_compile, true, "GPU/Metal",
++    "A draw whose shaders or pipeline Metal is still compiling (the first time a place or effect is seen) is left out "
++    "rather than the game waiting for it, once the frame's wait budget (metal_async_compile_budget_ms) is spent");
++REXCVAR_DEFINE_INT32(metal_async_compile_budget_ms, 4, "GPU/Metal",
++    "With metal_async_compile: how long a frame may wait in all for compiles before draws are left out");
 +REXCVAR_DEFINE_BOOL(metal_gpu_fences, false, "GPU/Metal",
 +    "Guest fences (EVENT_WRITE_SHD) written by the GPU after the work before them, not by the command processor");
 +REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal", "Resolves write guest memory (diagnostic: false keeps them on the GPU only)");
@@ -1292,7 +1396,14 @@ new file mode 100644
 +    memory::Memory& memory, RegisterFile& regs, MetalShaderCompiler& shaders, uint32_t edram_tiles)
 +    : device_(device), queue_(queue), memory_buffer_(memory_buffer), memory_(memory), regs_(regs),
 +      shaders_(shaders), edram_tiles_(edram_tiles) {}
-+MetalDraw::~MetalDraw() { Submit(); primitives_.reset(); shared_.reset(); }
++MetalDraw::~MetalDraw() {
++  if (prebuild_thread_.joinable()) prebuild_thread_.join();
++  {
++    std::unique_lock<std::mutex> lock(prebuild_mutex_);
++    prebuild_cv_.wait(lock, [this] { return prebuild_in_flight_ == 0; });
++  }
++  Submit(); primitives_.reset(); shared_.reset();
++}
 +bool MetalDraw::Initialize() {
 +  snapshot_buffer_ = [device_ newBufferWithLength:2 * kSnapshotRing + kSnapshotPersistent options:MTLResourceStorageModeShared];
 +  if (!snapshot_buffer_) return false;
@@ -1421,6 +1532,7 @@ new file mode 100644
 +  // The frame goes to the GPU without waiting for it; the next one is encoded meanwhile, into the other
 +  // snapshot buffer, once the frame before last (its previous user) is done.
 +  Submit(false);
++  async_budget_us_ = int64_t(std::max(0, REXCVAR_GET(metal_async_compile_budget_ms))) * 1000;
 +  split_last_.swap(split_now_); std::fill(split_now_.begin(), split_now_.end(), 0); frame_passes_ = 0;
 +  frame_done_[slot_] = last_committed_;
 +  slot_ ^= 1;
@@ -1459,11 +1571,11 @@ new file mode 100644
 +    snapshot_changed_ = 0; snapshot_changed_bytes_ = 0;
 +    REXGPU_INFO("Metal frame time: {:.1f} ms a frame, GPU busy {:.1f} ms, CPU waiting for the GPU {:.1f} ms; {:.1f} texture loads ({:.1f} made from resolves, {:.0f} rows loaded for them), {:.1f} resolve textures reused, "
 +        "{:.1f} MB of vertices and indices hashed and {:.1f} MB copied ({:.0f} kept from earlier frames), {:.1f} MB of textures hashed ({:.1f} skipped by watches), "
-+        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers, {:.1f} ended for texture loads, {:.1f} loads before their pass) a frame; {} pipelines created ({:.1f} ms)",
++        "{:.1f} EDRAM transfers ({:.1f} in the draw's pass), {:.1f} resolve clears in the next pass ({:.1f} as its load action), {:.1f} render passes ({:.1f} draws kept in the open pass, {:.1f} passes restarted for transfers, {:.1f} ended for texture loads, {:.1f} loads before their pass) a frame; {} pipelines created ({:.1f} ms), {} from the storage ({:.1f} ms waited for), {} draws left out while Metal compiled",
 +        wall / 1000.0 / 150, gpu_us_->exchange(0) / 1000.0 / 150, wait_us_ / 1000.0 / 150, texture_loads_ / 150.0, textures_composed_ / 150.0, texture_rows_loaded_ / 150.0, textures_reused_ / 150.0,
 +        snapshot_hashed_ / 1048576.0 / 150, snapshot_copied_ / 1048576.0 / 150, snapshot_persistent_hits_ / 150.0, texture_hashed_ / 1048576.0 / 150,
-+        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0);
-+    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0;
++        texture_watch_hits_ / 150.0, edram_transfers_ / 150.0, edram_transfers_in_pass_ / 150.0, clears_in_pass_ / 150.0, clears_as_load_ / 150.0, passes_ / 150.0, passes_merged_ / 150.0, passes_resynced_ / 150.0, passes_split_for_textures_ / 150.0, texture_work_before_pass_ / 150.0, pipelines_created_, pipeline_us_ / 1000.0, prebuilt_used_, prebuilt_wait_us_ / 1000.0, async_skipped_);
++    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0; prebuilt_used_ = 0; prebuilt_wait_us_ = 0; async_skipped_ = 0;
 +    stats_frames_ = 0; wait_us_ = 0; texture_loads_ = 0; textures_composed_ = 0; texture_rows_loaded_ = 0; textures_reused_ = 0; snapshot_hashed_ = 0; snapshot_copied_ = 0; snapshot_persistent_hits_ = 0; texture_hashed_ = 0; texture_watch_hits_ = 0; stats_start_ = std::chrono::steady_clock::now();
 +  }
 +  if (DebugFrame() && !debug_snapshots_.empty()) {
@@ -1658,6 +1770,133 @@ new file mode 100644
 +  return result;
 +}
 +
++MTLRenderPipelineDescriptor* MetalDraw::PipelineDescriptor(id<MTLLibrary> vl, id<MTLLibrary> pl,
++                                                           const PipelineKey& key) const {
++  // The descriptor only for a new pipeline (building it for every draw was 9% of the thread).
++  auto pd = [MTLRenderPipelineDescriptor new];
++  pd.vertexFunction = [vl newFunctionWithName:vl.functionNames.firstObject];
++  if (pl) pd.fragmentFunction = [pl newFunctionWithName:pl.functionNames.firstObject];
++  pd.rasterSampleCount = NSUInteger(key[2] >> 33);
++  const uint32_t mask = uint32_t(key[2]);
++  for (uint32_t i = 0; i < 4; ++i) {
++    const auto format = MTLPixelFormat((key[3] >> (16 * i)) & 0xFFFF);
++    reg::RB_BLENDCONTROL bc; bc.value = uint32_t(key[4 + i / 2] >> (32 * (i & 1)));
++    auto a = pd.colorAttachments[i]; a.pixelFormat = format;
++    uint32_t wm = (mask >> (4 * i)) & 15;
++    a.writeMask = MTLColorWriteMask(((wm & 1) ? MTLColorWriteMaskRed : 0) |
++      ((wm & 2) ? MTLColorWriteMaskGreen : 0) | ((wm & 4) ? MTLColorWriteMaskBlue : 0) |
++      ((wm & 8) ? MTLColorWriteMaskAlpha : 0));
++    a.blendingEnabled = format != MTLPixelFormatInvalid && wm && (bc.value & 0x1FFF1FFF) != 0x00010001;
++    a.sourceRGBBlendFactor = BlendFactor(bc.color_srcblend); a.destinationRGBBlendFactor = BlendFactor(bc.color_destblend);
++    a.sourceAlphaBlendFactor = BlendFactor(bc.alpha_srcblend); a.destinationAlphaBlendFactor = BlendFactor(bc.alpha_destblend);
++    a.rgbBlendOperation = BlendOp(bc.color_comb_fcn); a.alphaBlendOperation = BlendOp(bc.alpha_comb_fcn);
++  }
++  if ((key[2] >> 32) & 1) pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
++  return pd;
++}
++
++void MetalDraw::Prebuild(std::vector<PipelineKey> keys) {
++  if (keys.empty() || prebuild_thread_.joinable()) return;
++  {
++    std::lock_guard<std::mutex> lock(prebuild_mutex_);
++    for (const auto& key : keys) if (!pipelines_.count(key)) prebuild_waiting_.insert(key);
++    prebuild_total_ = uint32_t(prebuild_waiting_.size());
++  }
++  prebuild_start_ = std::chrono::steady_clock::now();
++  prebuild_thread_ = std::thread([this, keys = std::move(keys)] {
++    // The libraries first (the warm-up's compiles), then a few pipelines at a time: a draw's own build waits
++    // behind whatever Metal was given before it.
++    shaders_.Wait();
++    const uint32_t max_in_flight = std::max(2u, std::thread::hardware_concurrency() / 2);
++    for (const auto& key : keys) {
++      {
++        std::unique_lock<std::mutex> lock(prebuild_mutex_);
++        prebuild_cv_.wait(lock, [&] { return prebuild_in_flight_ < max_in_flight; });
++        // Taken by a draw before it was started (the draw builds it), or a repeat.
++        if (!prebuild_waiting_.erase(key)) continue;
++        prebuild_started_.insert(key);
++        ++prebuild_in_flight_;
++      }
++      auto vt = reinterpret_cast<const Shader::Translation*>(uintptr_t(key[0]));
++      auto pt = reinterpret_cast<const Shader::Translation*>(uintptr_t(key[1]));
++      id<MTLLibrary> vl = shaders_.GetLibrary(vt), pl = pt ? shaders_.GetLibrary(pt) : nil;
++      if (!vl || (pt && !pl)) { PrebuildDone(key, nil); continue; }
++      const PipelineKey copy = key;
++      [device_ newRenderPipelineStateWithDescriptor:PipelineDescriptor(vl, pl, key)
++                                  completionHandler:^(id<MTLRenderPipelineState> state, NSError*) {
++                                    PrebuildDone(copy, state);
++                                  }];
++    }
++    std::lock_guard<std::mutex> lock(prebuild_mutex_);
++    prebuild_submitted_ = true;
++    LogPrebuildLocked();
++    prebuild_cv_.notify_all();
++  });
++}
++
++void MetalDraw::PrebuildDone(const PipelineKey& key, id<MTLRenderPipelineState> state) {
++  std::lock_guard<std::mutex> lock(prebuild_mutex_);
++  prebuild_started_.erase(key);
++  if (state) { prebuilt_[key] = state; ++prebuild_built_; } else ++prebuild_failed_;
++  --prebuild_in_flight_;
++  LogPrebuildLocked();
++  prebuild_cv_.notify_all();
++}
++
++void MetalDraw::LogPrebuildLocked() {
++  if (!prebuild_submitted_ || prebuild_in_flight_ || prebuild_logged_) return;
++  prebuild_logged_ = true;
++  REXGPU_INFO("Metal pipeline storage: {} of {} pipelines of earlier runs built ahead in {} ms ({} failed or without "
++              "their shaders, the rest needed by a draw first)", prebuild_built_, prebuild_total_,
++              std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - prebuild_start_).count(),
++              prebuild_failed_);
++}
++
++id<MTLRenderPipelineState> MetalDraw::TakePrebuilt(const PipelineKey& key, bool& found, bool& pending,
++                                                   std::chrono::steady_clock::time_point deadline) {
++  found = false; pending = false;
++  if (!prebuild_total_ && !async_builds_) return nil;
++  std::unique_lock<std::mutex> lock(prebuild_mutex_);
++  if (prebuild_waiting_.erase(key)) return nil;  // not started: the draw builds it now
++  if (prebuild_started_.count(key)) {
++    const auto start = std::chrono::steady_clock::now();
++    if (deadline == std::chrono::steady_clock::time_point::max())
++      prebuild_cv_.wait(lock, [&] { return !prebuild_started_.count(key); });
++    else
++      prebuild_cv_.wait_until(lock, deadline, [&] { return !prebuild_started_.count(key); });
++    prebuilt_wait_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
++    if (prebuild_started_.count(key)) { pending = true; return nil; }
++  }
++  auto it = prebuilt_.find(key);
++  if (it == prebuilt_.end()) return nil;
++  id<MTLRenderPipelineState> state = it->second;
++  prebuilt_.erase(it);
++  found = true;
++  ++prebuilt_used_;
++  return state;
++}
++
++void MetalDraw::StartBuild(const PipelineKey& key, id<MTLLibrary> vl, id<MTLLibrary> pl) {
++  ++async_builds_;
++  {
++    std::lock_guard<std::mutex> lock(prebuild_mutex_);
++    prebuild_started_.insert(key);
++    ++prebuild_in_flight_;
++  }
++  const PipelineKey copy = key;
++  [device_ newRenderPipelineStateWithDescriptor:PipelineDescriptor(vl, pl, key)
++                              completionHandler:^(id<MTLRenderPipelineState> state, NSError* error) {
++                                if (!state)
++                                  REXGPU_ERROR("Metal pipeline failed: {}", error ? error.localizedDescription.UTF8String : "?");
++                                PrebuildDone(copy, state);
++                              }];
++}
++
++void MetalDraw::SpendAsyncBudget(std::chrono::steady_clock::time_point since) {
++  const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count();
++  async_budget_us_ = std::max<int64_t>(0, async_budget_us_ - us);
++}
++
 +bool MetalDraw::Draw(Shader* vs, Shader* ps) {
 +  @autoreleasepool {
 +    if (!vs) return true;
@@ -1685,12 +1924,24 @@ new file mode 100644
 +    uint64_t vm, pm;
 +    shaders_.translator().GetDrawModifications(regs_, *vs, ps, vm, pm, primitive.host_vertex_shader_type);
 +    shaders_.Request(*vs, vm); if (ps) shaders_.Request(*ps, pm);
-+    shaders_.Wait();
++    const bool async = REXCVAR_GET(metal_async_compile);
++    if (!async) shaders_.Wait();
 +    if (REXCVAR_GET(metal_draw_stop) == 2) return true;
 +    auto vt = vs->GetOrCreateTranslation(vm);
 +    auto pt = ps ? ps->GetOrCreateTranslation(pm) : nullptr;
 +    last_vt_ = vt; last_pt_ = pt;
-+    id<MTLLibrary> vl = shaders_.GetLibrary(vt), pl = pt ? shaders_.GetLibrary(pt) : nil;
++    id<MTLLibrary> vl, pl;
++    if (async) {
++      bool vs_compiling = false, ps_compiling = false;
++      const auto wait_start = std::chrono::steady_clock::now();
++      const auto deadline = wait_start + std::chrono::microseconds(async_budget_us_);
++      vl = shaders_.WaitForLibrary(vt, deadline, vs_compiling);
++      pl = pt ? shaders_.WaitForLibrary(pt, deadline, ps_compiling) : nil;
++      SpendAsyncBudget(wait_start);
++      if (vs_compiling || ps_compiling) { ++async_skipped_; return true; }
++    } else {
++      vl = shaders_.GetLibrary(vt); pl = pt ? shaders_.GetLibrary(pt) : nil;
++    }
 +    if (!vl || (ps && !pl)) { ++failures_; return false; }
 +    auto dc = draw_util::GetNormalizedDepthControl(regs_);
 +    uint32_t mask = draw_util::GetNormalizedColorMask(regs_, ps ? ps->writes_color_targets() : 0);
@@ -1944,31 +2195,31 @@ new file mode 100644
 +    auto pi = pipelines_.find(key);
 +    if (pi != pipelines_.end()) pipeline = pi->second;
 +    else {
-+      // The descriptor only for a new pipeline (building it for every draw was 9% of the thread).
-+      auto pd = [MTLRenderPipelineDescriptor new];
-+      pd.vertexFunction = [vl newFunctionWithName:vl.functionNames.firstObject];
-+      if (pl) pd.fragmentFunction = [pl newFunctionWithName:pl.functionNames.firstObject];
-+      pd.rasterSampleCount = raster_samples;
-+      for (uint32_t i = 0; i < 4; ++i) {
-+        reg::RB_BLENDCONTROL bc; bc.value = blends[i];
-+        auto a = pd.colorAttachments[i]; a.pixelFormat = formats[i];
-+        uint32_t wm = (mask >> (4 * i)) & 15;
-+        a.writeMask = MTLColorWriteMask(((wm & 1) ? MTLColorWriteMaskRed : 0) |
-+          ((wm & 2) ? MTLColorWriteMaskGreen : 0) | ((wm & 4) ? MTLColorWriteMaskBlue : 0) |
-+          ((wm & 8) ? MTLColorWriteMaskAlpha : 0));
-+        a.blendingEnabled = formats[i] != MTLPixelFormatInvalid && wm && (bc.value & 0x1FFF1FFF) != 0x00010001;
-+        a.sourceRGBBlendFactor = BlendFactor(bc.color_srcblend); a.destinationRGBBlendFactor = BlendFactor(bc.color_destblend);
-+        a.sourceAlphaBlendFactor = BlendFactor(bc.alpha_srcblend); a.destinationAlphaBlendFactor = BlendFactor(bc.alpha_destblend);
-+        a.rgbBlendOperation = BlendOp(bc.color_comb_fcn); a.alphaBlendOperation = BlendOp(bc.alpha_comb_fcn);
++      bool stored = false, pending = false;
++      auto wait_start = std::chrono::steady_clock::now();
++      pipeline = TakePrebuilt(key, stored, pending, async ? wait_start + std::chrono::microseconds(async_budget_us_)
++                                                          : std::chrono::steady_clock::time_point::max());
++      if (async) SpendAsyncBudget(wait_start);
++      if (!stored && !pending && async) {
++        // New: built on Metal's threads (and kept in the storage), waited for only within the frame's budget.
++        StartBuild(key, vl, pl);
++        if (on_new_pipeline_) on_new_pipeline_(key);
++        ++pipelines_created_;
++        wait_start = std::chrono::steady_clock::now();
++        pipeline = TakePrebuilt(key, stored, pending, wait_start + std::chrono::microseconds(async_budget_us_));
++        SpendAsyncBudget(wait_start);
 +      }
-+      if (attachments_[4]) pd.depthAttachmentPixelFormat = pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-+      NSError* error = nil;
-+      auto pipeline_start = std::chrono::steady_clock::now();
-+      pipeline = [device_ newRenderPipelineStateWithDescriptor:pd error:&error];
-+      ++pipelines_created_;
-+      pipeline_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pipeline_start).count();
++      if (pending) { ++async_skipped_; return true; }
++      if (!stored) {
++        NSError* error = nil;
++        auto pipeline_start = std::chrono::steady_clock::now();
++        pipeline = [device_ newRenderPipelineStateWithDescriptor:PipelineDescriptor(vl, pl, key) error:&error];
++        ++pipelines_created_;
++        pipeline_us_ += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - pipeline_start).count();
++        if (!pipeline) { ++failures_; REXGPU_ERROR("Metal pipeline failed: {}", error.localizedDescription.UTF8String); }
++        else if (on_new_pipeline_) on_new_pipeline_(key);
++      }
 +      pipelines_[key] = pipeline;
-+      if (!pipeline) { ++failures_; REXGPU_ERROR("Metal pipeline failed: {}", error.localizedDescription.UTF8String); }
 +    }
 +    if (!pipeline) return false;
 +    if (REXCVAR_GET(metal_draw_stop) == 3) return true;
@@ -3906,7 +4157,7 @@ diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_inte
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,230 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -4123,6 +4374,11 @@ new file mode 100644
 +  std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
 +  std::FILE* shader_storage_ = nullptr;
 +  std::unordered_set<uint64_t> stored_shaders_;
++  // The pipeline storage: each pipeline a draw built (its shaders' hashes and modifications, and the rest of
++  // MetalDraw's key), built ahead from the next start (metal_pipeline_storage).
++  void InitializePipelineStorage(const std::filesystem::path& dir, uint32_t title_id);
++  std::FILE* pipeline_storage_ = nullptr;
++  std::unordered_set<uint64_t> stored_pipelines_;
 +
 +  uint64_t swaps_ = 0;
 +  uint64_t stats_draws_ = 0;
@@ -5748,7 +6004,7 @@ diff --git a/src/graphics/metal/metal_shaders.h b/src/graphics/metal/metal_shade
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shaders.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,86 @@
 +/**
 + * @file        graphics/metal/metal_shaders.h
 + * @brief       Guest shaders to Metal libraries: MetalShaderTranslator's MSL through Metal's compiler
@@ -5773,6 +6029,8 @@ new file mode 100644
 +#include <condition_variable>
 +#include <string>
 +#include <unordered_map>
++#include <unordered_set>
++#include <chrono>
 +#include <functional>
 +#include <vector>
 +
@@ -5809,6 +6067,10 @@ new file mode 100644
 +
 +  // The compiled library of a translation, nil while compiling or after a failure. Any thread.
 +  id<MTLLibrary> GetLibrary(const Shader::Translation* translation) const;
++  // Waits at most until the deadline for a translation's library; nil with compiling set while Metal still compiles
++  // it, nil without it after a failure (or when it was never compiled).
++  id<MTLLibrary> WaitForLibrary(const Shader::Translation* translation,
++                                std::chrono::steady_clock::time_point deadline, bool& compiling);
 +
 +  const Stats& stats() const { return stats_; }
 +
@@ -5825,6 +6087,7 @@ new file mode 100644
 +  mutable std::mutex libraries_mutex_;
 +  std::condition_variable libraries_ready_;
 +  std::unordered_map<const Shader::Translation*, id<MTLLibrary>> libraries_;
++  std::unordered_set<const Shader::Translation*> compiling_;
 +};
 +
 +}  // namespace rex::graphics::metal
@@ -5832,7 +6095,7 @@ diff --git a/src/graphics/metal/metal_shaders.mm b/src/graphics/metal/metal_shad
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shaders.mm
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,197 @@
 +/**
 + * @file        graphics/metal/metal_shaders.mm
 + * @brief       Guest shaders to Metal (see metal_shaders.h)
@@ -5942,6 +6205,7 @@ new file mode 100644
 +  // The handler runs on a Metal thread; it copies what it needs (the MSL for a dump, the translation pointer as
 +  // the key: translations live as long as their shader, which the command processor keeps).
 +  std::string msl_copy = msl;
++  { std::lock_guard<std::mutex> lock(libraries_mutex_); compiling_.insert(translation); }
 +  [device_ newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
 +                        options:compile_options_
 +              completionHandler:^(id<MTLLibrary> library, NSError* error) {
@@ -5953,12 +6217,14 @@ new file mode 100644
 +                  REXGPU_WARN("Metal: shader {:016X} (modification {:016X}) did not compile: {}", hash,
 +                              modification, std::string(message).substr(0, 300));
 +                  Dump(*shader_ptr, modification, msl_copy, message);
-+                  { std::lock_guard<std::mutex> lock(libraries_mutex_); --stats_.pending; libraries_ready_.notify_all(); }
++                  { std::lock_guard<std::mutex> lock(libraries_mutex_);
++                    compiling_.erase(translation); --stats_.pending; libraries_ready_.notify_all(); }
 +                  return;
 +                }
 +                ++stats_.compiled;
 +                { std::lock_guard<std::mutex> lock(libraries_mutex_);
-+                  libraries_[translation] = library; --stats_.pending; libraries_ready_.notify_all(); }
++                  libraries_[translation] = library; compiling_.erase(translation); --stats_.pending;
++                  libraries_ready_.notify_all(); }
 +              }];
 +}
 +
@@ -5996,6 +6262,15 @@ new file mode 100644
 +
 +id<MTLLibrary> MetalShaderCompiler::GetLibrary(const Shader::Translation* translation) const {
 +  std::lock_guard<std::mutex> lock(libraries_mutex_);
++  auto it = libraries_.find(translation);
++  return it != libraries_.end() ? it->second : nil;
++}
++
++id<MTLLibrary> MetalShaderCompiler::WaitForLibrary(const Shader::Translation* translation,
++                                                   std::chrono::steady_clock::time_point deadline, bool& compiling) {
++  std::unique_lock<std::mutex> lock(libraries_mutex_);
++  libraries_ready_.wait_until(lock, deadline, [&] { return !compiling_.count(translation); });
++  compiling = compiling_.count(translation) != 0;
 +  auto it = libraries_.find(translation);
 +  return it != libraries_.end() ? it->second : nil;
 +}

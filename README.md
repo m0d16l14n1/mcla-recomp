@@ -128,6 +128,9 @@ The Metal backend's speed-ups are on by default, and each has an off switch for 
 | `--mcla_fence_sleep_us=0` | Spin while the game waits for the GPU, as before |
 | `--metal_edram_transfers=false` | No EDRAM ownership transfers between targets (the minimap goes wrong) |
 | `--metal_shader_storage=false` | No shader storage and warm-up at boot |
+| `--metal_pipeline_storage=false` | No pipeline storage: pipelines of earlier runs are not built ahead at boot |
+| `--metal_async_compile=false` | Wait for every new shader and pipeline to compile (freezes the first time a place is seen) instead of leaving its draw out for a moment |
+| `--metal_async_compile_budget_ms=4` | How long a frame may wait in all for compiles before draws are left out |
 | `--metal_taa_upscale=false` | No MetalFX upscaling (the scene drawn at full size whatever `mcla_upscaling` says) |
 | `--metal_4x_as_1x=false` | The game's MSAA 4x surfaces (the reflections) drawn as 2x2 supersampling, as before, instead of one sample a pixel (slower: about 16% at MetalFX Performance) |
 | `--metal_msaa=true` | MSAA surfaces as Metal multisample textures instead of supersampling (correct, but about half the frame rate; for testing) |
@@ -139,7 +142,7 @@ Every 150 frames the log has a `Metal frame time` line (frame time, GPU time, te
 
 - Frame rates vary a lot with what else the Mac runs and with its temperature: with four performance cores, a VM or a busy WindowServer pushes the game's threads onto the efficiency cores, and after a few minutes of load the CPU slows down.
 - The Metal backend draws MSAA 2x as 1x2 supersampling and MSAA 4x (the reflections) at one sample a pixel: real multisample textures are an option (`--metal_msaa=true`) but half as fast on Apple's GPUs here. It still lacks 3D textures (nothing sampled one in testing).
-- On a first run, or in new places, objects can be missing for a moment while their shaders compile; the Metal backend translates the shaders of earlier runs at boot.
+- On a first run, or in new places, objects can be missing for a moment while their shaders and pipelines compile (a frame waits at most 4 ms for them); the Metal backend translates the shaders and builds the pipelines of earlier runs at boot. `MCLA.app` has its own macOS shader cache, so the first session from the app compiles more than runs from the build folder.
 
 ## More documentation
 
