@@ -787,5 +787,18 @@ encoder, 10 to 15 µs; the dispatches and copies), the watches nothing measurabl
 about 3 cores in a race, waiting on condition variables most of the time and otherwise running the game: no
 spinning to remove.
 
+*Resolves and Metal's hazard tracking, tried.* Resolves write both their texture and the guest memory (tiled,
+for the CPU and for textures loaded from it); without the memory write (`--metal_resolve_to_memory=false`, a
+diagnostic) the command buffers' GPU time falls from 20.4 to 16.7 ms a frame, but the GPU's actual resolve work
+only from 2.13 to 1.28 ms (trace), and the minimap loses its roads: some resolves are read from memory. The 512 MB
+guest memory buffer was then made untracked (`--metal_memory_untracked`, off), its users ordered by the backend's
+own fences (writers, the resolves and fence writes, after every earlier user; readers, the texture loads, after
+the writes only). Untracked without any fence won three pairs (46.1, 48.2, 49.0 against 42.7, 43.4, 41.8 FPS) but
+is not safe; with the fences the uncapped races are inside the spread (46.2 and 46.6 against 42.9 and 47.7), and
+at a 30 FPS cap, where the chip's load is the same for every variant and the command thread's time compares, it
+saves 0.6 ms of the command thread's 10.8 a frame. The CPU-written buffers (vertex snapshots, constants, index
+buffers) untracked (`--metal_ring_untracked`, off): nothing measurable. Both kept as options, off. Uncapped FPS on a
+warm Air cannot tell a 5% change from the spread; a capped run's command thread time can.
+
 Check after the pass (a VM running): Performance 60 47.1 FPS, MSAA 2x 29.6, frame generation 29.0 (57.9 shown a
 second), every mode with no warning or error.

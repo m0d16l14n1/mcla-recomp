@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,802 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -194,6 +194,9 @@ new file mode 100644
 +  while (std::chrono::steady_clock::now() < until) {}
 +} }
 +REXCVAR_DEFINE_BOOL(metal_draw, true, "GPU/Metal", "Draw and resolve (diagnostic: false runs the game with no GPU work, as M0)");
++REXCVAR_DEFINE_BOOL(metal_memory_untracked, false, "GPU/Metal",
++    "The guest memory buffer without Metal's hazard tracking: its writers and readers (resolves, texture loads, "
++    "fence writes) ordered by a fence of the backend's own instead");
 +REXCVAR_DEFINE_BOOL(metal_occlusion_queries, true, "GPU/Metal",
 +    "The game's occlusion queries counted by the GPU (MCLA: the sun's glare fades behind buildings); false: the "
 +    "fake count (query_occlusion_fake_sample_count), as before");
@@ -841,7 +844,10 @@ new file mode 100644
 +  const uint64_t start_ms = chrono::Clock::QueryHostUptimeMillis();
 +  shared_memory_buffer_ = [device_ newBufferWithBytesNoCopy:physical
 +                                                     length:size
-+                                                    options:MTLResourceStorageModeShared
++                                                    options:MTLResourceStorageModeShared |
++                                                            (REXCVAR_GET(metal_memory_untracked)
++                                                                 ? MTLResourceHazardTrackingModeUntracked
++                                                                 : MTLResourceHazardTrackingModeDefault)
 +                                                deallocator:nil];
 +  if (!shared_memory_buffer_) {
 +    REXGPU_WARN("Metal: the guest's physical memory could not be made a Metal buffer without a copy");
@@ -931,7 +937,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,522 @@
+@@ -0,0 +1,526 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -1220,6 +1226,10 @@ new file mode 100644
 +  uint64_t texture_loads_ = 0, snapshot_hashed_ = 0, snapshot_copied_ = 0;
 +  id<MTLCommandBuffer> commands_ = nil;
 +  id<MTLRenderCommandEncoder> encoder_ = nil;
++  // Orders the GPU's users of guest memory (resolves, texture loads, fence writes) when the buffer is untracked.
++  // memory_fence_: updated by writers (resolves, fence writes), waited for by all; memory_read_fence_: updated by
++  // readers (texture loads), waited for by writers.
++  id<MTLFence> memory_fence_ = nil, memory_read_fence_ = nil;
 +  uint64_t tex_slow_ticks_ = 0, tex_watch_ticks_ = 0, tex_load_ticks_ = 0, tex_slow_calls_ = 0;
 +  // Occlusion queries: the open query's slot (-1: none), whether the open pass has the visibility buffer, and
 +  // the slot the open encoder counts into (-1: not counting).
@@ -1458,7 +1468,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3651 @@
+@@ -0,0 +1,3670 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1512,6 +1522,8 @@ new file mode 100644
 +REXCVAR_DEFINE_UINT32(metal_persistent_vertex_size, 16384, "GPU/Metal",
 +    "Vertex and index ranges at least this large are kept from frame to frame while the CPU doesn't write them "
 +    "(a write watch), not copied every frame (0: every frame)");
++REXCVAR_DEFINE_BOOL(metal_ring_untracked, false, "GPU/Metal",
++    "The buffers only the CPU writes (vertex snapshots, constants, index buffers) without Metal's hazard tracking");
 +REXCVAR_DEFINE_BOOL(metal_snapshot_vertices, true, "GPU/Metal", "Snapshot guest vertices and indices at draw time (disable only for diagnosis)");
 +REXCVAR_DEFINE_UINT32(metal_debug_frame, 0, "GPU/Metal", "Dump every resolve in this swap frame (0 disables)");
 +REXCVAR_DEFINE_BOOL(metal_debug_all_draws, false, "GPU/Metal", "In a dumped frame, log every draw (not every 64th)");
@@ -1666,6 +1678,12 @@ new file mode 100644
 +}
 +}
 +
++// Buffers only the CPU writes and the GPU only reads (vertex snapshots, constants, index buffers, uploads) have no
++// GPU hazards for Metal to track (metal_ring_untracked).
++static MTLResourceOptions CpuWrittenOptions() {
++  return MTLResourceStorageModeShared |
++         (REXCVAR_GET(metal_ring_untracked) ? MTLResourceHazardTrackingModeUntracked : MTLResourceHazardTrackingModeDefault);
++}
 +class MetalPrimitiveProcessor final : public PrimitiveProcessor {
 + public:
 +  MetalPrimitiveProcessor(id<MTLDevice> device, const RegisterFile& regs, memory::Memory& memory, SharedMemory& shared)
@@ -1678,14 +1696,14 @@ new file mode 100644
 +  }
 + private:
 +  bool InitializeBuiltinIndexBuffer(size_t size, std::function<void(void*)> fill) override {
-+    builtin_ = [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
++    builtin_ = [device_ newBufferWithLength:size options:CpuWrittenOptions()];
 +    if (!builtin_) return false;
 +    fill(builtin_.contents); return true;
 +  }
 +  void* RequestHostConvertedIndexBufferForCurrentFrame(xenos::IndexFormat format, uint32_t count,
 +      bool align, uint32_t original, size_t& handle) override {
 +    size_t size = count * (format == xenos::IndexFormat::kInt16 ? 2 : 4) + XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE;
-+    id<MTLBuffer> buffer = [device_ newBufferWithLength:size options:MTLResourceStorageModeShared];
++    id<MTLBuffer> buffer = [device_ newBufferWithLength:size options:CpuWrittenOptions()];
 +    if (!buffer) return nullptr;
 +    size_t offset = align ? GetSimdCoalignmentOffset(buffer.contents, original) : 0;
 +    handle = buffers_.size(); buffers_.emplace_back(buffer, offset);
@@ -1714,9 +1732,9 @@ new file mode 100644
 +    equeue_batch_ = uint32_t(std::max(1, REXCVAR_GET(metal_encoder_batch)));
 +    equeue_->Start(uint32_t(std::max(0, REXCVAR_GET(metal_encoder_spin))));
 +  }
-+  snapshot_buffer_ = [device_ newBufferWithLength:2 * kSnapshotRing + kSnapshotPersistent options:MTLResourceStorageModeShared];
++  snapshot_buffer_ = [device_ newBufferWithLength:2 * kSnapshotRing + kSnapshotPersistent options:CpuWrittenOptions()];
 +  if (REXCVAR_GET(metal_constant_ring)) {
-+    constant_ring_ = [device_ newBufferWithLength:2 * kConstantRing options:MTLResourceStorageModeShared];
++    constant_ring_ = [device_ newBufferWithLength:2 * kConstantRing options:CpuWrittenOptions()];
 +    constant_ring_.label = @"Xenos shader constants (two frames)";
 +  }
 +  if (!snapshot_buffer_) return false;
@@ -1725,6 +1743,8 @@ new file mode 100644
 +  resolve_rejected_ = [device_ newBufferWithLength:4 options:MTLResourceStorageModeShared];
 +  fence_values_ = [device_ newBufferWithLength:4096 * 4 options:MTLResourceStorageModeShared];
 +  visibility_ = [device_ newBufferWithLength:kQuerySlots * 8 options:MTLResourceStorageModeShared];
++  // Guest memory without Metal's hazard tracking (metal_memory_untracked): its users are ordered by this fence.
++  if (memory_buffer_ && memory_buffer_.hazardTrackingMode == MTLHazardTrackingModeUntracked) { memory_fence_ = [device_ newFence]; memory_read_fence_ = [device_ newFence]; }
 +  query_done_.reset(new std::atomic<uint64_t>[kQuerySlots]);
 +  for (uint32_t i = 0; i < kQuerySlots; ++i) query_done_[i].store(0);
 +  *static_cast<uint32_t*>(resolve_rejected_.contents) = 0;
@@ -1877,7 +1897,9 @@ new file mode 100644
 +  EndEncoder();
 +  if (!commands_) { commands_ = [queue_ commandBuffer]; commands_.label = @"Xenos M1 draws"; }
 +  auto blit = [commands_ blitCommandEncoder];
++  if (memory_fence_) { [blit waitForFence:memory_fence_]; [blit waitForFence:memory_read_fence_]; }
 +  [blit copyFromBuffer:fence_values_ sourceOffset:slot * 4 toBuffer:memory_buffer_ destinationOffset:address size:4];
++  if (memory_fence_) [blit updateFence:memory_fence_];
 +  [blit endEncoding];
 +  // Committed now, so a guest waiting for it doesn't wait for the end of the frame.
 +  Submit(false);
@@ -2154,7 +2176,7 @@ new file mode 100644
 +  return buffer;
 +}
 +id<MTLBuffer> MetalDraw::Upload(const void* data, size_t size) {
-+  id<MTLBuffer> buffer = [device_ newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
++  id<MTLBuffer> buffer = [device_ newBufferWithBytes:data length:size options:CpuWrittenOptions()];
 +  if (buffer) uploads_.push_back(buffer);
 +  return buffer;
 +}
@@ -3320,11 +3342,12 @@ new file mode 100644
 +      compute.label = [NSString stringWithFormat:@"compose %ux%u: rows from memory", width, height];
 +    [compute setComputePipelineState:load_texture_];
 +    [compute setBuffer:memory_buffer_ offset:0 atIndex:0];
++    if (memory_fence_) [compute waitForFence:memory_fence_];  // a reader: after the writes before it
 +    for (auto& g : gaps) {
 +      uint32_t rows = g.y1 - g.y0;
 +      size_t offset = 0;
 +      id<MTLBuffer> staging = Staging(size_t(width) * rows * bpb, offset);
-+      if (!staging) { [compute endEncoding]; return nil; }
++      if (!staging) { if (memory_fence_) [compute updateFence:memory_read_fence_]; [compute endEncoding]; return nil; }
 +      struct {
 +        uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
 +      } c{address + g.y0 / 32 * macro_row_bytes, 0, macro_row_bytes / 32, macro_row_bytes / 32 / bpb,
@@ -3335,6 +3358,7 @@ new file mode 100644
 +      loads.push_back({staging, offset, g.y0, rows});
 +      texture_rows_loaded_ += rows;
 +    }
++    if (memory_fence_) [compute updateFence:memory_read_fence_];
 +    [compute endEncoding];
 +  }
 +  auto blit = [cb blitCommandEncoder];
@@ -3623,6 +3647,7 @@ new file mode 100644
 +          if (REXCVAR_GET(metal_debug_labels))
 +            compute.label = [NSString stringWithFormat:@"texture load fmt %u %ux%u", uint32_t(format), bw, bh];
 +          [compute setComputePipelineState:load_texture_];
++          if (memory_fence_) [compute waitForFence:memory_fence_];
 +          [compute setBuffer:memory_buffer_ offset:0 atIndex:0]; [compute setBuffer:staging offset:staging_offset atIndex:1];
 +          [compute setBytes:&c length:sizeof(c) atIndex:2];
 +          [compute dispatchThreads:MTLSizeMake(bw, bh, layers) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
@@ -3651,6 +3676,7 @@ new file mode 100644
 +            mip_copies[level] = {mip_offset, limage, lw, lh, lbw};
 +            mip_offset += limage * layers;
 +          }
++          if (memory_fence_) [compute updateFence:memory_read_fence_];
 +          [compute endEncoding];
 +          auto blit = [cb blitCommandEncoder];
 +          for (uint32_t layer = 0; layer < layers; ++layer)
@@ -3907,7 +3933,10 @@ new file mode 100644
 +        [compute setBytes:&constants length:sizeof(constants) atIndex:0];
 +        [compute setBuffer:memory_buffer_ && REXCVAR_GET(metal_resolve_to_memory) ? memory_buffer_ : snapshot_buffer_ offset:0 atIndex:1];
 +        [compute setBuffer:resolve_rejected_ offset:0 atIndex:2];
++        // A writer: after the writes and the last read before it (readers run together, as Metal's tracking let them).
++        if (memory_fence_) { [compute waitForFence:memory_fence_]; [compute waitForFence:memory_read_fence_]; }
 +        [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++        if (memory_fence_) [compute updateFence:memory_fence_];
 +        [compute endEncoding];
 +        uint32_t address = info.copy_dest_base & 0x1FFFFFFF;
 +        uint32_t resolved_format = depth ? constants.format : uint32_t(info.copy_dest_info.copy_dest_format);
