@@ -57,6 +57,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>LSApplicationCategoryType</key><string>public.app-category.racing-games</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>GCSupportsControllerUserInteraction</key><true/>
+  <key>LSSupportsGameMode</key><true/>
 </dict>
 </plist>
 EOF

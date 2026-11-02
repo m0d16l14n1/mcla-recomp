@@ -769,7 +769,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,419 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -1005,6 +1005,16 @@ new file mode 100644
 +  // The inline constants each stage's slots hold in the current encoder (Bind skips resending them).
 +  void* bound_encoder_ = nullptr;
 +  std::array<std::array<std::vector<uint8_t>, 6>, 2> bound_bytes_;
++  // Shader constants written into a per-frame ring (two halves, as the vertex snapshots) and bound by offset
++  // (metal_constant_ring): what each stage's slot points at in it, to skip an unchanged upload.
++  static constexpr size_t kConstantRing = size_t(16) << 20;
++  id<MTLBuffer> constant_ring_ = nil;
++  size_t constant_used_ = 0;
++  struct BoundConstants { uint32_t offset = 0, size = 0; bool ring = false; };
++  std::array<std::array<BoundConstants, 6>, 2> bound_constants_{};
++  // The libraries of translations already seen by a draw (no lock or clock for them).
++  std::unordered_map<const Shader::Translation*, id<MTLLibrary>> library_cache_;
++  id<MTLLibrary> CachedLibrary(const Shader::Translation* translation);
 +  std::array<std::array<void*, 32>, 2> bound_textures_{}, bound_samplers_{};
 +  std::array<std::array<id<MTLTexture>, 32>, 2> draw_textures_{};  // this draw's textures, VS then PS
 +  std::array<uint32_t, 2> draw_texture_count_{};
@@ -1183,7 +1193,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,2969 @@
+@@ -0,0 +1,3017 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1206,6 +1216,9 @@ new file mode 100644
 +    "rather than the game waiting for it, once the frame's wait budget (metal_async_compile_budget_ms) is spent");
 +REXCVAR_DEFINE_INT32(metal_async_compile_budget_ms, 4, "GPU/Metal",
 +    "With metal_async_compile: how long a frame may wait in all for compiles before draws are left out");
++REXCVAR_DEFINE_BOOL(metal_constant_ring, true, "GPU/Metal",
++    "Shader constants written into a ring buffer and bound by offset instead of copied into each command (setBytes)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_BOOL(metal_gpu_fences, false, "GPU/Metal",
 +    "Guest fences (EVENT_WRITE_SHD) written by the GPU after the work before them, not by the command processor");
 +REXCVAR_DEFINE_BOOL(metal_resolve_to_memory, true, "GPU/Metal", "Resolves write guest memory (diagnostic: false keeps them on the GPU only)");
@@ -1406,6 +1419,10 @@ new file mode 100644
 +}
 +bool MetalDraw::Initialize() {
 +  snapshot_buffer_ = [device_ newBufferWithLength:2 * kSnapshotRing + kSnapshotPersistent options:MTLResourceStorageModeShared];
++  if (REXCVAR_GET(metal_constant_ring)) {
++    constant_ring_ = [device_ newBufferWithLength:2 * kConstantRing options:MTLResourceStorageModeShared];
++    constant_ring_.label = @"Xenos shader constants (two frames)";
++  }
 +  if (!snapshot_buffer_) return false;
 +  snapshot_buffer_.label = @"Xenos draw-time vertex and index snapshots";
 +  ring_base_ = 0;
@@ -1506,7 +1523,7 @@ new file mode 100644
 +  if (wait) {
 +    // One queue: its last command buffer completes after the ones before it.
 +    if (last_committed_) [last_committed_ waitUntilCompleted];
-+    snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0;
++    snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0; constant_used_ = 0;
 +  }
 +}
 +bool MetalDraw::DebugFrame() const {
@@ -1589,7 +1606,7 @@ new file mode 100644
 +          uint32_t(v[i].first), v[i].second[0], v[i].second[1], v[i].second[2]);
 +    debug_snapshots_.clear();
 +  }
-+  snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0;
++  snapshots_.clear(); snapshot_used_ = 0; staging_used_ = 0; constant_used_ = 0;
 +  ++frame_;
 +  if (REXCVAR_GET(metal_debug_capture)) {
 +    capture_frame_ = frame_;
@@ -1804,10 +1821,12 @@ new file mode 100644
 +  }
 +  prebuild_start_ = std::chrono::steady_clock::now();
 +  prebuild_thread_ = std::thread([this, keys = std::move(keys)] {
-+    // The libraries first (the warm-up's compiles), then a few pipelines at a time: a draw's own build waits
++    // The libraries first (the warm-up's compiles), then pipelines two at a time: a draw's own build waits
 +    // behind whatever Metal was given before it.
 +    shaders_.Wait();
-+    const uint32_t max_in_flight = std::max(2u, std::thread::hardware_concurrency() / 2);
++    // Two at a time: Metal's compiler processes take whole cores, and with a cold cache the game's own threads
++    // (audio among them) were starved with five.
++    const uint32_t max_in_flight = 2;
 +    for (const auto& key : keys) {
 +      {
 +        std::unique_lock<std::mutex> lock(prebuild_mutex_);
@@ -1892,6 +1911,14 @@ new file mode 100644
 +                              }];
 +}
 +
++id<MTLLibrary> MetalDraw::CachedLibrary(const Shader::Translation* translation) {
++  auto it = library_cache_.find(translation);
++  if (it != library_cache_.end()) return it->second;
++  id<MTLLibrary> library = shaders_.GetLibrary(translation);
++  if (library) library_cache_.emplace(translation, library);
++  return library;
++}
++
 +void MetalDraw::SpendAsyncBudget(std::chrono::steady_clock::time_point since) {
 +  const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count();
 +  async_budget_us_ = std::max<int64_t>(0, async_budget_us_ - us);
@@ -1932,13 +1959,19 @@ new file mode 100644
 +    last_vt_ = vt; last_pt_ = pt;
 +    id<MTLLibrary> vl, pl;
 +    if (async) {
-+      bool vs_compiling = false, ps_compiling = false;
-+      const auto wait_start = std::chrono::steady_clock::now();
-+      const auto deadline = wait_start + std::chrono::microseconds(async_budget_us_);
-+      vl = shaders_.WaitForLibrary(vt, deadline, vs_compiling);
-+      pl = pt ? shaders_.WaitForLibrary(pt, deadline, ps_compiling) : nil;
-+      SpendAsyncBudget(wait_start);
-+      if (vs_compiling || ps_compiling) { ++async_skipped_; return true; }
++      vl = CachedLibrary(vt); pl = pt ? CachedLibrary(pt) : nil;
++      if (!vl || (pt && !pl)) {
++        // Not compiled yet (or failed): waited for within the frame's budget.
++        bool vs_compiling = false, ps_compiling = false;
++        const auto wait_start = std::chrono::steady_clock::now();
++        const auto deadline = wait_start + std::chrono::microseconds(async_budget_us_);
++        if (!vl) vl = shaders_.WaitForLibrary(vt, deadline, vs_compiling);
++        if (pt && !pl) pl = shaders_.WaitForLibrary(pt, deadline, ps_compiling);
++        SpendAsyncBudget(wait_start);
++        if (vs_compiling || ps_compiling) { ++async_skipped_; return true; }
++        if (vl) library_cache_[vt] = vl;
++        if (pl) library_cache_[pt] = pl;
++      }
 +    } else {
 +      vl = shaders_.GetLibrary(vt); pl = pt ? shaders_.GetLibrary(pt) : nil;
 +    }
@@ -2472,11 +2505,36 @@ new file mode 100644
 +  if (bound_encoder_ != (__bridge void*)encoder_) {
 +    bound_encoder_ = (__bridge void*)encoder_;
 +    for (auto& stage : bound_bytes_) for (auto& slot : stage) slot.clear();
++    for (auto& stage : bound_constants_) stage.fill({});
 +    for (auto& stage : bound_textures_) stage.fill(nullptr);
 +    bound_floats_ = {}; bound_bools_ = {}; bound_fetch_ = {};
 +    for (auto& stage : bound_samplers_) stage.fill(nullptr);
 +  }
 +  auto bytes = [&](const void* data, size_t size, uint32_t slot) {
++    if (constant_ring_) {
++      // Into this frame's half of the ring; compared with the slot's last upload there.
++      auto& bound = bound_constants_[vertex][slot];
++      uint8_t* ring = static_cast<uint8_t*>(constant_ring_.contents) + slot_ * kConstantRing;
++      if (bound.ring && bound.size == size && !std::memcmp(ring + bound.offset, data, size)) return;
++      const size_t aligned = (size + 255) & ~size_t(255);
++      if (constant_used_ + aligned <= kConstantRing) {
++        const uint32_t offset = uint32_t(constant_used_);
++        std::memcpy(ring + offset, data, size);
++        constant_used_ += aligned;
++        const NSUInteger at = slot_ * kConstantRing + offset;
++        if (bound.ring) {
++          if (vertex) [encoder_ setVertexBufferOffset:at atIndex:slot];
++          else [encoder_ setFragmentBufferOffset:at atIndex:slot];
++        } else {
++          if (vertex) [encoder_ setVertexBuffer:constant_ring_ offset:at atIndex:slot];
++          else [encoder_ setFragmentBuffer:constant_ring_ offset:at atIndex:slot];
++        }
++        bound = {offset, uint32_t(size), true};
++        bound_bytes_[vertex][slot].clear();
++        return;
++      }
++      bound = {};  // full: the copies below, until the next frame
++    }
 +    if (size > 4096) { bound_bytes_[vertex][slot].clear(); buffer(Upload(data, size), slot); return; }
 +    auto& bound = bound_bytes_[vertex][slot];
 +    if (bound.size() == size && !std::memcmp(bound.data(), data, size)) return;

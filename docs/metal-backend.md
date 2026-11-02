@@ -587,3 +587,15 @@ route: 246 pipelines built in draws in 11.6 s, freezes of 4.9, 3.0 and 1.7 s. Tw
 The 150-frame `Metal frame time` line now ends with the pipelines created, those taken from the storage (and the time
 waited for them) and the draws left out. What remains in long sessions is heat: after about 2 minutes the MacBook Air
 reaches thermal pressure 2 and the command thread's CPU time goes from about 9 to 19-25 ms a frame (37 to 54 FPS).
+
+**Sixteenth pass (2026-11-02): command-thread trims.** A profile of the command thread while driving (8 s, hot Mac):
+the Metal Performance HUD's interposition (`MetalForceHudEnabled`, a system-wide setting on the test Mac) was about
+12% of it; vertex snapshot copies about 7%; shader constants compared, copied into a `std::vector` and copied again by
+`setVertexBytes` about 6%; the fifteenth pass's per-draw library lookup (a mutex) and budget clock about 4%. Now the
+libraries a draw has seen are cached on the command thread (no lock or clock for them), and constants go into a
+per-frame ring (`metal_constant_ring`, 2 x 16 MB, 256-byte aligned) bound with `set*BufferOffset`, compared with the
+slot's last upload there. Same picture (mean RGB of the spawn shot within 0.1), route test passes; no measurable FPS
+change at thermal pressure 2 (runs of one build differ by 20%). The pipeline storage builds two pipelines at a time
+(five starved the game's threads, audio among them, with a cold cache). `MCLA.app` also opts into Game Mode
+(`LSSupportsGameMode`; macOS turns it on in full screen only).
+
