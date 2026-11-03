@@ -864,3 +864,20 @@ and 18.6, no hitch against 1 and 3. The launcher sets the variable before the ga
 before its first Metal device when it is not set already. The bench's modes take `env:NAME=VALUE`.
 Also in this pass: the textures' memory index is split by length (a write scans back only as far as its class's
 longest texture), and the shader bindings' lookups (four or five a draw) are memoised.
+
+**Fix (2026-11-03): stale vertex copies (the pause menu flickered, lamp glows stayed behind cars).** Two bugs from
+play: parts of the pause menu flickered and broke (since the 1 KB change above), and traffic cars' lamp glows stayed
+where a car had stood (since the persistent copies, 2026-11-01). Both went with `metal_persistent_vertex_size=0`;
+the menu alone with 16384. A check that hashes each kept range again at its first use in a frame and compares it with
+its copy (`metal_persistent_verify`) found the cause: **guest memory changes that no write watch sees** (64 and more
+ranges of 1,404 bytes already during boot; 8 to 95 kept ranges in every 150 frames of a race). Not the hot pages
+(`shared_memory_hot_page_faults=0` misses as many); the writer reaches the memory without a write fault, as the
+story intro's movie frames did for the texture watches. So a range kept on the watch's word could be drawn stale
+for as long as nothing else wrote its pages.
+- `metal_persistent_vertex_size` is now **0 by default: every range is copied every frame** (as before 2026-11-01).
+  With the check on, keeping them saves nothing: at 30 FPS in the race, two runs each, the command thread spent
+  15.6 and 14.5 ms a frame hashing 18 to 24 MB and copying 2, against 14.0 and 16.0 ms copying 21 to 25 MB.
+- `metal_persistent_verify` (on) stays for anyone who sets a size: a kept range that changed unseen is copied again,
+  and the log counts them every 150 frames.
+- To do: the texture watches rely on the same faults (about 1.9 GB of texture lookups a frame skip their hash
+  on a watch's word); check them the same way.
