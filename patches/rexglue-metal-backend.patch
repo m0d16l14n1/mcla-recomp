@@ -18,7 +18,7 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
-@@ -94,6 +94,22 @@
+@@ -94,6 +94,23 @@
      list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
  endif()
  
@@ -28,6 +28,7 @@ diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
 +    metal/metal_presenter.mm
 +    metal/metal_shaders.mm
 +    metal/metal_draw.mm
++    metal/metal_fx4.mm
 +)
 +if(REXGLUE_USE_METAL)
 +    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_METAL_SOURCES})
@@ -41,7 +42,7 @@ diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
  if(REXGLUE_USE_D3D12)
      list(APPEND REXGPU_XENOS_SOURCES
          ${REXGPU_XENOS_DXBC_THIRDPARTY_SOURCES}
-@@ -148,6 +164,22 @@
+@@ -148,6 +165,22 @@
      xxHash::xxhash
  )
  
@@ -130,7 +131,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,808 @@
+@@ -0,0 +1,809 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -745,16 +746,17 @@ new file mode 100644
 +      frontbuffer_height = 720;
 +    }
 +    const uint64_t swap = swaps_;
-+    // HDR output's textures and composite are at the guest output's size (the draws are at 1x).
-+    hdr_output_width_ = frontbuffer_width;
-+    hdr_output_height_ = frontbuffer_height;
++    // The guest output, HDR output's textures and composite are at the draws' size (resolution_scale).
++    const uint32_t rs = MetalResolutionScale();
++    hdr_output_width_ = frontbuffer_width * rs;
++    hdr_output_height_ = frontbuffer_height * rs;
 +    // The ramp as the guest has it now, for this swap (the callback may run after more register writes).
 +    auto gamma = std::make_shared<MetalDraw::GammaRamp>();
 +    static_assert(sizeof(reg::DC_LUT_30_COLOR) == 4 && sizeof(reg::DC_LUT_PWL_DATA) == 4);
 +    std::memcpy(gamma->table, gamma_ramp_256_entry_table(), sizeof(gamma->table));
 +    std::memcpy(gamma->pwl, gamma_ramp_pwl_rgb(), sizeof(gamma->pwl));
 +    presenter->RefreshGuestOutput(
-+        frontbuffer_width, frontbuffer_height, 1280, 720,
++        frontbuffer_width * rs, frontbuffer_height * rs, 1280, 720,
 +        [this, frontbuffer_ptr, swap, gamma](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
 +          auto& metal_context = static_cast<MetalGuestOutputRefreshContext&>(context);
 +          @autoreleasepool {
@@ -943,9 +945,10 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,546 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
++#include "metal_fx4.h"
 +#include <functional>
 +#include "metal_shaders.h"
 +#include "metal_encoder_queue.h"
@@ -1126,6 +1129,10 @@ new file mode 100644
 +  // after a gap, a camera cut), and the GPU time of the interpolation and its compose.
 +  uint32_t fg_generated_ = 0, fg_no_taa_ = 0, fg_not_allowed_ = 0, fg_first_ = 0, fg_cuts_ = 0;
 +  std::shared_ptr<std::atomic<uint64_t>> fg_gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
++  // metal_metal4: the interpolator is an MTL4FXFrameInterpolator on its own Metal 4 queue (MetalFx4), between the
++  // HUD-less image on queue_ and the compose after it; and the temporal scaler an MTL4FXTemporalScaler (taa_fx4_).
++  bool fg_metal4_ = false;
++  MetalFx4 fg_fx4_, taa_fx4_;
 +  id<MTLRenderPipelineState> hdr_restore_ = nil;
 +  bool hdr_pipelines_failed_ = false;
 +  // The last draw's translations, for the scene pass's textures.
@@ -1170,6 +1177,7 @@ new file mode 100644
 +    TextureEntry* owner = nullptr;  // the texture entry it came from (its last use is kept for eviction)
 +  };
 +  TextureEntry* last_texture_entry_ = nullptr;
++  uint32_t textures_scaled_ = 0;  // the draw's fetch constants whose textures are at resolution_scale
 +  TextureWatch* last_texture_watch_ = nullptr;
 +  // The memory range of the texture TextureSlow last returned: a resolve or a new texture over it drops only
 +  // the lookups of textures there (a resolve dropped them all, some 50 times a frame).
@@ -1423,7 +1431,11 @@ new file mode 100644
 +    uint32_t stale_lo = 0, stale_hi = UINT32_MAX;
 +    uint32_t clean_lo = 0, clean_hi = 0;  // the last tiles checked or taken over and not written by others since
 +    uint32_t ssx = 1, ssy = 1;  // EDRAM samples a texel holds across and down (a metal_msaa multisample texture)
++    uint32_t scale = 1;  // texels a sample covers across and down (MetalResolutionScale; single-sample targets)
 +  };
++  // The draw resolution scale (MetalResolutionScale): targets hold rs_ x rs_ texels for each EDRAM sample, and
++  // textures made from resolves are rs_ times the guest's size (guest memory gets the 1x picture).
++  const uint32_t rs_;
 +  std::unordered_map<uintptr_t, TargetLayout> target_layouts_;
 +  // Per EDRAM tile: a version bumped by every pass writing it, the writer and its format kind.
 +  std::vector<uint32_t> tile_version_, tile_kind_;
@@ -1456,7 +1468,8 @@ new file mode 100644
 +  void ClearRect(id<MTLTexture> target, bool depth, std::array<float, 4> color, double depth_value, uint32_t stencil,
 +                 uint32_t x, uint32_t y0, uint32_t width, uint32_t y1);
 +  id<MTLLibrary> helper_library_ = nil;
-+  id taa_scaler_ = nil;  // id<MTLFXTemporalScaler>
++  id taa_scaler_ = nil;  // id<MTLFXTemporalScalerBase>: an MTL4FXTemporalScaler (taa_metal4_, on taa_fx4_) or MTLFXTemporalScaler
++  bool taa_metal4_ = false;
 +  uint32_t taa_width_ = 0, taa_height_ = 0, taa_render_width_ = 0, taa_render_height_ = 0;
 +  id<MTLTexture> taa_color_ = nil;  // upscaling: the render-size colour gathered from the stretched scene
 +  id<MTLTexture> taa_motion_ = nil, taa_depth_ = nil, taa_output_ = nil;
@@ -1483,7 +1496,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3713 @@
+@@ -0,0 +1,3795 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1685,13 +1698,15 @@ new file mode 100644
 +  uint32_t samples_x = 1, samples_y = 1, sample_select = 0, extent_start = 0, extent_end = 0, stretch = 0;
 +  uint32_t stretch_num[2] = {}, stretch_den[2] = {};  // temporal_aa_upscale: the render and output sizes
 +  uint32_t tex_ss[2] = {1, 1};  // samples a texel of a single-sample source holds (metal_4x_as_1x)
++  uint32_t rs = 1, padding2 = 0;  // resolution_scale: source and destination texels across and down a guest pixel
 +};
-+static_assert(sizeof(ResolveConstants) == 104);
++static_assert(sizeof(ResolveConstants) == 112);
 +// TransferConstants in metal_resolve.h.
 +struct TransferConstants {
 +  uint32_t dst_base, dst_pitch, src_base, src_pitch, lo, hi, src_kind, dst_kind;
 +  uint32_t dst_ss[2], src_ss[2];
 +  uint32_t dst_dw, src_dw;  // EDRAM dwords a sample: 2 for 64bpp formats
++  uint32_t scale = 1, padding = 0;  // the resolution scale (MetalResolutionScale), both single-sample targets
 +};
 +template <typename T> void Key(std::string& key, T value) {
 +  key.append(reinterpret_cast<const char*>(&value), sizeof(value));
@@ -1737,7 +1752,7 @@ new file mode 100644
 +MetalDraw::MetalDraw(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLBuffer> memory_buffer,
 +    memory::Memory& memory, RegisterFile& regs, MetalShaderCompiler& shaders, uint32_t edram_tiles)
 +    : device_(device), queue_(queue), memory_buffer_(memory_buffer), memory_(memory), regs_(regs),
-+      shaders_(shaders), edram_tiles_(edram_tiles) {}
++      shaders_(shaders), edram_tiles_(edram_tiles), rs_(MetalResolutionScale()) {}
 +MetalDraw::~MetalDraw() {
 +  if (prebuild_thread_.joinable()) prebuild_thread_.join();
 +  {
@@ -1904,6 +1919,8 @@ new file mode 100644
 +bool MetalDraw::OcclusionQueryRead(uint32_t slot, uint64_t generation, uint64_t& samples_out) {
 +  if (slot >= kQuerySlots || query_done_[slot].load(std::memory_order_acquire) != generation) return false;
 +  samples_out = static_cast<const uint64_t*>(visibility_.contents)[slot];
++  // Guest samples: rs x rs host pixels each at resolution_scale (one seen stays one).
++  if (rs_ > 1) samples_out = (samples_out + rs_ * rs_ - 1) / (rs_ * rs_);
 +  return true;
 +}
 +bool MetalDraw::DebugFrame() const {
@@ -2018,11 +2035,13 @@ new file mode 100644
 +      equeue_cpu_us_ = cpu;
 +    }
 +    if (fg_generated_ || fg_no_taa_ || fg_not_allowed_ || fg_first_ || fg_cuts_) {
-+      const uint64_t fg_us = fg_gpu_us_->exchange(0);
-+      REXGPU_INFO("Metal frame generation: {} frames generated in 150 ({:.2f} ms of GPU time each for MetalFX and the "
-+                  "compose); not for {} without temporal AA, {} without the UI layer or tone map, {} first after a gap, {} "
-+                  "camera cuts", fg_generated_, fg_generated_ ? fg_us / 1000.0 / fg_generated_ : 0.0, fg_no_taa_,
-+                  fg_not_allowed_, fg_first_, fg_cuts_);
++      const uint64_t fg_us = fg_gpu_us_->exchange(0), fg4_us = fg_fx4_.TakeGpuUs();
++      REXGPU_INFO("Metal frame generation ({}): {} frames generated in 150 ({:.2f} ms of GPU time each for MetalFX and "
++                  "the compose{}); not for {} without temporal AA, {} without the UI layer or tone map, {} first after a "
++                  "gap, {} camera cuts", fg_metal4_ ? "Metal 4" : "Metal 3", fg_generated_,
++                  fg_generated_ ? (fg_us + fg4_us) / 1000.0 / fg_generated_ : 0.0,
++                  fg_metal4_ && fg_generated_ ? fmt::format(", {:.2f} of it MetalFX", fg4_us / 1000.0 / fg_generated_)
++                                              : std::string(), fg_no_taa_, fg_not_allowed_, fg_first_, fg_cuts_);
 +      fg_generated_ = 0; fg_no_taa_ = 0; fg_not_allowed_ = 0; fg_first_ = 0; fg_cuts_ = 0;
 +    }
 +    edram_transfers_ = 0; edram_transfers_in_pass_ = 0; clears_in_pass_ = 0; clears_as_load_ = 0; passes_ = 0; passes_merged_ = 0; passes_resynced_ = 0; passes_split_for_textures_ = 0; texture_work_before_pass_ = 0; pipelines_created_ = 0; pipeline_us_ = 0; prebuilt_used_ = 0; prebuilt_wait_us_ = 0; async_skipped_ = 0;
@@ -2237,7 +2256,10 @@ new file mode 100644
 +  const uint32_t ssx = samples >= 4 ? 2 : 1, ssy = samples >= 2 ? 2 : 1;
 +  uint32_t pitch_tiles = std::max(1u, (width * ssx + (is_64bpp ? 39 : 79)) / (is_64bpp ? 40 : 80));
 +  uint32_t height = std::min(8192u, (edram_tiles_ - std::min(base, edram_tiles_ - 1) + pitch_tiles - 1) / pitch_tiles * 16) / ssy;
-+  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width height:height mipmapped:NO];
++  // Resolution scale: rs_ x rs_ texels a sample (`width` and the rows above are samples), within Metal's 16384.
++  const uint32_t scale = multisample ? 1u : rs_;
++  height = std::min(height, 16384u / scale) * scale;
++  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:width * scale height:height mipmapped:NO];
 +  if (multisample) { desc.textureType = MTLTextureType2DMultisample; desc.sampleCount = samples; }
 +  desc.storageMode = MTLStorageModePrivate;
 +  desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
@@ -2250,6 +2272,7 @@ new file mode 100644
 +         std::vector<uint32_t>(edram_tiles_, 0)};
 +    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)].ssx = ssx;
 +    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)].ssy = ssy;
++    target_layouts_[reinterpret_cast<uintptr_t>((__bridge void*)result)].scale = scale;
 +    if (tile_version_.size() != edram_tiles_) {
 +      tile_version_.assign(edram_tiles_, 0); tile_kind_.assign(edram_tiles_, kNoTransfer); tile_owner_.assign(edram_tiles_, 0);
 +    }
@@ -2473,11 +2496,13 @@ new file mode 100644
 +    SurfaceSamples(msaa, samples, multisample);
 +    if (samples > 1) ssx = ssy = 1;
 +    const uint32_t raster_samples = multisample ? samples : 1;
++    // Host pixels a guest pixel: the supersampling and the resolution scale (the targets' texels).
++    const uint32_t scale = multisample ? 1u : rs_, hx = ssx * scale, hy = ssy * scale;
 +    draw_util::ViewportInfo viewport{};
-+    draw_util::GetHostViewportInfo(regs_, ssx, ssy, false, 16384, 16384, true, dc, false, true,
++    draw_util::GetHostViewportInfo(regs_, hx, hy, false, 16384, 16384, true, dc, false, true,
 +                                   ps && ps->writes_depth(), viewport);
 +    draw_util::Scissor scissor{}; draw_util::GetScissor(regs_, scissor);
-+    scissor.offset[0] *= ssx; scissor.extent[0] *= ssx; scissor.offset[1] *= ssy; scissor.extent[1] *= ssy;
++    scissor.offset[0] *= hx; scissor.extent[0] *= hx; scissor.offset[1] *= hy; scissor.extent[1] *= hy;
 +    if (!scissor.extent[0] || !scissor.extent[1] || !viewport.xy_extent[0] || !viewport.xy_extent[1]) return true;
 +    float param_gen_scale = 1.0f;
 +    if (taa_draw_) taa_draw_(viewport, scissor, param_gen_scale);
@@ -2515,14 +2540,22 @@ new file mode 100644
 +    // constants are made here too, for only the fetch constants the shaders sample (all 32 were 2% of the
 +    // thread, and the game writes fetch constants nearly every draw).
 +    signs_.fill(0);
++    textures_scaled_ = 0;
 +    const bool texture_signs = REXCVAR_GET(metal_texture_signs);
 +    for (uint32_t stage = 0; stage < 2; ++stage) {
 +      draw_texture_count_[stage] = 0;
 +      auto* t = stage ? pt : vt;
 +      if (!t) continue;
 +      for (auto& b : shaders_.translator().bindings(t).textures) {
-+        if (draw_texture_count_[stage] < draw_textures_[stage].size()) draw_textures_[stage][draw_texture_count_[stage]++] = Texture(b);
-+        else Texture(b);
++        id<MTLTexture> view = Texture(b);
++        if (draw_texture_count_[stage] < draw_textures_[stage].size()) draw_textures_[stage][draw_texture_count_[stage]++] = view;
++        // A resolve's texture (or one composed from resolves) is drawn at resolution_scale: wider than its fetch
++        // constant says, which the shaders' texel coordinates and size queries allow for.
++        if (rs_ > 1 && view && b.fetch_constant < 32) {
++          auto fetch = regs_.GetTextureFetch(b.fetch_constant);
++          if (fetch.dimension == xenos::DataDimension::k2DOrStacked && view.width > uint32_t(fetch.size_2d.width) + 1)
++            textures_scaled_ |= 1u << b.fetch_constant;
++        }
 +        if (texture_signs && b.fetch_constant < 32) {
 +          auto fetch = regs_.GetTextureFetch(b.fetch_constant);
 +          uint32_t s = (fetch.dword_0 >> 2) & 255, swizzled = 0;
@@ -2566,11 +2599,11 @@ new file mode 100644
 +          low = std::min(low, y); high = std::max(high, y);
 +        }
 +        if (std::isfinite(low) && std::isfinite(high) && high >= low && high < 16384.0f) {
-+          y0 = std::max<uint32_t>(y0, uint32_t(std::max(0.0f, std::floor(low))) * ssy);
++          y0 = std::max<uint32_t>(y0, uint32_t(std::max(0.0f, std::floor(low))) * hy);
 +          // Row r is covered when its centre (r or r + 0.5) is below the top-left rule's bottom edge, so
 +          // ceil(high) is the exclusive end: one more row reached into the next 16-row EDRAM tile, which the
 +          // target after this one owns (a depth clear of 512 rows handed tiles back and forth with it).
-+          y1 = std::min<uint32_t>(y1, uint32_t(std::ceil(high)) * ssy);
++          y1 = std::min<uint32_t>(y1, uint32_t(std::ceil(high)) * hy);
 +          if (y1 < y0) y1 = y0;
 +        }
 +        break;
@@ -2585,11 +2618,12 @@ new file mode 100644
 +        ? std::min(attachment_height, std::max(32u, (y1 + 31) & ~31u)) : attachment_height;
 +    // And only the columns they reach (metal_pass_columns): with MetalFX upscaling the game draws its scene into
 +    // the top left of its 1280-wide targets, and a full-width pass loaded and stored the rest too.
-+    uint32_t pass_cols = width;
++    const uint32_t host_width = width * scale;  // the targets' texels
++    uint32_t pass_cols = host_width;
 +    if (REXCVAR_GET(metal_pass_columns)) {
 +      const int64_t cols_to = std::min<int64_t>(int64_t(scissor.offset[0]) + scissor.extent[0],
 +                                                int64_t(viewport.xy_offset[0]) + viewport.xy_extent[0]);
-+      pass_cols = std::min<uint32_t>(width, std::max<uint32_t>(32u, (uint32_t(std::max<int64_t>(cols_to, 0)) + 31) & ~31u));
++      pass_cols = std::min<uint32_t>(host_width, std::max<uint32_t>(32u, (uint32_t(std::max<int64_t>(cols_to, 0)) + 31) & ~31u));
 +    }
 +    // HDR output: the UI layer's underlay copy and clear, before the draw that starts it (ends the open pass).
 +    if (hdr_targets_ready_) hdr_targets_ready_();
@@ -2612,12 +2646,12 @@ new file mode 100644
 +        bool attached = false;
 +        for (auto t : next) if (t && t == c.target) attached = true;
 +        if (!attached) { ++i; continue; }
-+        if (c.x + c.width > width) {
++        if (c.x + c.width > host_width) {
 +          EndEncoder(); EncodeClear(c); pending_clears_.erase(pending_clears_.begin() + i); continue;
 +        }
 +        pass_rows = std::max(pass_rows, std::min(c.y1, attachment_height));
 +        // The pass covers the clear (one wider than it would be cut, or, as its load action, leave columns).
-+        pass_cols = std::max(pass_cols, std::min(c.x + c.width, width));
++        pass_cols = std::max(pass_cols, std::min(c.x + c.width, host_width));
 +        ++i;
 +      }
 +    }
@@ -2643,7 +2677,7 @@ new file mode 100644
 +          for (auto& t : pending_transfers_) EncodeTransfer(t);
 +          pending_transfers_.clear();
 +        } else if (!pending_transfers_.empty()) {
-+          pass_cols = width;  // transfers in the pass copy whole rows
++          pass_cols = host_width;  // transfers in the pass copy whole rows
 +        }
 +        pass_ranges_ = {};
 +      }
@@ -2865,7 +2899,7 @@ new file mode 100644
 +      else [encoder_ setBlendColorRed:blend[0] green:blend[1] blue:blend[2] alpha:blend[3]];
 +      if (cache_state) es.blend = blend;
 +    }
-+    BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data(), param_gen_scale);
++    BuildMetalSystemConstants(regs_, primitive, viewport, system_bytes_, signs_.data(), param_gen_scale, scale, textures_scaled_);
 +    const auto& system = system_bytes_;
 +    debug_draw_log_ = DebugFrame() && primitive.host_draw_vertex_count <= 6;
 +    Bind(*vs, vt, true, system); if (ps) Bind(*ps, pt, false, system);
@@ -3378,7 +3412,9 @@ new file mode 100644
 +                        format == uint32_t(F::k_1_5_5_5) || format == uint32_t(F::k_5_6_5) ||
 +                        format == uint32_t(F::k_6_5_5) || format == uint32_t(F::k_4_4_4_4) || !memory_buffer_))
 +    return nil;  // formats the load kernel converts: the resolve's texture and a load would differ
-+  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixel_format width:width height:height mipmapped:NO];
++  // The pieces are at resolution_scale (sizes here are guest pixels): so is the composite, and its rows from memory.
++  const uint32_t rs = rs_;
++  auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixel_format width:width * rs height:height * rs mipmapped:NO];
 +  desc.textureType = MTLTextureType2DArray; desc.arrayLength = 1;
 +  desc.storageMode = MTLStorageModePrivate;
 +  desc.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
@@ -3397,15 +3433,15 @@ new file mode 100644
 +    for (auto& g : gaps) {
 +      uint32_t rows = g.y1 - g.y0;
 +      size_t offset = 0;
-+      id<MTLBuffer> staging = Staging(size_t(width) * rows * bpb, offset);
++      id<MTLBuffer> staging = Staging(size_t(width) * rows * rs * rs * bpb, offset);
 +      if (!staging) { if (memory_fence_) [compute updateFence:memory_read_fence_]; [compute endEncoding]; return nil; }
 +      struct {
-+        uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
++        uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert, scale;
 +      } c{address + g.y0 / 32 * macro_row_bytes, 0, macro_row_bytes / 32, macro_row_bytes / 32 / bpb,
-+          rex::log2_floor(bpb), 0, 0, 1, xor_mask, width, rows, 0};
++          rex::log2_floor(bpb), 0, 0, 1, xor_mask, width, rows, 0, rs};
 +      [compute setBuffer:staging offset:offset atIndex:1];
 +      [compute setBytes:&c length:sizeof(c) atIndex:2];
-+      [compute dispatchThreads:MTLSizeMake(width, rows, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++      [compute dispatchThreads:MTLSizeMake(width * rs, rows * rs, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 +      loads.push_back({staging, offset, g.y0, rows});
 +      texture_rows_loaded_ += rows;
 +    }
@@ -3416,16 +3452,17 @@ new file mode 100644
 +  if (REXCVAR_GET(metal_debug_labels))
 +    blit.label = [NSString stringWithFormat:@"compose %ux%u from %zu resolves", width, height, pieces.size()];
 +  for (auto& l : loads)
-+    [blit copyFromBuffer:l.staging sourceOffset:l.offset sourceBytesPerRow:width * bpb sourceBytesPerImage:size_t(width) * l.rows * bpb
-+        sourceSize:MTLSizeMake(width, l.rows, 1) toTexture:texture destinationSlice:0 destinationLevel:0
-+        destinationOrigin:MTLOriginMake(0, l.y0, 0)];
++    [blit copyFromBuffer:l.staging sourceOffset:l.offset sourceBytesPerRow:width * rs * bpb
++        sourceBytesPerImage:size_t(width) * rs * l.rows * rs * bpb
++        sourceSize:MTLSizeMake(width * rs, l.rows * rs, 1) toTexture:texture destinationSlice:0 destinationLevel:0
++        destinationOrigin:MTLOriginMake(0, l.y0 * rs, 0)];
 +  for (auto& p : pieces) {
 +    if (p.y >= height) continue;
 +    uint32_t rows = std::min<uint32_t>(p.r->height, height - p.y);
 +    uint32_t columns = std::min<uint32_t>(p.r->width, width - p.x);
 +    [blit copyFromTexture:p.r->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-+        sourceSize:MTLSizeMake(columns, rows, 1) toTexture:texture destinationSlice:0 destinationLevel:0
-+        destinationOrigin:MTLOriginMake(p.x, p.y, 0)];
++        sourceSize:MTLSizeMake(columns * rs, rows * rs, 1) toTexture:texture destinationSlice:0 destinationLevel:0
++        destinationOrigin:MTLOriginMake(p.x * rs, p.y * rs, 0)];
 +  }
 +  [blit endEncoding];
 +  ++textures_composed_;
@@ -3687,7 +3724,7 @@ new file mode 100644
 +          texture = nil;
 +        } else {
 +          struct {
-+            uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
++            uint32_t src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert, scale = 1;
 +          } c{(base_page << 12) & 0x1FFFFFFF, layout.base.array_slice_stride_bytes, layout.base.row_pitch_bytes,
 +              layout.base.row_pitch_bytes / bpb, rex::log2_floor(bpb), ox, oy, fetch.tiled ? 1u : 0u,
 +              fetch.endianness == xenos::Endian::k8in16 ? 1u : fetch.endianness == xenos::Endian::k8in32 ? 3u :
@@ -3908,6 +3945,8 @@ new file mode 100644
 +    uint32_t samples; bool multisample;
 +    SurfaceSamples(ei.msaa_samples, samples, multisample);
 +    const uint32_t dvx = samples > 1 ? ssx : 1, dvy = samples > 1 ? ssy : 1;
++    // resolution_scale: a single-sample target has rs x rs texels for each of its 1x ones (TargetLayout.scale).
++    const uint32_t rs = multisample ? 1u : rs_;
 +    uint32_t pitch = regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch * ssx / dvx;
 +    MTLPixelFormat format = depth ? MTLPixelFormatDepth32Float_Stencil8 : ColorFormat(xenos::ColorRenderTargetFormat(ei.format));
 +    id<MTLTexture> source = nil;
@@ -3924,13 +3963,13 @@ new file mode 100644
 +      uint32_t sx = (delta % std::max(1u, uint32_t(ei.pitch_tiles))) * (ei.format_is_64bpp ? 40 : 80) +
 +                    info.coordinate_info.edram_offset_x_div_8 * 8 * ssx;
 +      uint32_t sy = (delta / std::max(1u, uint32_t(ei.pitch_tiles))) * 16 + info.coordinate_info.edram_offset_y_div_8 * 8 * ssy;
-+      const uint32_t source_width = uint32_t(source.width) * dvx, source_height = uint32_t(source.height) * dvy;
++      const uint32_t source_width = uint32_t(source.width) / rs * dvx, source_height = uint32_t(source.height) / rs * dvy;
 +      if (sx < source_width && sy < source_height) {
 +        width = std::min(width, (source_width - sx) / ssx); height = std::min(height, (source_height - sy) / ssy);
 +      }
 +      if (sx < source_width && sy < source_height && width && height) {
-+        resolve_rows[0] = sy / dvy; resolve_rows[1] = (sy + height * ssy) / dvy;
-+        clear_rect[0] = sx / dvx; clear_rect[1] = width * ssx / dvx;
++        resolve_rows[0] = sy / dvy * rs; resolve_rows[1] = (sy + height * ssy) / dvy * rs;
++        clear_rect[0] = sx / dvx * rs; clear_rect[1] = width * ssx / dvx * rs;
 +        FlushClears(source);
 +        if (REXCVAR_GET(metal_edram_transfers)) SyncTarget(source, source_kind, resolve_rows[0], resolve_rows[1]);
 +        MTLPixelFormat dest_format = MTLPixelFormatRGBA8Unorm;
@@ -3949,7 +3988,7 @@ new file mode 100644
 +          case 37: dest_format = MTLPixelFormatRG32Float; break;
 +          case 38: dest_format = MTLPixelFormatRGBA32Float; break;
 +        }
-+        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dest_format width:width height:height mipmapped:NO];
++        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dest_format width:width * rs height:height * rs mipmapped:NO];
 +        desc.storageMode = MTLStorageModePrivate; desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 +        id<MTLTexture> destination = PooledTexture(desc);
 +        if (!destination) return false;
@@ -3979,6 +4018,7 @@ new file mode 100644
 +        if (REXCVAR_GET(metal_debug_labels))
 +          compute.label = [NSString stringWithFormat:@"resolve %s %ux%u", depth ? "depth" : "color", width, height];
 +        if (!multisample) { constants.tex_ss[0] = dvx; constants.tex_ss[1] = dvy; }
++        constants.rs = rs;
 +        [compute setComputePipelineState:multisample ? (depth ? resolve_depth_ms_ : resolve_color_ms_)
 +                                                     : (depth ? resolve_depth_ : resolve_color_)];
 +        [compute setTexture:source atIndex:0]; [compute setTexture:destination atIndex:1];
@@ -3993,7 +4033,7 @@ new file mode 100644
 +        [compute setBuffer:resolve_rejected_ offset:0 atIndex:2];
 +        // A writer: after the writes and the last read before it (readers run together, as Metal's tracking let them).
 +        if (memory_fence_) { [compute waitForFence:memory_fence_]; [compute waitForFence:memory_read_fence_]; }
-+        [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
++        [compute dispatchThreads:MTLSizeMake(width * rs, height * rs, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
 +        if (memory_fence_) [compute updateFence:memory_fence_];
 +        [compute endEncoding];
 +        uint32_t address = info.copy_dest_base & 0x1FFFFFFF;
@@ -4018,7 +4058,7 @@ new file mode 100644
 +          resolved_[address] = {destination, info.copy_dest_extent_start & 0x1FFFFFFF, info.copy_dest_extent_length,
 +                                width, height, resolved_format, resolved_pitch};
 +        ++resolves_;
-+        if (!resolve_verified_ && memory_buffer_ && frame_ >= 650 && dest_format == MTLPixelFormatRGBA8Unorm)
++        if (!resolve_verified_ && memory_buffer_ && frame_ >= 650 && dest_format == MTLPixelFormatRGBA8Unorm && rs == 1)
 +          VerifyResolve(destination, info);
 +        if (DebugFrame()) {
 +          REXGPU_INFO("Metal resolve debug {}: base {} -> {:08X}, format {} -> {}, source {}x{} origin {},{} size {}x{}, exponent {}, swap {}",
@@ -4040,7 +4080,7 @@ new file mode 100644
 +            depth_layout->second.ssx * depth_layout->second.ssy != depth_samples ||
 +            (target.sampleCount > 1) != depth_multisample ||
 +            target.width != regs_.Get<reg::RB_SURFACE_INFO>().surface_pitch *
-+                (depth_samples == 1 && depth_msaa >= xenos::MsaaSamples::k4X ? 2 : 1)) continue;
++                (depth_samples == 1 && depth_msaa >= xenos::MsaaSamples::k4X ? 2 : 1) * depth_layout->second.scale) continue;
 +        ClearRect(target, true, {}, (info.depth_edram_info.format == uint32_t(xenos::DepthRenderTargetFormat::kD24FS8)
 +            ? xenos::Float20e4To32(info.rb_depth_clear >> 8) * 0.5 : double(info.rb_depth_clear >> 8) / 16777215.0),
 +            info.rb_depth_clear & 255, clear_rect[0], resolve_rows[0], clear_rect[1], resolve_rows[1]);
@@ -4125,9 +4165,10 @@ new file mode 100644
 +bool MetalDraw::TileRange(const TargetLayout& l, uint32_t height, uint32_t y0, uint32_t y1, uint32_t& lo, uint32_t& hi) const {
 +  y1 = std::min(y1, height);
 +  if (y0 >= y1 || l.base >= edram_tiles_) return false;
-+  // Texture rows to EDRAM tile rows (16 sample rows; a multisample texture's row holds ssy of them).
-+  lo = l.base + (y0 * l.ssy / 16) * l.pitch_tiles;
-+  hi = std::min(edram_tiles_, l.base + ((y1 * l.ssy + 15) / 16) * l.pitch_tiles);
++  // Texture rows to EDRAM tile rows (16 sample rows; a texel row holds ssy / scale of them).
++  const uint32_t rows_a_tile = 16 * l.scale;
++  lo = l.base + (y0 * l.ssy / rows_a_tile) * l.pitch_tiles;
++  hi = std::min(edram_tiles_, l.base + ((y1 * l.ssy + rows_a_tile - 1) / rows_a_tile) * l.pitch_tiles);
 +  return lo < hi;
 +}
 +void MetalDraw::MarkWritten(id<MTLTexture> target, uint32_t kind, uint32_t y0, uint32_t y1,
@@ -4390,7 +4431,8 @@ new file mode 100644
 +  if (hi <= dl.base) return;
 +  uint32_t first_row = lo > dl.base ? (lo - dl.base) / dl.pitch_tiles : 0;
 +  uint32_t end_row = (hi - dl.base + dl.pitch_tiles - 1) / dl.pitch_tiles;
-+  uint32_t y0 = first_row * 16 / dl.ssy, y1 = std::min<uint32_t>(end_row * 16 / dl.ssy, uint32_t(target.height));
++  uint32_t y0 = first_row * 16 * dl.scale / dl.ssy,
++           y1 = std::min<uint32_t>(end_row * 16 * dl.scale / dl.ssy, uint32_t(target.height));
 +  if (y0 >= y1) return;
 +  if (!pending_clears_.empty()) FlushClears(sl.texture);
 +  PendingTransfer t{&sl, source_kind, target, kind, lo, hi, y0, y1};
@@ -4445,7 +4487,7 @@ new file mode 100644
 +  if (dl.is_depth) [encoder setDepthStencilState:transfer_depth_state_];
 +  [encoder setScissorRect:MTLScissorRect{0, y0, target.width, y1 - y0}];
 +  TransferConstants c{dl.base, dl.pitch_tiles, sl.base, sl.pitch_tiles, lo, hi, source_kind, kind,
-+                      {dl.ssx, dl.ssy}, {sl.ssx, sl.ssy}, dl.is_64bpp ? 2u : 1u, sl.is_64bpp ? 2u : 1u};
++                      {dl.ssx, dl.ssy}, {sl.ssx, sl.ssy}, dl.is_64bpp ? 2u : 1u, sl.is_64bpp ? 2u : 1u, dl.scale};
 +  [encoder setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +  [encoder setFragmentTexture:source_texture atIndex:0];
 +  if (sl.is_depth) {
@@ -4505,7 +4547,7 @@ new file mode 100644
 +    const auto& dl = target_layouts_.find(reinterpret_cast<uintptr_t>((__bridge void*)t.target))->second;
 +    TransferConstants c{dl.base, dl.pitch_tiles, t.source->base, t.source->pitch_tiles, t.lo, t.hi, t.source_kind,
 +                        t.kind, {dl.ssx, dl.ssy}, {t.source->ssx, t.source->ssy}, dl.is_64bpp ? 2u : 1u,
-+                        t.source->is_64bpp ? 2u : 1u};
++                        t.source->is_64bpp ? 2u : 1u, dl.scale};
 +    [encoder_ setFragmentBytes:&c length:sizeof(c) atIndex:0];
 +    [encoder_ setFragmentTexture:t.source->texture atIndex:0];
 +    if (t.source->is_depth) {
@@ -4547,9 +4589,19 @@ new file mode 100644
 +    const uint32_t render_width = inputs.render_width, render_height = inputs.render_height;
 +    if (scene_base.pixelFormat != MTLPixelFormatRGBA16Float || depth_base.pixelFormat != MTLPixelFormatR32Float ||
 +        scene_base.width != width || scene_base.height != height || depth_base.width != width ||
-+        depth_base.height != height || stencil.width != width || stencil.height != height ||
-+        !render_width || !render_height || render_width > width || render_height > height)
++        depth_base.height != height || !stencil.width || stencil.width * (width / stencil.width) != width ||
++        stencil.height * (width / stencil.width) != height ||
++        !render_width || !render_height || render_width > width || render_height > height) {
++      static bool logged = false;
++      if (!logged) {
++        logged = true;
++        REXGPU_WARN("Metal temporal AA: inputs don't fit: scene {}x{} fmt {}, depth {}x{} fmt {}, stencil {}x{}, output {}x{}, "
++                    "render {}x{}", scene_base.width, scene_base.height, uint32_t(scene_base.pixelFormat), depth_base.width,
++                    depth_base.height, uint32_t(depth_base.pixelFormat), stencil.width, stencil.height, width, height,
++                    render_width, render_height);
++      }
 +      return 'r';
++    }
 +    const bool upscale = render_width != width || render_height != height;
 +    if (!taa_vectors_pipeline_) {
 +      NSError* error = nil;
@@ -4581,7 +4633,17 @@ new file mode 100644
 +      desc.inputWidth = render_width; desc.inputHeight = render_height;
 +      desc.outputWidth = width; desc.outputHeight = height;
 +      desc.autoExposureEnabled = YES;  // the scene before the tone map
-+      id<MTLFXTemporalScaler> scaler = [desc newTemporalScalerWithDevice:device_];
++      // Metal 4 (metal_metal4) on a queue of its own between the vectors and the copy back, else Metal 3.
++      id<MTLFXTemporalScalerBase> scaler = nil;
++      taa_metal4_ = false;
++      if (@available(macOS 26.0, *)) {
++        if (MetalUseMetal4() && [MTLFXTemporalScalerDescriptor supportsMetal4FX:device_] &&
++            taa_fx4_.Init(device_, @"MetalFX temporal scaler (Metal 4)")) {
++          scaler = [desc newTemporalScalerWithDevice:device_ compiler:taa_fx4_.compiler()];
++          taa_metal4_ = scaler != nil;
++        }
++      }
++      if (!scaler) scaler = [desc newTemporalScalerWithDevice:device_];
 +      if (!scaler) {
 +        REXGPU_ERROR("Metal temporal AA: no MetalFX temporal scaler for {}x{} to {}x{}", render_width, render_height,
 +                     width, height);
@@ -4604,19 +4666,20 @@ new file mode 100644
 +      if (!taa_motion_ || !taa_depth_ || !taa_output_ || (upscale && !taa_color_)) { taa_failed_ = true; return 'x'; }
 +      taa_scaler_ = scaler; taa_width_ = width; taa_height_ = height;
 +      taa_render_width_ = render_width; taa_render_height_ = render_height;
-+      REXGPU_INFO("Metal temporal AA: MetalFX temporal scaler ready for {}x{} to {}x{}", render_width, render_height,
-+                  width, height);
++      REXGPU_INFO("Metal temporal AA: MetalFX {} temporal scaler ready for {}x{} to {}x{}", taa_metal4_ ? "Metal 4" : "Metal 3",
++                  render_width, render_height, width, height);
 +      inputs.reset = true;
 +    }
 +    // The scaler is made for the render size; a frame whose scene was not squeezed to it has nothing to give it.
 +    if (upscale && !inputs.squeezed) return 'u';
-+    id<MTLFXTemporalScaler> scaler = taa_scaler_;
++    id<MTLFXTemporalScalerBase> scaler = taa_scaler_;
 +    // The stencil is the stencil view's first byte (red): where the fetch constant's swizzle puts it.
 +    auto stencil_fetch = regs_.GetTextureFetch(1);
 +    struct {
 +      float previous[24 * 16];
 +      float size[4], jitter[4];
 +      uint32_t map[4];
++      uint32_t stencil[4];
 +    } constants;
 +    static_assert(sizeof(constants.previous) + 8 * sizeof(float) == sizeof(float) * (24 * 16 + 8));
 +    std::memcpy(&constants, inputs.vector_constants, sizeof(float) * (24 * 16 + 8));
@@ -4629,6 +4692,7 @@ new file mode 100644
 +    for (uint32_t i = 0; i < 4; ++i)
 +      if (((stencil_fetch.swizzle >> (3 * i)) & 7) == xenos::XE_GPU_TEXTURE_SWIZZLE_R) { constants.jitter[2] = float(i); break; }
 +    constants.map[0] = width; constants.map[1] = height; constants.map[2] = render_width; constants.map[3] = render_height;
++    constants.stencil[0] = width / uint32_t(stencil.width); constants.stencil[1] = constants.stencil[2] = constants.stencil[3] = 0;
 +
 +    id<MTLCommandBuffer> cb = TextureWorkCommands();
 +    auto compute = [cb computeCommandEncoder];
@@ -4665,7 +4729,16 @@ new file mode 100644
 +    scaler.jitterOffsetX = inputs.jitter[0]; scaler.jitterOffsetY = inputs.jitter[1];
 +    scaler.motionVectorScaleX = 1.0f; scaler.motionVectorScaleY = 1.0f;
 +    scaler.reset = inputs.reset;
-+    [scaler encodeToCommandBuffer:cb];
++    bool encoded = false;
++    if (@available(macOS 26.0, *)) {
++      if (taa_metal4_) {
++        taa_fx4_.Encode(cb, cb, {color, taa_depth_, taa_motion_, taa_output_}, ^(id<MTL4CommandBuffer> commands) {
++          [(id<MTL4FXTemporalScaler>)scaler encodeToCommandBuffer:commands];
++        });
++        encoded = true;
++      }
++    }
++    if (!encoded) [(id<MTLFXTemporalScaler>)scaler encodeToCommandBuffer:cb];
 +    // The anti-aliased scene in place of the scene, for the motion blur and anything after it.
 +    auto blit = [cb blitCommandEncoder];
 +    [blit copyFromTexture:taa_output_ sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -4791,7 +4864,14 @@ new file mode 100644
 +    desc.motionTextureFormat = MTLPixelFormatRG16Float;
 +    desc.inputWidth = in_width; desc.inputHeight = in_height;
 +    desc.outputWidth = width; desc.outputHeight = height;
-+    id<MTLFXFrameInterpolator> interpolator = [desc newFrameInterpolatorWithDevice:device_];
++    id<MTLFXFrameInterpolatorBase> interpolator = nil;
++    fg_metal4_ = false;
++    if (MetalUseMetal4() && [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device_] &&
++        fg_fx4_.Init(device_, @"MetalFX frame interpolation (Metal 4)")) {
++      interpolator = [desc newFrameInterpolatorWithDevice:device_ compiler:fg_fx4_.compiler()];
++      fg_metal4_ = interpolator != nil;
++    }
++    if (!interpolator) interpolator = [desc newFrameInterpolatorWithDevice:device_];
 +    if (!interpolator) {
 +      REXGPU_ERROR("Metal frame generation: no MetalFX frame interpolator for {}x{} to {}x{}", in_width, in_height,
 +                   width, height);
@@ -4819,7 +4899,8 @@ new file mode 100644
 +    if (!fg_hudless_[0] || !fg_hudless_[1] || !fg_output_) { fg_failed_ = true; return false; }
 +    fg_interpolator_ = interpolator;
 +    fg_in_width_ = in_width; fg_in_height_ = in_height;
-+    REXGPU_INFO("Metal frame generation: MetalFX frame interpolator ready for {}x{} (depth and vectors {}x{})", width,
++    REXGPU_INFO("Metal frame generation: MetalFX {} frame interpolator ready for {}x{} (depth and vectors {}x{})",
++                fg_metal4_ ? "Metal 4" : "Metal 3", width,
 +                height, in_width, in_height);
 +    return true;
 +  }
@@ -4848,8 +4929,12 @@ new file mode 100644
 +  // The front buffer's format picks the ramp (as the Vulkan backend does): PWL for 10-bit, the table otherwise.
 +  auto format = GetBaseFormat(fetch.format);
 +  bool pwl = format == xenos::TextureFormat::k_2_10_10_10 || format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
-+  struct { uint32_t size[2]; uint32_t mode; } c{{uint32_t(std::min(source.width, destination.width)),
-+      uint32_t(std::min(source.height, destination.height))}, gamma && REXCVAR_GET(metal_gamma_ramp) ? (pwl ? 2u : 1u) : 0u};
++  // At resolution_scale a front buffer loaded from memory (not a resolve's texture) is at 1x: each of its pixels
++  // goes to rs x rs of the output.
++  const uint32_t factor = rs_ > 1 && source.width == uint32_t(fetch.size_2d.width) + 1 ? rs_ : 1u;
++  struct { uint32_t size[2]; uint32_t mode, factor; } c{{uint32_t(std::min<NSUInteger>(source.width * factor, destination.width)),
++      uint32_t(std::min<NSUInteger>(source.height * factor, destination.height))},
++      gamma && REXCVAR_GET(metal_gamma_ramp) ? (pwl ? 2u : 1u) : 0u, factor};
 +  EndEncoder();
 +  CommitBefore();
 +  if (!commands_) commands_ = [queue_ commandBuffer];
@@ -4951,7 +5036,7 @@ new file mode 100644
 +    // texture.
 +    id<MTLCommandBuffer> fg_commands = [queue_ commandBuffer];
 +    fg_commands.label = @"MetalFX frame interpolation";
-+    id<MTLFXFrameInterpolator> interpolator = fg_interpolator_;
++    id<MTLFXFrameInterpolatorBase> interpolator = fg_interpolator_;
 +    interpolator.colorTexture = hudless;
 +    interpolator.prevColorTexture = fg_hudless_[fg_index_ ^ 1];
 +    interpolator.depthTexture = taa_depth_;
@@ -4965,7 +5050,17 @@ new file mode 100644
 +    interpolator.aspectRatio = float(width) / float(height);
 +    interpolator.shouldResetHistory = NO;  // cuts aren't generated (above)
 +    interpolator.outputTexture = fg_output_;
-+    [interpolator encodeToCommandBuffer:fg_commands];
++    if (fg_metal4_) {
++      // Metal 4: after the HUD-less image's commands (committed above; a command buffer between signals), before the
++      // compose. The queue's order holds the next frame's writes to these textures behind the compose.
++      id<MTLCommandBuffer> signal = [queue_ commandBuffer];
++      signal.label = @"frame generation: HUD-less image ready";
++      fg_fx4_.Encode(signal, fg_commands, {fg_hudless_[0], fg_hudless_[1], fg_output_, taa_depth_, taa_motion_},
++                     ^(id<MTL4CommandBuffer> cb) { [(id<MTL4FXFrameInterpolator>)interpolator encodeToCommandBuffer:cb]; });
++      [signal commit];
++    } else {
++      [(id<MTLFXFrameInterpolator>)interpolator encodeToCommandBuffer:fg_commands];
++    }
 +    constants[2] = refresh->constants[2] | (1u << 12) | (use_hdr ? 0u : 1u << 15);
 +    constants[3] = width | (height << 16);
 +    auto compose = [fg_commands computeCommandEncoder];
@@ -5425,11 +5520,158 @@ new file mode 100644
 +};
 +
 +}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/metal_fx4.h b/src/graphics/metal/metal_fx4.h
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/metal/metal_fx4.h
+@@ -0,0 +1,45 @@
++/** Metal 4 queues for the MetalFX effects. BSD-3-Clause, see LICENSE. */
++#pragma once
++#import <Metal/Metal.h>
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <initializer_list>
++#include <memory>
++
++namespace rex::graphics::metal {
++
++// metal_metal4 (on by default): whether the MetalFX effects (the temporal scaler, the frame interpolator, the
++// presenter's spatial scaler) are made and encoded with Metal 4 (MTL4FX*, macOS 26) where the device has them;
++// false is Metal 3 everywhere. The draws themselves are Metal 3 either way.
++bool MetalUseMetal4();
++
++// One effect's Metal 4 queue beside the backend's Metal 3 one. The effect's commands run between Metal 3 work: the
++// command buffer before them signals a shared event where it stands, the Metal 4 queue waits for that, runs them and
++// signals again, and the Metal 3 command buffer after them (the same one or a later one) waits for that. Metal 4
++// doesn't track residency: the textures a call names are put in the effect's residency set. One thread uses it.
++class MetalFx4 {
++ public:
++  // False: no Metal 4 here (or it's turned off); the effect uses Metal 3.
++  bool Init(id<MTLDevice> device, NSString* label) API_AVAILABLE(macos(26.0));
++  bool ready() const { return queue_ != nil; }
++  id<MTL4Compiler> compiler() const API_AVAILABLE(macos(26.0)) { return compiler_; }
++  void Encode(id<MTLCommandBuffer> before, id<MTLCommandBuffer> after, std::initializer_list<id<MTLTexture>> textures,
++              void (^encode)(id<MTL4CommandBuffer>)) API_AVAILABLE(macos(26.0));
++  // GPU time of the Metal 4 commands since the last call, in microseconds.
++  uint64_t TakeGpuUs() { return gpu_us_->exchange(0); }
++
++ private:
++  id queue_ = nil, compiler_ = nil, command_buffer_ = nil, residency_ = nil;  // MTL4CommandQueue, MTL4Compiler, ...
++  std::array<id, 3> allocators_{};                                             // MTL4CommandAllocator
++  std::array<uint64_t, 3> allocator_done_{};  // the event value after each allocator's last commands
++  uint32_t slot_ = 0;
++  id<MTLSharedEvent> event_ = nil;
++  uint64_t value_ = 0;
++  std::array<id<MTLTexture>, 8> resident_{};
++  NSString* label_ = nil;
++  std::shared_ptr<std::atomic<uint64_t>> gpu_us_ = std::make_shared<std::atomic<uint64_t>>(0);
++};
++
++}  // namespace rex::graphics::metal
+diff --git a/src/graphics/metal/metal_fx4.mm b/src/graphics/metal/metal_fx4.mm
+new file mode 100644
+--- /dev/null
++++ b/src/graphics/metal/metal_fx4.mm
+@@ -0,0 +1,92 @@
++/** Metal 4 queues for the MetalFX effects. BSD-3-Clause, see LICENSE. */
++#include "metal_fx4.h"
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++REXCVAR_DEFINE_BOOL(metal_metal4, true, "GPU/Metal",
++                    "Metal 4 for the MetalFX effects (macOS 26): the temporal scaler (temporal AA and upscaling), the "
++                    "frame interpolator (frame generation) and the presenter's spatial scaler are made and encoded with "
++                    "Metal 4 (MTL4FX*, each on a Metal 4 queue of its own) where the device has them; false: Metal 3 "
++                    "everywhere (MTLFX*). The draws are Metal 3 either way")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++namespace rex::graphics::metal {
++
++bool MetalUseMetal4() {
++  if (@available(macOS 26.0, *)) return REXCVAR_GET(metal_metal4);
++  return false;
++}
++
++bool MetalFx4::Init(id<MTLDevice> device, NSString* label) {
++  if (queue_) return true;
++  if (!MetalUseMetal4() || !device) return false;
++  NSError* error = nil;
++  auto queue_desc = [MTL4CommandQueueDescriptor new];
++  queue_desc.label = label;
++  id<MTL4CommandQueue> queue = [device newMTL4CommandQueueWithDescriptor:queue_desc error:&error];
++  id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
++  auto residency_desc = [MTLResidencySetDescriptor new];
++  residency_desc.label = label;
++  residency_desc.initialCapacity = resident_.size();
++  id<MTLResidencySet> residency = [device newResidencySetWithDescriptor:residency_desc error:&error];
++  id<MTL4CommandBuffer> command_buffer = [device newCommandBuffer];
++  bool allocators = true;
++  for (auto& a : allocators_) allocators &= (a = [device newCommandAllocator]) != nil;
++  event_ = [device newSharedEvent];
++  if (!queue || !compiler || !residency || !command_buffer || !allocators || !event_) {
++    REXGPU_WARN("Metal 4: no queue for {} ({}); Metal 3 instead", label.UTF8String,
++                error ? error.localizedDescription.UTF8String : "?");
++    return false;
++  }
++  queue_ = queue; compiler_ = compiler; residency_ = residency; command_buffer_ = command_buffer; label_ = label;
++  return true;
++}
++
++void MetalFx4::Encode(id<MTLCommandBuffer> before, id<MTLCommandBuffer> after,
++                      std::initializer_list<id<MTLTexture>> textures, void (^encode)(id<MTL4CommandBuffer>)) {
++  id<MTL4CommandQueue> queue = queue_;
++  id<MTLResidencySet> residency = residency_;
++  // The residency set follows the textures (made again with a size): the allocations, not their views.
++  std::array<id<MTLTexture>, 8> resident{};
++  size_t count = 0;
++  for (id<MTLTexture> t : textures) {
++    while (t.parentTexture) t = t.parentTexture;
++    if (t && count < resident.size()) resident[count++] = t;
++  }
++  if (resident != resident_) {
++    [residency removeAllAllocations];
++    for (size_t i = 0; i < count; ++i) [residency addAllocation:resident[i]];
++    [residency commit];
++    resident_ = resident;
++  }
++  const uint64_t ready = ++value_;
++  [before encodeSignalEvent:event_ value:ready];
++  // An allocator is reset once the GPU is done with its last commands (two uses back).
++  const uint32_t slot = slot_;
++  slot_ = (slot_ + 1) % uint32_t(allocators_.size());
++  if (event_.signaledValue < allocator_done_[slot]) [event_ waitUntilSignaledValue:allocator_done_[slot] timeoutMS:1000];
++  id<MTL4CommandAllocator> allocator = allocators_[slot];
++  [allocator reset];
++  id<MTL4CommandBuffer> command_buffer = command_buffer_;
++  [command_buffer beginCommandBufferWithAllocator:allocator];
++  command_buffer.label = label_;
++  [command_buffer useResidencySet:residency];
++  encode(command_buffer);
++  [command_buffer endCommandBuffer];
++  [queue waitForEvent:event_ value:ready];
++  auto options = [MTL4CommitOptions new];
++  auto gpu_us = gpu_us_;
++  [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
++    if (!feedback.error && feedback.GPUEndTime > feedback.GPUStartTime)
++      gpu_us->fetch_add(uint64_t((feedback.GPUEndTime - feedback.GPUStartTime) * 1e6), std::memory_order_relaxed);
++  }];
++  id<MTL4CommandBuffer> commits[1] = {command_buffer};
++  [queue commit:commits count:1 options:options];
++  const uint64_t done = ++value_;
++  [queue signalEvent:event_ value:done];
++  allocator_done_[slot] = done;
++  [after encodeWaitForEvent:event_ value:done];
++}
++
++}  // namespace rex::graphics::metal
 diff --git a/src/graphics/metal/metal_internal.h b/src/graphics/metal/metal_internal.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_internal.h
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,330 @@
 +/**
 + * @file        graphics/metal/metal_internal.h
 + * @brief       The Metal backend's classes (Objective-C++ only)
@@ -5475,7 +5717,10 @@ new file mode 100644
 +#include <rex/ui/graphics_provider.h>
 +#include <rex/ui/presenter.h>
 +
++#include "metal_fx4.h"
 +namespace rex::graphics::metal {
++// resolution_scale clamped to 1..3 (1 with metal_msaa): host pixels across and down each guest pixel.
++uint32_t MetalResolutionScale();
 +
 +class MetalShaderCompiler;
 +class MetalDraw;
@@ -5609,7 +5854,10 @@ new file mode 100644
 +  id<MTLTexture> SpatialUpscale(id<MTLCommandBuffer> command_buffer, id<MTLTexture> image,
 +                                const PaintPlacement& placement);
 +  std::mutex spatial_mutex_;
-+  id<MTLFXSpatialScaler> spatial_ = nil;
++  // id<MTLFXSpatialScalerBase>: an MTL4FXSpatialScaler on spatial_fx4_ (metal_metal4) or an MTLFXSpatialScaler.
++  id spatial_ = nil;
++  bool spatial_metal4_ = false;
++  MetalFx4 spatial_fx4_;
 +  id<MTLTexture> spatial_output_ = nil;
 +  uint32_t spatial_in_[2] = {}, spatial_out_[2] = {};
 +  MTLPixelFormat spatial_format_ = MTLPixelFormatInvalid;
@@ -5684,6 +5932,8 @@ new file mode 100644
 +  // stretch it back (metal_taa_upscale).
 +  bool TaaUpscaleSupported() const override;
 +  bool HdrHostRenderTargets() const override { return true; }
++  // resolution_scale (MetalResolutionScale): the shared HDR and temporal AA code works in host pixels.
++  void HdrDrawResolutionScale(uint32_t& x, uint32_t& y) const override { x = y = MetalResolutionScale(); }
 +  uint32_t HdrEdramTileCount() const override { return graphics_system_->edram_tile_count(); }
 +  bool HdrCopyFromColorTarget(uint32_t key, HdrTexture dest, const HdrRect& source, uint32_t dest_x,
 +                              uint32_t dest_y) override;
@@ -5756,7 +6006,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,1121 @@
+@@ -0,0 +1,1140 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -6642,12 +6892,20 @@ new file mode 100644
 +    desc.colorTextureFormat = image.pixelFormat; desc.outputTextureFormat = image.pixelFormat;
 +    // SDR in sRGB gamma, HDR in PQ: both perceptual encodings.
 +    desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
-+    spatial_ = [desc newSpatialScalerWithDevice:device_];
++    spatial_metal4_ = false;
++    if (@available(macOS 26.0, *)) {
++      if (MetalUseMetal4() && [MTLFXSpatialScalerDescriptor supportsMetal4FX:device_] &&
++          spatial_fx4_.Init(device_, @"MetalFX spatial scaler (Metal 4)")) {
++        spatial_ = [desc newSpatialScalerWithDevice:device_ compiler:spatial_fx4_.compiler()];
++        spatial_metal4_ = spatial_ != nil;
++      }
++    }
++    if (!spatial_) spatial_ = [desc newSpatialScalerWithDevice:device_];
 +    if (spatial_) {
 +      MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:image.pixelFormat
 +                                                                                    width:width height:height
 +                                                                                mipmapped:NO];
-+      td.usage = spatial_.outputTextureUsage | MTLTextureUsageShaderRead;
++      td.usage = ((id<MTLFXSpatialScalerBase>)spatial_).outputTextureUsage | MTLTextureUsageShaderRead;
 +      td.storageMode = MTLStorageModePrivate;
 +      spatial_output_ = [device_ newTextureWithDescriptor:td];
 +    }
@@ -6659,13 +6917,24 @@ new file mode 100644
 +    }
 +    spatial_in_[0] = uint32_t(image.width); spatial_in_[1] = uint32_t(image.height);
 +    spatial_out_[0] = width; spatial_out_[1] = height; spatial_format_ = image.pixelFormat;
-+    REXGPU_INFO("Metal presenter: MetalFX spatial upscaling {}x{} to {}x{} (shown at {}x{})", uint32_t(image.width),
++    REXGPU_INFO("Metal presenter: MetalFX {} spatial upscaling {}x{} to {}x{} (shown at {}x{})",
++                spatial_metal4_ ? "Metal 4" : "Metal 3", uint32_t(image.width),
 +                uint32_t(image.height), width, height, out_width, out_height);
 +  }
-+  spatial_.colorTexture = image;
-+  spatial_.outputTexture = spatial_output_;
-+  spatial_.inputContentWidth = image.width; spatial_.inputContentHeight = image.height;
-+  [spatial_ encodeToCommandBuffer:command_buffer];
++  id<MTLFXSpatialScalerBase> spatial = spatial_;
++  spatial.colorTexture = image;
++  spatial.outputTexture = spatial_output_;
++  spatial.inputContentWidth = image.width; spatial.inputContentHeight = image.height;
++  if (@available(macOS 26.0, *)) {
++    if (spatial_metal4_) {
++      // On the Metal 4 queue between the command buffer's work so far and the paint after it.
++      spatial_fx4_.Encode(command_buffer, command_buffer, {image, spatial_output_}, ^(id<MTL4CommandBuffer> commands) {
++        [(id<MTL4FXSpatialScaler>)spatial encodeToCommandBuffer:commands];
++      });
++      return spatial_output_;
++    }
++  }
++  [(id<MTLFXSpatialScaler>)spatial encodeToCommandBuffer:command_buffer];
 +  return spatial_output_;
 +}
 +
@@ -6882,7 +7151,7 @@ diff --git a/src/graphics/metal/metal_resolve.h b/src/graphics/metal/metal_resol
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_resolve.h
-@@ -0,0 +1,493 @@
+@@ -0,0 +1,514 @@
 +/** Metal resolve compute kernels. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +namespace rex::graphics::metal {
@@ -6904,7 +7173,11 @@ new file mode 100644
 +  // EDRAM samples a texel of a single-sample source holds across and down: 1x1, or 2x2 for a 4x surface drawn at
 +  // one sample a pixel (metal_4x_as_1x).
 +  uint2 tex_ss;
++  // resolution_scale (single-sample sources): the source and the destination texture have rs x rs texels for each
++  // guest pixel, and the grid covers them all. Guest memory gets one of each pixel's (its first).
++  uint rs, padding;
 +};
++// Host pixel q of the target (from its origin, times rs) at ((2q + 1) * num) / (2 * den): num and den are host sizes.
 +uint2 stretched(uint2 q, constant ResolveConstants& c) {
 +  return min(((2u * q + 1u) * c.stretch_num) / (2u * c.stretch_den), c.stretch_num - 1u);
 +}
@@ -6988,38 +7261,42 @@ new file mode 100644
 +kernel void resolve_color(texture2d<float, access::read> source [[texture(0)]],
 +    texture2d<float, access::write> destination [[texture(1)]],
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
-+    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
-+  if (any(p >= c.size)) return;
++    device atomic_uint* rejected [[buffer(2)]], uint2 q [[thread_position_in_grid]]) {
++  uint rs = max(c.rs, 1u);
++  if (any(q >= c.size * rs)) return;
++  uint2 p = q / rs, sub = q % rs;
 +  uint2 base = c.origin + p * c.samples;
-+  if (c.stretch) base = stretched(c.origin + p, c);
 +  float4 value;
 +  if (c.stretch) {
-+    value = source.read(base);
++    value = source.read(stretched(c.origin * rs + q, c));
 +  } else if (c.sample_select < 4) {
-+    value = source.read((base + sample_offset(c.sample_select, c.samples)) / c.tex_ss);
++    value = source.read((base + sample_offset(c.sample_select, c.samples)) / c.tex_ss * rs + sub);
 +  } else {
 +    value = float4(0);
-+    for (uint y = 0; y < c.samples.y; ++y) for (uint x = 0; x < c.samples.x; ++x) value += source.read((base + uint2(x, y)) / c.tex_ss);
++    for (uint y = 0; y < c.samples.y; ++y) for (uint x = 0; x < c.samples.x; ++x)
++      value += source.read((base + uint2(x, y)) / c.tex_ss * rs + sub);
 +    value /= float(c.samples.x * c.samples.y);
 +  }
 +  value *= c.scale;
 +  if (c.swap) value = value.bgra;
-+  destination.write(value, p);
-+  store_guest(value, p, c, memory, rejected);
++  destination.write(value, q);
++  if (all(sub == 0u)) store_guest(value, p, c, memory, rejected);
 +}
 +kernel void resolve_depth(depth2d<float, access::read> source [[texture(0)]],
 +    texture2d<float, access::write> destination [[texture(1)]],
 +    texture2d<uint, access::read> stencil [[texture(2)]],
 +    constant ResolveConstants& c [[buffer(0)]], device uchar* memory [[buffer(1)]],
-+    device atomic_uint* rejected [[buffer(2)]], uint2 p [[thread_position_in_grid]]) {
-+  if (any(p >= c.size)) return;
-+  uint2 at = c.stretch ? stretched(c.origin + p, c)
-+                       : (c.origin + p * c.samples + sample_offset(c.sample_select, c.samples)) / c.tex_ss;
++    device atomic_uint* rejected [[buffer(2)]], uint2 q [[thread_position_in_grid]]) {
++  uint rs = max(c.rs, 1u);
++  if (any(q >= c.size * rs)) return;
++  uint2 p = q / rs, sub = q % rs;
++  uint2 at = c.stretch ? stretched(c.origin * rs + q, c)
++                       : (c.origin + p * c.samples + sample_offset(c.sample_select, c.samples)) / c.tex_ss * rs + sub;
 +  float depth = source.read(at) * c.scale;
-+  destination.write(float4(depth), p);
++  destination.write(float4(depth), q);
 +  // Depth resolves write the EDRAM depth format whatever the destination format says: 24-bit
 +  // depth over 8-bit stencil (the stencil read through an X32_Stencil8 view of the target).
-+  if (!c.write_memory) return;
++  if (!c.write_memory || any(sub != 0u)) return;
 +  uint d24 = c.format == 23 ? float32_to_20e4(depth) : uint(rint(saturate(depth) * 16777215.0f));
 +  store_raw(uint4((d24 << 8) | (stencil.read(at).r & 0xFFu), 0, 0, 0), 2, p, c, memory, rejected);
 +}
@@ -7061,6 +7338,7 @@ new file mode 100644
 +// Guest texture memory to linear blocks, for a blit into the texture (any format, compressed too).
 +struct LoadConstants {
 +  uint src_base, slice_stride, row_pitch_bytes, pitch_blocks, log_bpp, ox, oy, tiled, xor_mask, bw, bh, convert;
++  uint scale;  // out blocks across and down for each: a composite's rows from memory beside resolution-scaled resolves
 +};
 +float float20e4_to_32(uint f24) {
 +  f24 &= 0xFFFFFFu;
@@ -7073,13 +7351,15 @@ new file mode 100644
 +  return as_type<float>(((exponent + 112) << 23) | (mantissa << 3));
 +}
 +kernel void load_texture(device const uchar* memory [[buffer(0)]], device uchar* out [[buffer(1)]],
-+    constant LoadConstants& c [[buffer(2)]], uint3 p [[thread_position_in_grid]]) {
-+  if (p.x >= c.bw || p.y >= c.bh) return;
++    constant LoadConstants& c [[buffer(2)]], uint3 o [[thread_position_in_grid]]) {
++  uint scale = max(c.scale, 1u), out_w = c.bw * scale, out_h = c.bh * scale;
++  if (o.x >= out_w || o.y >= out_h) return;
++  uint3 p = uint3(o.xy / scale, o.z);
 +  uint bpb = 1u << c.log_bpp;
 +  uint offset = c.tiled ? tiled_offset(uint2(p.x + c.ox, p.y + c.oy), c.pitch_blocks, c.log_bpp)
 +                        : (p.y + c.oy) * c.row_pitch_bytes + (p.x + c.ox) * bpb;
 +  uint src = c.src_base + p.z * c.slice_stride + offset;
-+  uint dst = ((p.z * c.bh + p.y) * c.bw + p.x) * (c.convert >= 3 ? 4u : bpb);
++  uint dst = ((o.z * out_h + o.y) * out_w + o.x) * (c.convert >= 3 ? 4u : bpb);
 +  bool inside = src + bpb <= 0x20000000u;
 +  if (c.convert >= 3) {
 +    // 16-bit packed, red in the low bits: 3 k_1_5_5_5, 4 k_5_6_5, 5 k_6_5_5, 6 k_4_4_4_4. Formats
@@ -7123,7 +7403,7 @@ new file mode 100644
 +  }
 +  for (uint i = 0; i < bpb; ++i) out[dst + i] = inside ? memory[(src + i) ^ c.xor_mask] : uchar(0);
 +}
-+struct PresentConstants { uint2 size; uint mode; };  // mode 0: as is, 1: 256-entry table, 2: PWL
++struct PresentConstants { uint2 size; uint mode, factor; };  // mode 0: as is, 1: 256-entry table, 2: PWL; factor: output pixels a source one
 +struct GammaRamp { uint table[256]; uint pwl[128 * 3]; };
 +// DC_LUT_30_COLOR: blue in bits 0:9, green 10:19, red 20:29.
 +float ramp_table(constant GammaRamp& g, float v, uint shift) {
@@ -7141,7 +7421,7 @@ new file mode 100644
 +    constant PresentConstants& c [[buffer(0)]], constant GammaRamp& g [[buffer(1)]],
 +    uint2 p [[thread_position_in_grid]]) {
 +  if (any(p >= c.size)) return;
-+  float4 color = source.read(p, 0);
++  float4 color = source.read(p / max(c.factor, 1u), 0);
 +  if (c.mode == 1) color.rgb = float3(ramp_table(g, color.r, 20), ramp_table(g, color.g, 10), ramp_table(g, color.b, 0));
 +  else if (c.mode == 2) color.rgb = float3(ramp_pwl(g, color.r, 0), ramp_pwl(g, color.g, 1), ramp_pwl(g, color.b, 2));
 +  destination.write(color, p);
@@ -7160,6 +7440,7 @@ new file mode 100644
 +  uint src_kind, dst_kind;
 +  uint2 dst_ss, src_ss;  // samples a texel of each holds (1x1 for a single-sample texture; metal_msaa)
 +  uint dst_dw, src_dw;  // dwords a sample (2 for 64bpp)
++  uint scale, padding;  // the resolution scale: texels across and down for each 1x texel (single-sample targets)
 +};
 +// Resolve clears: a scissored full-screen triangle over only the resolved rectangle.
 +struct ClearConstants { float4 color; float depth; };
@@ -7245,14 +7526,18 @@ new file mode 100644
 +  out.stencil = b & 0xFFu;
 +  return out;
 +}
-+// Reading a source at a sample-space position, single-sample or multisample.
-+float4 read_color(texture2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss); }
-+float4 read_color(texture2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
-+float read_depth(depth2d<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss); }
-+float read_depth(depth2d_ms<float, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)); }
-+uint read_stencil(texture2d<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss).r; }
-+uint read_stencil(texture2d_ms<uint, access::read> t, uint2 s, uint2 ss) { return t.read(s / ss, host_sample(s % ss, ss)).r; }
-+template <typename T> uint2 sample_size(T t, uint2 ss) { return uint2(t.get_width(), t.get_height()) * ss; }
++// Reading a source at a sample-space position, single-sample or multisample. With a resolution scale a
++// single-sample texel at 1x is scale x scale texels: the one at `sub` in it (the destination's own sub-texel).
++float4 read_color(texture2d<float, access::read> t, uint2 s, uint2 ss, uint2 sub, uint scale) { return t.read(s / ss * scale + sub); }
++float4 read_color(texture2d_ms<float, access::read> t, uint2 s, uint2 ss, uint2, uint) { return t.read(s / ss, host_sample(s % ss, ss)); }
++float read_depth(depth2d<float, access::read> t, uint2 s, uint2 ss, uint2 sub, uint scale) { return t.read(s / ss * scale + sub); }
++float read_depth(depth2d_ms<float, access::read> t, uint2 s, uint2 ss, uint2, uint) { return t.read(s / ss, host_sample(s % ss, ss)); }
++uint read_stencil(texture2d<uint, access::read> t, uint2 s, uint2 ss, uint2 sub, uint scale) { return t.read(s / ss * scale + sub).r; }
++uint read_stencil(texture2d_ms<uint, access::read> t, uint2 s, uint2 ss, uint2, uint) { return t.read(s / ss, host_sample(s % ss, ss)).r; }
++uint2 sample_size(texture2d<float, access::read> t, uint2 ss, uint scale) { return uint2(t.get_width(), t.get_height()) / scale * ss; }
++uint2 sample_size(depth2d<float, access::read> t, uint2 ss, uint scale) { return uint2(t.get_width(), t.get_height()) / scale * ss; }
++uint2 sample_size(texture2d_ms<float, access::read> t, uint2 ss, uint) { return uint2(t.get_width(), t.get_height()) * ss; }
++uint2 sample_size(depth2d_ms<float, access::read> t, uint2 ss, uint) { return uint2(t.get_width(), t.get_height()) * ss; }
 +// A single-sample texture's texel may hold several samples (metal_4x_as_1x: 2x2): it is drawn as its first.
 +// Variants: _sm a multisample source, _dm a multisample destination (run per sample).
 +#define SRC_COLOR_P texture2d<float, access::read>
@@ -7263,19 +7548,22 @@ new file mode 100644
 +#define SRC_STENCIL_M texture2d_ms<uint, access::read>
 +#define DST_ARGS_P
 +#define DST_ARGS_M , uint sid [[sample_id]]
-+#define DST_COORD_P (uint2(position.xy) * c.dst_ss)
++#define DST_COORD_P (uint2(position.xy) / c.scale * c.dst_ss)
 +#define DST_COORD_M (uint2(position.xy) * c.dst_ss + guest_sub(sid, c.dst_ss))
++#define DST_SUB_P (uint2(position.xy) % c.scale)
++#define DST_SUB_M uint2(0u)
 +// The destination sample's dwords (b) from a color or a depth source; discarded where the source has none.
 +#define TRANSFER_DWORDS(D, PACK) \
-+  uint2 d = DST_COORD_##D, s, s1; uint sk, sk1; \
-+  if (!transfer_source(d, 0u, c, sample_size(source, c.src_ss), s, sk)) discard_fragment(); \
++  uint2 d = DST_COORD_##D, sub = DST_SUB_##D, s, s1; uint sk, sk1; \
++  if (!transfer_source(d, 0u, c, sample_size(source, c.src_ss, c.scale), s, sk)) discard_fragment(); \
 +  uint2 p = PACK(s), b = uint2(p[sk], 0u); \
-+  if (c.dst_dw > 1u && transfer_source(d, 1u, c, sample_size(source, c.src_ss), s1, sk1)) { \
++  if (c.dst_dw > 1u && transfer_source(d, 1u, c, sample_size(source, c.src_ss, c.scale), s1, sk1)) { \
 +    if (any(s1 != s)) p = PACK(s1); \
 +    b.y = p[sk1]; \
 +  }
-+#define PACK_COLOR(at) pack_color(read_color(source, at, c.src_ss), c.src_kind)
-+#define PACK_DEPTH(at) uint2(pack_depth(read_depth(source, at, c.src_ss), read_stencil(stencil, at, c.src_ss), c.src_kind), 0u)
++#define PACK_COLOR(at) pack_color(read_color(source, at, c.src_ss, sub, c.scale), c.src_kind)
++#define PACK_DEPTH(at) uint2(pack_depth(read_depth(source, at, c.src_ss, sub, c.scale), \
++    read_stencil(stencil, at, c.src_ss, sub, c.scale), c.src_kind), 0u)
 +#define TRANSFERS(SUFFIX, S, D) \
 +fragment float4 transfer_color_from_color##SUFFIX(float4 position [[position]], constant TransferConstants& c [[buffer(0)]], \
 +    SRC_COLOR_##S source [[texture(0)]] DST_ARGS_##D) { \
@@ -7340,7 +7628,9 @@ new file mode 100644
 +// render-size corner and resolved stretched to the output size: render pixel i is output pixel
 +// (2 * output * i + render - 1) / (2 * render), the first to show it, where the depth, the stencil and (when
 +// asked) the colour are taken from. At the native size that is pixel i itself.
-+struct TaaMvConstants { float4 previous[96]; float4 size; float4 jitter; uint4 map; };  // map: output w, h, render w, h
++// map: output w, h, render w, h; stencil.x: output pixels across a stencil texel (resolution_scale: the stencil view
++// comes from guest memory, at 1x).
++struct TaaMvConstants { float4 previous[96]; float4 size; float4 jitter; uint4 map; uint4 stencil; };
 +uint2 taa_source(uint2 i, uint4 map) { return min((i * map.xy * 2u + map.zw - 1u) / (map.zw * 2u), map.xy - 1u); }
 +kernel void taa_motion_vectors(constant TaaMvConstants& c [[buffer(0)]],
 +    texture2d_array<float, access::read> depth [[texture(0)]], texture2d_array<float, access::read> stencil [[texture(1)]],
@@ -7350,7 +7640,7 @@ new file mode 100644
 +  uint2 source = taa_source(p, c.map);
 +  if (c.jitter.w != 0.0f) color.write(scene.read(source, 0), p);
 +  float d = depth.read(source, 0).x;
-+  float s = stencil.read(source, 0)[uint(c.jitter.z)];
++  float s = stencil.read(source / max(c.stencil.x, 1u), 0)[uint(c.jitter.z)];
 +  uint id = uint(s * 255.0f + 0.5f) >> 2u;
 +  if (id >= 24u) id = 0u;
 +  float2 position = float2(p) + 0.5f - c.jitter.xy;
@@ -7380,7 +7670,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.cpp b/src/graphics/metal
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.cpp
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,295 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.cpp
 + * @brief       Guest microcode to MSL (see metal_shader_translator.h)
@@ -7393,6 +7683,7 @@ new file mode 100644
 +
 +#include "metal_shader_translator.h"
 +
++#include <algorithm>
 +#include <cstring>
 +#include <exception>
 +#include <vector>
@@ -7406,6 +7697,8 @@ new file mode 100644
 +    "The guest's exact float operations (SPIRV-Cross's spvFMul, spvFAdd: single-rounding fma forms) inlined instead "
 +    "of optnone function calls, with safe shader math (metal_shader_math 0), where the fma forms alone keep them exact");
 +REXCVAR_DECLARE(int32_t, metal_shader_math);
++REXCVAR_DECLARE(int32_t, resolution_scale);
++REXCVAR_DECLARE(bool, metal_msaa);
 +#include <rex/graphics/register_file.h>
 +#include <rex/graphics/pipeline/shader/spirv.h>
 +
@@ -7435,9 +7728,16 @@ new file mode 100644
 +
 +}  // namespace
 +
++uint32_t MetalResolutionScale() {
++  static const uint32_t scale = REXCVAR_GET(metal_msaa) ? 1u
++      : uint32_t(std::clamp(REXCVAR_GET(resolution_scale), int32_t(1), int32_t(3)));
++  return scale;
++}
++
 +MetalShaderTranslator::MetalShaderTranslator(uint32_t edram_tile_count)
-+    : translator_(std::make_unique<SpirvShaderTranslator>(MetalTranslatorFeatures(), false, false, false, 1,
-+                                                          1, edram_tile_count)) {}
++    : translator_(std::make_unique<SpirvShaderTranslator>(MetalTranslatorFeatures(), false, false, false,
++                                                          MetalResolutionScale(), MetalResolutionScale(),
++                                                          edram_tile_count)) {}
 +
 +MetalShaderTranslator::~MetalShaderTranslator() = default;
 +
@@ -7591,7 +7891,7 @@ new file mode 100644
 +
 +void BuildMetalSystemConstants(const RegisterFile& regs, const PrimitiveProcessor::ProcessingResult& p,
 +    const draw_util::ViewportInfo& v, std::vector<uint8_t>& out, const uint32_t* texture_signs,
-+    float ps_param_gen_scale) {
++    float ps_param_gen_scale, uint32_t resolution_scale, uint32_t textures_scaled) {
 +  using T = SpirvShaderTranslator;
 +  T::SystemConstants c{};
 +  auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
@@ -7641,8 +7941,10 @@ new file mode 100644
 +  c.point_vertex_diameter_max = minmax.max_size * 0.125f;
 +  c.point_constant_diameter[0] = point.width * 0.125f;
 +  c.point_constant_diameter[1] = point.height * 0.125f;
-+  c.point_screen_diameter_to_ndc_radius[0] = 1.0f / std::max(v.xy_extent[0], 1u);
-+  c.point_screen_diameter_to_ndc_radius[1] = -1.0f / std::max(v.xy_extent[1], 1u);
++  // Point sizes are in guest pixels: as many host pixels as the resolution scale (the viewport is in host ones).
++  c.point_screen_diameter_to_ndc_radius[0] = float(resolution_scale) / std::max(v.xy_extent[0], 1u);
++  c.point_screen_diameter_to_ndc_radius[1] = -float(resolution_scale) / std::max(v.xy_extent[1], 1u);
++  c.textures_resolution_scaled = textures_scaled;
 +  for (uint32_t i = 0; i < 4; ++i) {
 +    auto color = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
 +    c.color_exp_bias[i] = std::ldexp(1.0f, color.color_exp_bias);
@@ -7668,7 +7970,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.h b/src/graphics/metal/m
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,112 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.h
 + * @brief       Guest microcode to MSL: the SDK's SPIR-V translator, then SPIRV-Cross (plain C++)
@@ -7703,6 +8005,10 @@ new file mode 100644
 +
 +namespace rex::graphics::metal {
 +
++// The draw resolution scale (resolution_scale: 1, 2 or 3; 1 with metal_msaa), read once: the render targets, the
++// textures made from resolves and the translated shaders are made for it, so it changes at the next start only.
++uint32_t MetalResolutionScale();
++
 +struct MetalTextureBinding {
 +  uint32_t index, fetch_constant;
 +  xenos::FetchOpDimension dimension;
@@ -7724,7 +8030,7 @@ new file mode 100644
 +// texture fetches' swizzled signs computed for the current fetch constants, else they are computed here.
 +void BuildMetalSystemConstants(const RegisterFile& regs, const PrimitiveProcessor::ProcessingResult& primitive,
 +    const draw_util::ViewportInfo& viewport, std::vector<uint8_t>& out, const uint32_t* texture_signs = nullptr,
-+    float ps_param_gen_scale = 1.0f);
++    float ps_param_gen_scale = 1.0f, uint32_t resolution_scale = 1, uint32_t textures_scaled = 0);
 +void MetalTextureSwizzledSigns(const RegisterFile& regs, uint32_t* signs);
 +// The SDK's own compute shaders (the Vulkan backend's SPIR-V, such as the HDR output's refresher and scene pass)
 +// as MSL, through the same SPIRV-Cross: each (descriptor set, binding) to a texture index, push constants to

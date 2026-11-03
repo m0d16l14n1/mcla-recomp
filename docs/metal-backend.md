@@ -892,3 +892,29 @@ for as long as nothing else wrote its pages.
   fork aimed at weak GPUs). Now 1.5, 2, 3 and 4 too, and traffic up to 600 m. A night drive at 30 FPS, MetalFX
   Performance: GPU busy 22.5 to 24.3 ms a frame at 4 against 18.4 to 21.7 at 1; no errors, no hitches, texture
   evictions as usual.
+
+**Resolution scale: the game drawn at 1440p and 4K (2026-11-03, BACKLOG 30).** `resolution_scale` 2 and 3 (and the
+launcher's and pause menu's resolution) now work on Metal; before, Metal drew 1280x720 whatever it said.
+- A single-sample target holds rs x rs texels for each of its 1x ones (`TargetLayout.scale`, `MetalResolutionScale()`:
+  `resolution_scale` clamped to 1 to 3, 1 with `metal_msaa`). The translator gets it as `draw_resolution_scale_x/y`
+  (as on Vulkan); viewports, scissors, the EDRAM tile rows of a pass (`TileRange`), transfers (`TransferConstants.scale`)
+  and clears follow.
+- Resolves read and write rs x rs texels a pixel; their texture is that size, and guest memory gets each pixel's first
+  one (the rain's particles, read back as vertex data, keep working). Composed surfaces scale with their pieces, and
+  their rows from memory are enlarged by the load kernel (`LoadConstants.scale`). A draw's textures that are larger than
+  their fetch constants say are flagged to the shaders (`textures_resolution_scaled`).
+- Point sizes, occlusion counts (divided by rs²), the guest output, HDR output's sizes and the shared temporal AA code
+  (`HdrDrawResolutionScale`, host pixels) follow. MetalFX's motion vectors read the 1x stencil view (it only exists in
+  guest memory) at its own scale.
+- Measured on the M5 in the race (bench 20261103-184044, a loaded Mac): MetalFX Performance at 2x (scene 1280x720,
+  output 2560x1440) 26.3 and 23.9 FPS against 49.1 and 39.8 at 1x; GPU 47 to 52 ms against 16 to 17 (the scene,
+  shadows and reflections have four times the pixels). 3x with Performance about 17 FPS at the spawn. Pictures match 1x
+  (spawn mean RGB 54.0/45.1/33.2 against 53.9/45.1/33.1).
+
+**MetalFX on Metal 4 (2026-11-03; stage 0 of [the Metal 4 revamp](metal4-revamp.md)).** `metal_metal4` (on; next
+start) makes the temporal scaler, the frame interpolator and the presenter's spatial scaler with Metal 4
+(`MTL4FXTemporalScaler`, `MTL4FXFrameInterpolator`, `MTL4FXSpatialScaler`) where the device has them, each on a Metal
+4 queue of its own (`metal_fx4.h`): the Metal 3 command buffer before signals a shared event, the Metal 4 queue waits,
+encodes with its own allocators and residency set, signals, and the Metal 3 work after waits. False is Metal 3
+everywhere. Race bench with frame generation, two runs each: GPU 16.3 and 16.4 ms a frame against 17.0 and 17.0 on
+Metal 3, both at the 29 FPS cap with 58 frames shown a second; the same picture.

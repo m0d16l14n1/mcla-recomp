@@ -21,15 +21,18 @@ struct AntiAliasing: Identifiable, Hashable {
         return AntiAliasing(aa: aa, up: up)
     }
 
-    /// The scene's size: the game draws 1280×720; the upscalers draw it smaller and scale it back up.
-    var sceneSize: String {
+    /// The scene's size: the game draws 1280×720 times the resolution scale; the upscalers draw it smaller and
+    /// scale it back up.
+    func sceneSize(scale: Int = 1) -> String {
+        let ratio: Double
         switch up {
-        case "ultra_quality": return "960×540"
-        case "quality": return "853×480"
-        case "balanced": return "753×424"
-        case "performance": return "640×360"
-        default: return "1280×720"
+        case "ultra_quality": ratio = 4.0 / 3.0
+        case "quality": ratio = 1.5
+        case "balanced": ratio = 1.7
+        case "performance": ratio = 2.0
+        default: ratio = 1.0
         }
+        return "\(Int(1280.0 * Double(scale) / ratio))×\(Int(720.0 * Double(scale) / ratio))"
     }
 
     func label(metal: Bool) -> String {
@@ -167,16 +170,20 @@ struct GraphicsView: View {
         let aa = AntiAliasing.current(launcher)
         let shown = screen.map { "\(Int($0.pixels.width))×\(Int($0.pixels.height))" } ?? "the screen"
         if metal {
+            let scale = max(1, min(3, Int(launcher.value("resolution_scale")?.asDouble ?? 1)))
             VStack(alignment: .leading, spacing: 4) {
+                SettingRow(setting: Setting("resolution_scale", "Resolution scale", .choice([
+                    Choice(label: "1x (1280×720, as on the console)", value: .int(1)),
+                    Choice(label: "2x (2560×1440)", value: .int(2)),
+                    Choice(label: "3x (3840×2160, 4K)", value: .int(3)),
+                ]), .int(1), "Draws the game, HUD and menus at a multiple of the console's 1280×720. Each step costs about "
+                    + "the square of it in GPU time: with MetalFX Performance, 2x draws the 3D scene at 1280×720 and "
+                    + "MetalFX takes it to 2560×1440. 3x is for a Max or Ultra chip."))
                 HStack {
-                    Text("Resolution")
                     Spacer()
-                    Text("Scene \(aa.sceneSize) → game 1280×720 → \(shown)").monospacedDigit().foregroundStyle(.secondary)
+                    Text("Scene \(aa.sceneSize(scale: scale)) → game \(1280 * scale)×\(720 * scale) → \(shown)")
+                        .monospacedDigit().foregroundStyle(.secondary)
                 }
-                Text("On Metal the game draws at the console's 1280×720 and the picture is scaled to the screen, Retina or "
-                     + "4K, with the HUD and menus drawn at that size. Drawing the game itself at 1440p or 4K (resolution "
-                     + "scale) is Vulkan-only for now; it is the Metal backend's next big step.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         } else {
             SettingRow(setting: Setting("resolution_scale", "Resolution scale", .choice([
