@@ -1469,7 +1469,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3671 @@
+@@ -0,0 +1,3675 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -1520,7 +1520,7 @@ new file mode 100644
 +    "Vertex or index ranges at least this large are copied once a frame and reused by the frame's later draws "
 +    "without a check; smaller ones are hashed at every draw (0xFFFFFFFF: every range at every draw, and the stats "
 +    "count the ranges that changed between two draws of a frame)");
-+REXCVAR_DEFINE_UINT32(metal_persistent_vertex_size, 16384, "GPU/Metal",
++REXCVAR_DEFINE_UINT32(metal_persistent_vertex_size, 1024, "GPU/Metal",
 +    "Vertex and index ranges at least this large are kept from frame to frame while the CPU doesn't write them "
 +    "(a write watch), not copied every frame (0: every frame)");
 +REXCVAR_DEFINE_BOOL(metal_ring_untracked, false, "GPU/Metal",
@@ -3011,6 +3011,8 @@ new file mode 100644
 +  if (persistent_used_ + aligned > kSnapshotPersistent) {
 +    // Full: everything in it is dropped, and it is reused once no frame in flight reads it.
 +    for (auto& [k, r] : persistent_) r.valid = false;
++    REXGPU_INFO("Metal: the persistent vertex region is full ({} ranges, frame {}): copied again from frame {}",
++                persistent_.size(), frame_, frame_ + 3);
 +    persistent_full_frame_ = frame_;
 +    return false;
 +  }
@@ -3719,8 +3721,10 @@ new file mode 100644
 +  }
 +  if (cached) DropViews(entry.texture);
 +  else ++cached_textures_;
-+  // Lookups of the texture this replaces (other swizzles) cover its address.
-+  DropFastTextures(address, uint64_t(address) + std::max(1u, last_texture_range_.second));
++  // Lookups of the texture this replaces (other swizzles) cover its address. A texture that was not cached has
++  // none: eviction and InvalidateRange drop the lookups of what they drop (a scan of all 8,192 at every load
++  // was 1.4% of this thread in a race).
++  if (cached) DropFastTextures(address, uint64_t(address) + std::max(1u, last_texture_range_.second));
 +  entry.texture = texture; entry.cached = true;
 +  if (!resolved && !composite) remember_range();
 +  return View(texture, fetch.swizzle, cube);

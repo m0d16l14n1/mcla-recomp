@@ -248,7 +248,7 @@ these changes: 0 of 240 samples under the road in 3 of 3 capped drives.
   draw, no vertex or index range changed between two draws of a frame, in boot, menus, free roam or a drive
   (the stats line counts them when `metal_snapshot_trust_size=0xFFFFFFFF`). Each range is now copied at its first
   draw in a frame and reused: no hashing (46 MB a frame before). +15 to 18% in paired runs.
-- *Persistent vertex copies* (`metal_persistent_vertex_size`, 16 KB). The snapshots are one buffer: a ring per
+- *Persistent vertex copies* (`metal_persistent_vertex_size`, 16 KB then; 1 KB since the twentieth pass). The snapshots are one buffer: a ring per
   frame slot and a 192 MB persistent region. A range of 16 KB or more is copied there once, with a write watch,
   and used from there in later frames until the CPU writes its pages; then it moves to a new copy (frames in
   flight keep the old one), and a range written three times goes back to the per-frame copies. Copies went from
@@ -840,3 +840,13 @@ No warning or error, no new pipeline in the race and no draw left out in any of 
   (`newTextureWithDescriptor`): 11 of 89 ms in the race's first frame (2,938 loads), 7 of 24 ms in a frame
   with 468, so 12 to 28%. The rest is encoding the untiling dispatch and the blit. Reusing textures would save
   little.
+
+*Vertex ranges of 1 KB and up kept from frame to frame* (`metal_persistent_vertex_size`, 1 KB, was 16 KB). A CPU
+profile of the command thread in a race: texture lookups 15%, vertex copies 8% (7 to 10 MB a frame, the ranges
+under 16 KB), resolves 8%, Metal encoders about 10%. With the persistent copies (a write watch each) from 1 KB the
+copies are 0.6 to 1.2 MB a frame (about 1,900 ranges kept against 300). At 30 FPS, MetalFX Performance, two runs
+each: command thread 10.5 and 10.0 ms a frame against 11.1 and 11.6 (4 KB: 9.9 and 10.2), 1% low 25.1 and 26.0
+FPS against 19.1 and 14.3. Uncapped races and a free roam drive on a busy Mac: even (54.1 against 54.0 FPS in the
+drive). Pictures checked. The log says when the 192 MB persistent region fills (everything is copied again).
+Also: a texture load no longer scans the 8,192 fast lookups when it makes a new texture (only when it replaces
+one); that was 1.4% of the thread.

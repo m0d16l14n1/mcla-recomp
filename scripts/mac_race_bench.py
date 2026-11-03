@@ -304,6 +304,28 @@ def profile_race(out, seconds, log, gputrace=False):
     subprocess.run(["sample", pid[0], str(seconds), "-file", str(out / "sample.txt")], capture_output=True)
 
 
+def watch_load(stop, into):
+    """While a run plays: the 1-minute load average, and other processes busier than half a core (another
+    session's game or build skews a run's numbers; the summary flags it)."""
+    while not stop.wait(5):
+        into["load"].append(os.getloadavg()[0])
+        try:
+            ps = subprocess.run(["ps", "-Ao", "pcpu=,comm="], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            continue
+        for line in ps.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                cpu = float(parts[0])
+            except ValueError:
+                continue
+            comm = parts[1].rsplit("/", 1)[-1]
+            if cpu >= 50 and comm not in ("mcla", "WindowServer", "kernel_task", "sample", "xctrace"):
+                into["others"][comm] = max(into["others"].get(comm, 0), round(cpu))
+
+
 def run_one(name, extra, out, a):
     out.mkdir(parents=True, exist_ok=True)
     user = prepare_user(False)
@@ -329,6 +351,10 @@ def run_one(name, extra, out, a):
         merged[arg.split("=", 1)[0]] = arg
     th0 = thermal()
     t0 = time.time()
+    load = {"load": [], "others": {}}
+    load_stop = threading.Event()
+    load_thread = threading.Thread(target=watch_load, args=(load_stop, load), daemon=True)
+    load_thread.start()
     with open(out / "stdout.txt", "w") as so:
         proc = subprocess.Popen(["sh", str(REPO / "scripts" / "play_mac.sh"), *merged.values()],
                                 stdout=so, stderr=subprocess.STDOUT, start_new_session=True)
@@ -343,6 +369,7 @@ def run_one(name, extra, out, a):
         except subprocess.TimeoutExpired:
             hung = True
             os.killpg(proc.pid, signal.SIGKILL)
+    load_stop.set()
     if profiler:
         profiler.join(timeout=180)  # xctrace writes its trace for a while after recording
     kill_game()
@@ -356,7 +383,9 @@ def run_one(name, extra, out, a):
             subprocess.run([sys.executable, str(REPO / "out" / "research" / "parse_gputrace.py"), str(xml), "mcla",
                             str(frames)], stdout=f, stderr=subprocess.STDOUT)
     result = {"mode": name, "args": extra, "thermal_start": th0, "thermal_end": thermal(),
-              "wall_s": round(time.time() - t0), "hung": hung, "exit": proc.returncode}
+              "wall_s": round(time.time() - t0), "hung": hung, "exit": proc.returncode,
+              "load": round(sum(load["load"]) / len(load["load"]), 1) if load["load"] else None,
+              "others": load["others"]}
     return analyze_run(out, result)
 
 
@@ -379,16 +408,22 @@ def fmt(r):
             f"{d.get('shown_fps', '-')} | {d.get('max_gap_ms', '-')} | {d.get('gaps_1_5', '-')} | {d.get('gaps_3', '-')} | "
             f"{l.get('gpu_busy_ms', '-')} | {l.get('cp_cpu_ms', '-')} | {l.get('pipelines_new', '-')} | "
             f"{l.get('draws_left_out', '-')} | {l.get('warnings', '-')}/{l.get('errors', '-')} | "
-            f"{r.get('thermal_start')}->{r.get('thermal_end')} |")
+            f"{r.get('thermal_start')}->{r.get('thermal_end')} | {r.get('load', '-')} |")
 
 
 HEADER = ("| mode | run | FPS | median ms | p99 ms | 1% low | max ms | hitches | freezes | shown/s | "
-          "max gap ms | gaps>1.5r | gaps>3r | GPU ms | CP ms | new PSOs | draws left out | warn/err | thermal |\n"
-          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+          "max gap ms | gaps>1.5r | gaps>3r | GPU ms | CP ms | new PSOs | draws left out | warn/err | thermal | load |\n"
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 
 
 def write_summary(folder, results, what):
     md = [f"# Race bench {folder.name} ({what})", "", HEADER, *[fmt(r) for r in results], ""]
+    busy = [r for r in results if r.get("others")]
+    if busy:
+        md.append("## Other busy processes during runs (more than half a core; the numbers may be skewed)")
+        md += [f"- {r['mode']} run {r.get('run')}: " + ", ".join(f"{k} {v}%" for k, v in r["others"].items())
+               for r in busy]
+        md.append("")
     for r in results:
         kinds = (r.get("log") or {}).get("warning_kinds") or {}
         if kinds:
@@ -415,6 +450,8 @@ def main():
     p.add_argument("--gputrace", action="store_true",
                    help="15 s into the race, a 3 s Metal System Trace by encoder label (gputrace.txt; adds "
                         "--metal_debug_labels=true)")
+    p.add_argument("--peer-games", nargs="*", default=["fifa19", "SpeedBreaker", "Liberty Recompiled"], metavar="PROCESS",
+                   help="before each run, wait while any of these processes (other sessions' games) runs")
     p.add_argument("--sample", type=int, default=0, metavar="SECONDS",
                    help="15 s into the race, profile the game for SECONDS (sample.txt, threads.txt)")
     p.add_argument("--list", action="store_true")
@@ -463,6 +500,16 @@ def main():
         for name, opts in wanted:
             if not first and a.cooldown:
                 time.sleep(a.cooldown)
+            # Other sessions on this Mac bench their own games: wait until none of them runs.
+            waited = 0
+            while any(subprocess.run(["pgrep", "-x", g], capture_output=True).returncode == 0 for g in a.peer_games):
+                if not waited:
+                    print(f"[{time.strftime('%H:%M:%S')}] waiting for another game to exit ({', '.join(a.peer_games)})",
+                          flush=True)
+                time.sleep(15)
+                waited += 15
+            if waited:
+                print(f"[{time.strftime('%H:%M:%S')}] waited {waited} s for another game", flush=True)
             if a.cool_to is not None:
                 # Thermal pressure decides the CPU's clocks (a run starting at level 2 is 20-35% slower than
                 # one at 0): every run starts at the same level, or after --cool-max seconds.
