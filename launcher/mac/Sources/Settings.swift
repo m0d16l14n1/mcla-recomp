@@ -124,12 +124,14 @@ enum Catalogue {
         "The soft focus of distant things in cut scenes and the garage.")
     static let cityLod = Setting("mcla_city_lod", "City detail distance", .choice([
         c("Near (faster)", d(0.5)), c("Medium", d(0.75)), c("As on the console", d(1.0)),
+        c("Far (1.5x)", d(1.5)), c("Farther (2x)", d(2.0)), c("Very far (3x)", d(3.0)), c("Farthest (4x, about 18% more GPU time)", d(4.0)),
     ]), d(1.0), live: true, "How far away buildings keep their full detail.")
     static let trafficLod = Setting("mcla_traffic_lod", "Traffic detail distance", .choice([
         c("Near (faster)", d(0.5)), c("Medium", d(0.75)), c("As on the console", d(1.0)),
+        c("Far (1.5x)", d(1.5)), c("Farther (2x)", d(2.0)), c("Very far (3x)", d(3.0)), c("Farthest (4x)", d(4.0)),
     ]), d(1.0), live: true, "How far away cars keep their full detail.")
     static let trafficDistance = Setting("mcla_traffic_distance", "Traffic distance", .choice([
-        c("250 m", d(250)), c("325 m", d(325)), c("400 m (as on the console)", d(400)),
+        c("250 m", d(250)), c("325 m", d(325)), c("400 m (as on the console)", d(400)), c("500 m", d(500)), c("600 m", d(600)),
     ]), d(400), live: true, "How far away traffic is drawn.")
     static let pedestrians = Setting("mcla_pedestrians", "Pedestrians", .choice([
         c("None", d(0)), c("Half", d(0.5)), c("All", d(1.0)),

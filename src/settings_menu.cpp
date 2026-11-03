@@ -816,7 +816,9 @@ std::string MenuStateKey() {
 // Detail the game can do without when the frame rate matters more; all as
 // shipped by default (src/perf_options.cpp). Options the game reads once, when
 // it starts, are kRequiresRestart, and their rows say "(NEXT START)" (RowLabel).
-constexpr double kDetailScales[] = {0.5, 0.75, 1.0};
+// Above 1 the city and traffic keep their full detail farther than on the console: about 18% more GPU time at 4
+// (Metal, MetalFX Performance, a night drive, 2026-11-03), no streaming trouble seen.
+constexpr double kDetailScales[] = {0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0};
 // mcla_anti_aliasing (src/perf_options.cpp): none, the game's 2x MSAA, or AMD
 // FSR 3.1 (the SDK's temporal_aa, rexglue-temporal-aa.patch) at native resolution or
 // upscaling (rexglue-fsr-upscaling.patch: the scene is drawn smaller), with its
@@ -853,7 +855,7 @@ constexpr double kSharpness[] = {0.0, 0.2, 0.4, 0.6, 0.8, 1.0};
 constexpr double kDensityScales[] = {0.0, 0.5, 1.0};
 // How often an off-screen pass is drawn (src/perf_options.cpp): 0 is every frame.
 constexpr double kPassIntervals[] = {0.0, 2.0, 4.0, 8.0};
-constexpr double kTrafficDistances[] = {250.0, 325.0, 400.0};
+constexpr double kTrafficDistances[] = {250.0, 325.0, 400.0, 500.0, 600.0};
 // anisotropic_override (the SDK's, hot-reloadable: the samplers are worked out again for every draw):
 // -1 leaves the game's own choice, 0 turns it off, then 2x, 4x, 8x and 16x (the default); 1x is
 // trilinear, which OFF is for all but the textures that ask for a point mip filter, so it has no row.
@@ -866,11 +868,11 @@ const ItemDef kPerformanceItems[] = {
     {"PM_MxShadows", ItemKind::kToggle, "mcla_shadows", "SHADOWS"},
     {"PM_MxFoliageShadows", ItemKind::kToggle, "mcla_foliage_shadows", "FOLIAGE SHADOWS"},
     {"PM_MxCityLod", ItemKind::kNumberChoice, "mcla_city_lod", "CITY DETAIL DISTANCE", nullptr,
-     nullptr, kDetailScales, 3, "%.2f"},
+     nullptr, kDetailScales, 7, "%.2f"},
     {"PM_MxTrafficLod", ItemKind::kNumberChoice, "mcla_traffic_lod", "TRAFFIC DETAIL DISTANCE",
-     nullptr, nullptr, kDetailScales, 3, "%.2f"},
+     nullptr, nullptr, kDetailScales, 7, "%.2f"},
     {"PM_MxTrafficDist", ItemKind::kNumberChoice, "mcla_traffic_distance", "TRAFFIC DISTANCE",
-     nullptr, nullptr, kTrafficDistances, 3, "%.0f"},
+     nullptr, nullptr, kTrafficDistances, 5, "%.0f"},
     {"PM_MxPeds", ItemKind::kNumberChoice, "mcla_pedestrians", "PEDESTRIANS", nullptr, nullptr,
      kDensityScales, 3, "%.1f", "NONE"},
     {"PM_MxParked", ItemKind::kNumberChoice, "mcla_parked_cars", "PARKED CARS", nullptr, nullptr,

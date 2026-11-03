@@ -881,3 +881,14 @@ for as long as nothing else wrote its pages.
   and the log counts them every 150 frames.
 - To do: the texture watches rely on the same faults (about 1.9 GB of texture lookups a frame skip their hash
   on a watch's word); check them the same way.
+
+**Sharper textures under MetalFX upscaling; detail distances above the console's (2026-11-03).**
+- *LOD bias* (`metal_taa_lod_bias`, on): with the scene squeezed for MetalFX upscaling, its textures are sampled
+  `log2(output / render)` levels sharper, the SDK's `TaaLodBias` (in eighths), as Vulkan and D3D12 do for FSR:
+  `MTLSamplerDescriptor.lodBias` (macOS 26), set on the scene's draws through `taa_draw_` and part of the sampler's
+  cache key. At Performance (640x360 to 1280x720) one level: the spawn picture's edge energy +3.7%, the badge and plate
+  crisper. Not before: no mips were sampled on Metal until the eighteenth pass.
+- *Detail distances*: `mcla_city_lod` and `mcla_traffic_lod` took 0.1 to 4 but the menus offered only 0.5 to 1 (the PC
+  fork aimed at weak GPUs). Now 1.5, 2, 3 and 4 too, and traffic up to 600 m. A night drive at 30 FPS, MetalFX
+  Performance: GPU busy 22.5 to 24.3 ms a frame at 4 against 18.4 to 21.7 at 1; no errors, no hitches, texture
+  evictions as usual.

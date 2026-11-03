@@ -130,7 +130,7 @@ diff --git a/src/graphics/metal/metal_command_processor.mm b/src/graphics/metal/
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_command_processor.mm
-@@ -0,0 +1,803 @@
+@@ -0,0 +1,808 @@
 +/**
 + * @file        graphics/metal/metal_command_processor.mm
 + * @brief       The Metal backend's graphics system and command processor
@@ -182,6 +182,9 @@ new file mode 100644
 +    "0: off. At most 20 a 10 s")
 +    .range(0, 10000);
 +REXCVAR_DEFINE_BOOL(metal_resolves, true, "GPU/Metal", "Resolves (diagnostic: false skips them)");
++REXCVAR_DEFINE_BOOL(metal_taa_lod_bias, true, "GPU/Metal",
++    "With MetalFX upscaling, the scene's textures are sampled with a negative LOD bias (log2 of the upscale: one "
++    "level sharper at Performance), as the Vulkan and D3D12 backends do for FSR (macOS 26; false: no bias)");
 +REXCVAR_DEFINE_DOUBLE(metal_motion_blur_fps, 60.0, "GPU/Metal",
 +    "MCLA's motion blur as long as at this frame rate at most: the game blurs by one frame's motion, so at 30 FPS "
 +    "(or 29 with frame generation) twice as long as at 60. 0: the game's own length")
@@ -270,6 +273,8 @@ new file mode 100644
 +      TaaSqueeze(viewport.xy_offset, viewport.xy_extent, scissor.offset, scissor.extent);
 +      param_gen_scale = TaaPsParamGenScale();
 +    }
++    // Textures a level sharper per halving of the render size, as on Vulkan and D3D12 (the squeezed draws only).
++    draw_->taa_lod_bias_ = REXCVAR_GET(metal_taa_lod_bias) ? TaaLodBias() : 0;
 +  };
 +  draw_->taa_resolve_stretch_ = [this](uint32_t pitch_px, uint32_t samples, uint32_t format, bool depth,
 +                                       uint32_t num[2], uint32_t den[2]) {
@@ -938,7 +943,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,535 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -1000,6 +1005,8 @@ new file mode 100644
 +  // scene is squeezed for upscaling (temporal_aa_upscale above 1), the viewport and scissor squeezed into the
 +  // top-left render size of the target, and the ps_param_gen scale.
 +  std::function<void(draw_util::ViewportInfo& viewport, draw_util::Scissor& scissor, float& param_gen_scale)> taa_draw_;
++  // Set by taa_draw_ for each draw: the upscaled scene's texture LOD bias, in -1/8 levels (CommandProcessor::TaaLodBias).
++  uint32_t taa_lod_bias_ = 0;
 +  // For a resolve while the scene may be squeezed: whether to read the source through the stretch (num the render
 +  // size, den the output size); copy_ok is whether this resolve can stretch.
 +  std::function<bool(uint32_t pitch_px, uint32_t samples, uint32_t format, bool depth, uint32_t num[2], uint32_t den[2])>
@@ -1476,7 +1483,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3710 @@
+@@ -0,0 +1,3713 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -3810,7 +3817,7 @@ new file mode 100644
 +    std::memcpy(fast_key.data(), &regs_[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + b.fetch_constant * 6], 24);
 +    fast_key[6] = uint32_t(b.mag_filter) | (uint32_t(b.min_filter) << 4) | (uint32_t(b.mip_filter) << 8) |
 +                  (uint32_t(b.aniso_filter) << 12) | (REXCVAR_GET(metal_texture_mips) ? 1u << 16 : 0u);
-+    fast_key[7] = uint32_t(REXCVAR_GET(anisotropic_override));
++    fast_key[7] = uint32_t(REXCVAR_GET(anisotropic_override)) | (taa_lod_bias_ << 8);
 +    uint32_t h = 2166136261u;
 +    for (uint32_t v : fast_key) h = (h ^ v) * 16777619u;
 +    fast = &fast_samplers_[(h ^ (h >> 13)) & (fast_samplers_.size() - 1)];
@@ -3850,7 +3857,7 @@ new file mode 100644
 +  const uint64_t key = uint64_t(mag) | (uint64_t(min) << 2) | (uint64_t(mips ? mip : xenos::TextureFilter::kBaseMap) << 4) |
 +                       (uint64_t(aniso) << 6) | (uint64_t(clamp_x) << 9) | (uint64_t(clamp_y) << 12) |
 +                       (uint64_t(clamp_z) << 15) | (uint64_t(border_color) << 18) | (uint64_t(mip_min) << 20) |
-+                       (uint64_t(mip_max) << 24);
++                       (uint64_t(mip_max) << 24) | (uint64_t(mips ? taa_lod_bias_ & 15 : 0) << 28);
 +  auto found = samplers_.find(key); if (found != samplers_.end()) return found->second;
 +  auto d = [MTLSamplerDescriptor new];
 +  d.magFilter = mag == xenos::TextureFilter::kLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
@@ -3862,6 +3869,9 @@ new file mode 100644
 +    d.mipFilter = mip == xenos::TextureFilter::kLinear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
 +    d.lodMinClamp = float(mip_min);
 +    d.lodMaxClamp = base_map ? float(mip_min) + 0.25f : float(std::max(mip_max, mip_min));
++    if (@available(macOS 26.0, *)) {
++      if (taa_lod_bias_ && !base_map) d.lodBias = -float(taa_lod_bias_ & 15) * 0.125f;
++    }
 +  }
 +  if (aniso != xenos::AnisoFilter::kDisabled)
 +    d.maxAnisotropy = NSUInteger(1) << (uint32_t(aniso) - uint32_t(xenos::AnisoFilter::kMax_1_1));
