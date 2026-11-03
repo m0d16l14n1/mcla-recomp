@@ -854,3 +854,13 @@ view a 2D array), not through a 2D array view and then a swizzled view of that: 
 of the 8 or so, 2.7% of the thread in the profile. Capped, on a quiet Mac: command thread 10.4 ms. The minimap and
 the road's reflections checked. The textures hashed every frame are the linear ones (about 6 MB: 1024x1024 DXT5,
 512x640 RGBA8 and smaller, the game's CPU-written pictures), as intended; 2% of the thread.
+
+*The Metal performance HUD, off for this game* (`metal_performance_hud`: `system` by default, `off`, `on`; the
+launcher's Renderer card). With the HUD forced on for every app (`MetalForceHudEnabled`, as on the development
+Mac), Metal loads hooks that wrap encoder creation and other calls (`libMetalMetricsInterpose`; in the profile a
+third of a resolve's time). With `MTL_HUD_ENABLED=0` for the game only, at 30 FPS with MetalFX Performance, two
+runs each: command thread 9.2 and 9.0 ms a frame against 11.9 and 10.2, 1% low 25.9 and 25.4 FPS against 22.6
+and 18.6, no hitch against 1 and 3. The launcher sets the variable before the game starts; the game sets it
+before its first Metal device when it is not set already. The bench's modes take `env:NAME=VALUE`.
+Also in this pass: the textures' memory index is split by length (a write scans back only as far as its class's
+longest texture), and the shader bindings' lookups (four or five a draw) are memoised.

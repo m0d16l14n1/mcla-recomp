@@ -18,6 +18,7 @@ The launcher's settings are the game's own, kept in `mcla.toml` next to `mcla.ex
 | Display | Fullscreen, Windowed | `fullscreen` = `true` or `false` | DISPLAY › FULLSCREEN |
 | Screen scaling filter | Bilinear (the default), FSR 1, CAS: how the finished picture is scaled to the window or screen when their sizes differ | `present_effect` = `bilinear`, `fsr` or `cas` | the launcher (next start) |
 | Screen scaling (macOS, Metal) | MetalFX (the default: Apple's spatial upscaler), Bilinear: how the picture is enlarged to the window or screen | `metal_present_scaling` = `metalfx` or `bilinear` | the macOS launcher (next start) |
+| Metal performance HUD (macOS, Metal) | As macOS is set (the default), Off for this game, On: Apple's frame-rate overlay. Forced on system-wide (`MetalForceHudEnabled`), its hooks cost about 15% of the renderer's CPU time | `metal_performance_hud` = `system`, `off` or `on` | the macOS launcher (next start) |
 | Display gamma | TV (as on the console), PC monitor (sRGB, brighter shadows) | `mcla_display_gamma` = `tv` or `pc` | DISPLAY › DISPLAY GAMMA |
 | HDR | Off, Auto (when Windows HDR is on; the default), On | `hdr` = `off`, `auto` or `on` | DISPLAY › HDR |
 | HDR peak brightness | Auto (what the display reports), or 200 to 4,000 nits in steps of 50 | `hdr_peak_nits` (0 for auto) | DISPLAY › PEAK BRIGHTNESS |

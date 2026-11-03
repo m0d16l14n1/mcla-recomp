@@ -938,7 +938,7 @@ diff --git a/src/graphics/metal/metal_draw.h b/src/graphics/metal/metal_draw.h
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.h
-@@ -0,0 +1,526 @@
+@@ -0,0 +1,532 @@
 +/** Native Metal draw path. BSD-3-Clause, see LICENSE. */
 +#pragma once
 +#include <functional>
@@ -1390,8 +1390,14 @@ new file mode 100644
 +  std::map<uint32_t, ResolvedTexture> resolved_;  // ordered: ComposeResolves looks in an address range
 +  // The guest memory each cached texture was made from (its entry's range), ordered by start, so a resolve
 +  // looks only at textures near what it wrote (scanning them all was 10% of the command processor thread).
-+  std::multimap<uint32_t, std::pair<uint32_t, TextureEntry*>> range_index_;  // start -> length, entry
-+  uint32_t max_range_length_ = 0;
++  // start -> length, entry; by length class, so a write scans back only as far as its class's longest range
++  // (one index scanned back by the longest texture ever seen was a fifth of every resolve).
++  static constexpr size_t kRangeClasses = 4;
++  static size_t RangeClass(uint32_t length) {
++    return length <= (64u << 10) ? 0 : length <= (512u << 10) ? 1 : length <= (4u << 20) ? 2 : 3;
++  }
++  std::array<std::multimap<uint32_t, std::pair<uint32_t, TextureEntry*>>, kRangeClasses> range_index_;
++  std::array<uint32_t, kRangeClasses> max_range_length_{};
 +  void SetTextureRange(TextureEntry& entry, uint32_t start, uint32_t length);
 +  void InvalidateRange(uint32_t start, uint32_t length);
 +  std::unordered_set<uint32_t> unsupported_formats_;
@@ -1469,7 +1475,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3676 @@
+@@ -0,0 +1,3682 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -2044,8 +2050,9 @@ new file mode 100644
 +    // Not what the last frames used (a working set larger than the cache would thrash: let it grow instead).
 +    if (entry.used_frame + 2 >= frame_) continue;
 +    if (entry.has_range) {
-+      for (auto [it, e] = range_index_.equal_range(entry.range_start); it != e; ++it)
-+        if (it->second.second == &entry) { range_index_.erase(it); break; }
++      auto& index = range_index_[RangeClass(entry.range_length)];
++      for (auto [it, e] = index.equal_range(entry.range_start); it != e; ++it)
++        if (it->second.second == &entry) { index.erase(it); break; }
 +    }
 +    DropTexture(entry);
 +    ++dropped;
@@ -2102,11 +2109,14 @@ new file mode 100644
 +      ++it;
 +    }
 +  }
-+  auto it = range_index_.lower_bound(start > max_range_length_ ? start - max_range_length_ : 0);
-+  while (it != range_index_.end() && it->first < end) {
-+    if (uint64_t(it->first) + it->second.first <= start) { ++it; continue; }
-+    DropTexture(*it->second.second);
-+    it = range_index_.erase(it);
++  for (size_t c = 0; c < kRangeClasses; ++c) {
++    auto& index = range_index_[c];
++    auto it = index.lower_bound(start > max_range_length_[c] ? start - max_range_length_[c] : 0);
++    while (it != index.end() && it->first < end) {
++      if (uint64_t(it->first) + it->second.first <= start) { ++it; continue; }
++      DropTexture(*it->second.second);
++      it = index.erase(it);
++    }
 +  }
 +}
 +id<MTLTexture> MetalDraw::PooledTexture(MTLTextureDescriptor* desc) {
@@ -2151,12 +2161,14 @@ new file mode 100644
 +  last_texture_range_ = {start, length};
 +  if (entry.has_range) {
 +    if (entry.range_start == start && entry.range_length == length) return;
-+    for (auto [i, e] = range_index_.equal_range(entry.range_start); i != e; ++i)
-+      if (i->second.second == &entry) { range_index_.erase(i); break; }
++    auto& index = range_index_[RangeClass(entry.range_length)];
++    for (auto [i, e] = index.equal_range(entry.range_start); i != e; ++i)
++      if (i->second.second == &entry) { index.erase(i); break; }
 +  }
 +  entry.has_range = true; entry.range_start = start; entry.range_length = length;
-+  range_index_.emplace(start, std::make_pair(length, &entry));
-+  max_range_length_ = std::max(max_range_length_, length);
++  const size_t c = RangeClass(length);
++  range_index_[c].emplace(start, std::make_pair(length, &entry));
++  max_range_length_[c] = std::max(max_range_length_[c], length);
 +}
 +id<MTLBuffer> MetalDraw::Staging(size_t size, size_t& offset) {
 +  // Texture loads go through a buffer (raw bits, then a blit to the texture of any format). A buffer of
@@ -5705,7 +5717,7 @@ diff --git a/src/graphics/metal/metal_presenter.mm b/src/graphics/metal/metal_pr
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_presenter.mm
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1121 @@
 +/**
 + * @file        graphics/metal/metal_presenter.mm
 + * @brief       The Metal backend's provider and presenter
@@ -5747,6 +5759,12 @@ new file mode 100644
 +    "How the game's picture (720p times resolution_scale, the HUD in it) is enlarged to the window or screen: "
 +    "metalfx (MetalFX's spatial upscaler, then the bilinear paint at its size) or bilinear")
 +    .allowed({"metalfx", "bilinear"});
++REXCVAR_DEFINE_STRING(metal_performance_hud, "system", "GPU/Metal",
++    "Apple's Metal performance HUD for this game: system (as macOS is set: MetalForceHudEnabled, the Developer "
++    "settings), off or on. With the HUD forced on system-wide, its hooks into Metal cost the command thread about "
++    "15% (9.1 against 11 ms a frame in a race at 30 FPS); off removes them for this game only")
++    .allowed({"system", "off", "on"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 +REXCVAR_DEFINE_STRING(metal_present_capture, "", "GPU/Metal",
 +    "Development: write what the presenter paints (the guest output and the UI overlays) to this PPM file, at most "
 +    "every 2 seconds");
@@ -6159,7 +6177,20 @@ new file mode 100644
 +  return MetalImmediateDrawer::Create(device_);
 +}
 +
++// Before Metal's first device: MTL_HUD_ENABLED decides whether the HUD (and its hooks) load. A value already in
++// the environment (the launcher's, a bench's) wins.
++static void ApplyPerformanceHudSetting() {
++  static bool applied = false;
++  if (applied) return;
++  applied = true;
++  const std::string hud = REXCVAR_GET(metal_performance_hud);
++  if (hud == "system" || getenv("MTL_HUD_ENABLED")) return;
++  setenv("MTL_HUD_ENABLED", hud == "on" ? "1" : "0", 0);
++  REXGPU_INFO("Metal: performance HUD {} for this game (metal_performance_hud)", hud);
++}
++
 +bool IsMetalAvailable() {
++  ApplyPerformanceHudSetting();
 +  @autoreleasepool {
 +    return MTLCreateSystemDefaultDevice() != nil;
 +  }
@@ -6167,6 +6198,7 @@ new file mode 100644
 +
 +std::unique_ptr<MetalProvider> MetalProvider::Create() {
 +  std::unique_ptr<MetalProvider> provider(new MetalProvider());
++  ApplyPerformanceHudSetting();
 +  provider->device_ = MTLCreateSystemDefaultDevice();
 +  if (!provider->device_) {
 +    REXGPU_ERROR("Metal: no Metal device");
@@ -7597,7 +7629,7 @@ diff --git a/src/graphics/metal/metal_shader_translator.h b/src/graphics/metal/m
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_shader_translator.h
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,108 @@
 +/**
 + * @file        graphics/metal/metal_shader_translator.h
 + * @brief       Guest microcode to MSL: the SDK's SPIR-V translator, then SPIRV-Cross (plain C++)
@@ -7614,6 +7646,7 @@ new file mode 100644
 +#pragma once
 +
 +#include <cstdint>
++#include <array>
 +#include <memory>
 +#include <string>
 +#include <vector>
@@ -7683,15 +7716,23 @@ new file mode 100644
 +  };
 +  Result Translate(Shader& shader, uint64_t modification, Shader::Translation*& translation_out,
 +                   std::string& msl_out, std::string& error_out);
-+  const MetalShaderBindings& bindings(const Shader::Translation* t) const { return bindings_.at(t); }
++  // Asked four or five times a draw (the hash map's lookup was 1.4% of the command thread): the last few
++  // answers are kept (the map's elements don't move, and none is removed). The command thread's only.
++  const MetalShaderBindings& bindings(const Shader::Translation* t) const {
++    auto& slot = bindings_memo_[(reinterpret_cast<uintptr_t>(t) >> 4) & 7];
++    if (slot.first != t) slot = {t, &bindings_.at(t)};
++    return *slot.second;
++  }
 +  // Takes the bindings of another translator's translations (the warm-up's workers, once they are done).
 +  void AdoptBindings(MetalShaderTranslator& other) {
 +    for (auto& entry : other.bindings_) bindings_[entry.first] = std::move(entry.second);
 +    other.bindings_.clear();
++    other.bindings_memo_ = {};
 +  }
 +
 + private:
 +  std::unordered_map<const Shader::Translation*, MetalShaderBindings> bindings_;
++  mutable std::array<std::pair<const Shader::Translation*, const MetalShaderBindings*>, 8> bindings_memo_{};
 +  std::unique_ptr<SpirvShaderTranslator> translator_;
 +  string::StringBuffer ucode_disasm_buffer_;
 +};

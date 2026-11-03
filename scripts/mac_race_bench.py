@@ -347,7 +347,12 @@ def run_one(name, extra, out, a):
         args.append("--metal_debug_labels=true")
     # One value per option, the mode's last (the SDK's parser fails on a repeated option).
     merged = {}
+    env = dict(os.environ)
     for arg in args + extra.split():
+        if arg.startswith("env:"):  # env:NAME=VALUE, for this run's game (MTL_HUD_ENABLED=0, say)
+            k, _, v = arg[4:].partition("=")
+            env[k] = v
+            continue
         merged[arg.split("=", 1)[0]] = arg
     th0 = thermal()
     t0 = time.time()
@@ -357,7 +362,7 @@ def run_one(name, extra, out, a):
     load_thread.start()
     with open(out / "stdout.txt", "w") as so:
         proc = subprocess.Popen(["sh", str(REPO / "scripts" / "play_mac.sh"), *merged.values()],
-                                stdout=so, stderr=subprocess.STDOUT, start_new_session=True)
+                                stdout=so, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         profiler = None
         if a.sample or a.gputrace:
             profiler = threading.Thread(target=profile_race, args=(out, a.sample, out / "game.log", a.gputrace),

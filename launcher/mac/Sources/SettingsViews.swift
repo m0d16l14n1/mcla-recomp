@@ -87,6 +87,8 @@ struct GraphicsView: View {
                 if metal {
                     Divider()
                     SettingRow(setting: Catalogue.screenScaling)
+                    Divider()
+                    SettingRow(setting: Catalogue.performanceHud)
                 }
             }
             SettingsCard(title: "Effects", settings: Catalogue.detail)

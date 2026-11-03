@@ -99,6 +99,13 @@ enum Catalogue {
         + "times its pixels across). MetalFX's spatial upscaler keeps edges and the HUD's text sharp; bilinear is "
         + "the plain stretch, softer. Metal only.")
 
+    static let performanceHud = Setting("metal_performance_hud", "Metal performance HUD", .choice([
+        c("As macOS is set", s("system")), c("Off for this game", s("off")), c("On", s("on")),
+    ]), s("system"),
+        "Apple's frame-rate overlay. When it is switched on for every app (the Developer settings, or "
+        + "MetalForceHudEnabled), its hooks cost this game's renderer about 15% of its CPU time; Off for this game "
+        + "removes them here only. Metal only; takes effect at the next start.")
+
     static let shadows = Setting("mcla_shadows", "Shadows", .toggle, on(true), live: true,
         "Real-time shadows of the city, cars and people.")
     static let foliageShadows = Setting("mcla_foliage_shadows", "Tree and plant shadows", .toggle, on(true), live: true,

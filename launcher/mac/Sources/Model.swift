@@ -230,6 +230,12 @@ final class Launcher: ObservableObject {
         process.executableURL = paths.program
         process.currentDirectoryURL = paths.programDir
         process.arguments = Launcher.splitArguments(extraArguments)
+        // Apple's Metal HUD is decided when Metal loads: set here, before the game starts (metal_performance_hud).
+        if let hud = value("metal_performance_hud")?.asString, hud == "off" || hud == "on" {
+            var env = ProcessInfo.processInfo.environment
+            env["MTL_HUD_ENABLED"] = hud == "on" ? "1" : "0"
+            process.environment = env
+        }
         // The game logs to its log file; what it prints goes nowhere.
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
