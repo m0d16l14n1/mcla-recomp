@@ -1469,7 +1469,7 @@ diff --git a/src/graphics/metal/metal_draw.mm b/src/graphics/metal/metal_draw.mm
 new file mode 100644
 --- /dev/null
 +++ b/src/graphics/metal/metal_draw.mm
-@@ -0,0 +1,3675 @@
+@@ -0,0 +1,3676 @@
 +/**
 + * Native Metal M1 rasterizer. Uses ReXGlue's primitive normalization and SPIR-V shader semantics.
 + * Copyright 2026. BSD-3-Clause, see LICENSE.
@@ -3567,9 +3567,8 @@ new file mode 100644
 +  entry.hash = content_hash; entry.has_hash = true;
 +  id<MTLTexture> texture = nil;
 +  if (resolved) {
-+    auto source = resolved->texture;
-+    texture = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2DArray
-+        levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
++    // The resolve's 2D texture itself: View makes its swizzled view a 2D array (one view a frame, not two).
++    texture = resolved->texture;
 +  } else if (composite) {
 +    texture = composite;
 +  } else if (fetch.type == xenos::FetchConstantType::kTexture && !volume && REXCVAR_GET(metal_texture_loads)) {
@@ -3755,7 +3754,9 @@ new file mode 100644
 +  swizzle[4] = MTLTextureSwizzleZero; swizzle[5] = MTLTextureSwizzleOne; swizzle[6] = swizzle[7] = MTLTextureSwizzleZero;
 +  MTLTextureSwizzleChannels channels = MTLTextureSwizzleChannelsMake(swizzle[swizzle_bits & 7],
 +    swizzle[(swizzle_bits >> 3) & 7], swizzle[(swizzle_bits >> 6) & 7], swizzle[(swizzle_bits >> 9) & 7]);
-+  id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:texture.textureType
++  // The shaders read 2D textures as 2D arrays: a resolve's 2D texture is viewed as one.
++  const MTLTextureType type = texture.textureType == MTLTextureType2D ? MTLTextureType2DArray : texture.textureType;
++  id<MTLTexture> view = [texture newTextureViewWithPixelFormat:texture.pixelFormat textureType:type
 +    levels:NSMakeRange(0, texture.mipmapLevelCount) slices:NSMakeRange(0, cube ? 6 : texture.arrayLength) swizzle:channels];
 +  views[swizzle_bits] = view;
 +  return view;

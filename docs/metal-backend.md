@@ -849,4 +849,8 @@ each: command thread 10.5 and 10.0 ms a frame against 11.1 and 11.6 (4 KB: 9.9 a
 FPS against 19.1 and 14.3. Uncapped races and a free roam drive on a busy Mac: even (54.1 against 54.0 FPS in the
 drive). Pictures checked. The log says when the 192 MB persistent region fills (everything is copied again).
 Also: a texture load no longer scans the 8,192 fast lookups when it makes a new texture (only when it replaces
-one); that was 1.4% of the thread.
+one); that was 1.4% of the thread. A texture made from a resolve is viewed once (the resolve's 2D texture, its swizzled
+view a 2D array), not through a 2D array view and then a swizzled view of that: two view objects a frame for each
+of the 8 or so, 2.7% of the thread in the profile. Capped, on a quiet Mac: command thread 10.4 ms. The minimap and
+the road's reflections checked. The textures hashed every frame are the linear ones (about 6 MB: 1024x1024 DXT5,
+512x640 RGBA8 and smaller, the game's CPU-written pictures), as intended; 2% of the thread.
