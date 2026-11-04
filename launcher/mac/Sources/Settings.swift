@@ -60,6 +60,14 @@ enum Catalogue {
         + "game's Vulkan renderer through MoltenVK; it is slower, but it is there to compare with if something "
         + "looks wrong on Metal.")
 
+    static let metalVersion = Setting("metal_metal4", "Metal version", .choice([
+        c("Metal 4 (macOS 26, recommended)", on(true)), c("Metal 3", on(false)),
+    ]), on(true),
+        "Metal 4 records the game's drawing with Apple's newest API: argument tables, explicit residency and "
+        + "barriers, and Metal 4's MetalFX in the same command buffers, for about a fifth less GPU time a frame on "
+        + "an M5. Metal 3 is the earlier path, kept to compare with if something looks wrong. On macOS before 26 "
+        + "the game uses Metal 3 whatever this says.")
+
     static let frameGeneration = Setting("frame_generation", "Frame generation", .choice([
         c("Off", s("off")), c("MetalFX (macOS 26)", s("fsr")),
     ]), s("off"), live: true,

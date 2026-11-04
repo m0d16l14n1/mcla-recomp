@@ -150,6 +150,7 @@ rexglue-fence-hook.patch include/rex/graphics/command_processor.h WriteFenceValu
 rexglue-metal-backend.patch src/graphics/plugin_main.cpp CreateMetalGraphicsSystem
 rexglue-settings-overlay-live-only.patch src/ui/overlay/settings_overlay.cpp settings_overlay_live_only
 rexglue-upstream-posix-fixes.patch src/core/threading_posix.cpp released_by_earlier_set
+rexglue-mnk-quit-deadlock.patch src/input/mnk/mnk_input_driver.cpp deadlocked the quit
 MAC
 
 # ---------------------------------------------------------------------------

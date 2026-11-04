@@ -918,3 +918,184 @@ start) makes the temporal scaler, the frame interpolator and the presenter's spa
 encodes with its own allocators and residency set, signals, and the Metal 3 work after waits. False is Metal 3
 everywhere. Race bench with frame generation, two runs each: GPU 16.3 and 16.4 ms a frame against 17.0 and 17.0 on
 Metal 3, both at the 29 FPS cap with 58 frames shown a second; the same picture.
+
+## Metal 4 (2026-11-03)
+
+The draws, resolves, texture loads, EDRAM transfers, temporal AA and the front buffer's copy are recorded on a Metal 4
+queue by default (macOS 26 and a device of the `MTLGPUFamilyMetal4` family: the M5 here). Metal 3 stays as the
+fallback and for comparing. The plan and its stages: [metal4-revamp.md](metal4-revamp.md). It is not the Metal 3
+code with the calls renamed:
+- bindings are writes into argument tables;
+- a residency set replaces Metal's own tracking and keeps resources alive;
+- barriers are explicit;
+- pipelines come from Metal 4's compiler and its archives.
+
+**Switches.**
+
+| Cvar | Default | What |
+|---|---|---|
+| `metal_metal4` | on | Metal 4 at all (the master switch); false: Metal 3 everywhere, MetalFX included |
+| `metal_metal4_draws` | on | with `metal_metal4`: the draws on the Metal 4 queue; false: the draws on Metal 3, with MetalFX still on Metal 4 (for comparing) |
+| `metal_metal4_pipelines` | on | with the Metal 4 draws: the draws' pipelines through `MTL4Compiler` and its archives; false: the device's Metal 3 calls |
+| `metal_metal4_flexible_pipelines` | off | flexible pipelines specialised per set of targets instead of whole ones (fewer compiles, slower frames) |
+| `metal_texture_view_pool` | on (restart) | the fetch constants' swizzle views as slots of an `MTLTextureViewPool`, not view objects |
+| `metal_gpu_phase_times` | 0 | every N frames, the GPU time of each phase of the guest's markers (`MTL4CounterHeap`) |
+| `metal_metal4_submit_thread` | on (restart) | commits on a serial queue of their own; false: on the GPU command thread |
+| `metal_metal4_narrow_barriers` | on | each pass waits only for what it can depend on; false: every encoder waits for everything before it |
+
+Before macOS 26, or on a device without the Metal 4 family, `MetalUseMetal4Draws()` is false and the backend is the
+Metal 3 one described above, unchanged.
+
+**The encoding layer** (`metal_gpu.h`).
+- `metal_draw.mm` goes through three small classes for every command buffer, encoder, binding and wait, so one
+  draw path serves both APIs:
+  - `GpuQueue` makes and commits command buffers and owns residency and lifetimes;
+  - `GpuCommands` is a command buffer being recorded;
+  - `GpuEncoder` is a render pass or the command buffer's compute encoder.
+- On Metal 3 each call is forwarded to the Metal 3 object, as before.
+- On Metal 4:
+  - Command buffers are reused, and so are their argument tables, which come back from a free list once
+    committed.
+  - Command allocators are reset only when the queue's shared event says the GPU is done with their last commit.
+    The event is signalled after every commit with its serial. At most 32 allocators are in flight; beyond that,
+    `Begin` waits for the oldest.
+  - Completion, GPU time and errors come from `MTL4CommitFeedback`.
+
+**Argument tables, per stage.**
+- Each command buffer has three tables: fragment, vertex and compute. Each is sized for what its stage binds:
+  - buffers: 8, 8 and 8;
+  - textures: 32, 8 and 16;
+  - samplers: 16, 4 and 4.
+  A binding past those sizes is reported, not written.
+- Two command buffers can be recorded at once (the one before a pass takes texture work while the pass is open), so
+  each has its own tables.
+- A binding is a write of a GPU address or resource ID into the table, and Metal snapshots the table at the draw.
+- **The shadow:** the command buffer keeps what each slot was last set to, and skips a write that would set the same
+  thing again (the table write and the residency bookkeeping alike). The shadow is reset when recording starts,
+  since pooled tables still hold the last command buffer's bindings.
+- **Carry-over:** a draw pass that follows the previous draw pass in the same command buffer, with no other render
+  encoder between them, starts with the tables as that pass left them. The draw path then skips everything it would
+  send again. That happened for about 250 passes a second in a race.
+- Redundant render and compute state calls (pipeline, depth-stencil, viewport and the like) are skipped the same
+  way.
+
+**The residency set as the lifetime tracker; heaps.**
+- Metal 4 command buffers don't retain what they use. `GpuQueue` therefore tracks every resource a recording names:
+  - The resource is added to the queue's residency set, and the queue holds a reference.
+  - Each resource carries the serial of the last commit that used it, and a count of open recordings that use it.
+- A resource leaves the set (`EndFrame`) once three things hold:
+  - no open recording uses it;
+  - the GPU has passed its last commit;
+  - either nothing but the queue holds it, or it has gone 60 frames unused.
+- Render targets, the guest memory buffer and the rings are resident for the queue's life.
+- The texture pool's test for reuse (`Idle`) asks the same question: no recording or running work holds the
+  texture.
+- Textures the draws make often are placed in 256 MB heaps that are resident as a whole: resolve destinations,
+  composites, texture loads. Making and dropping such a texture then doesn't change the set. In a race the set is
+  committed 0 times a frame; before the heaps it was committed every frame, at 4.9% of the command thread. About
+  2,870 resources are tracked, and about 96 a frame are released (race, MetalFX Performance).
+
+**Transient constants.**
+- Inline bytes, Metal 3's `set*Bytes`, are copied into 4 MB shared, write-combined buffers. Each binding is aligned
+  to 256 bytes, and the binding is the copy's GPU address.
+- A buffer is reused once the GPU has passed every commit that used it. There is no ring wrap to wait for.
+- The shader constants already go through the per-frame constant ring (`metal_constant_ring`). What is left here
+  is small: 0.04 MB a frame in a race.
+
+**Barriers.**
+- Nothing is tracked, so the backend says each dependency itself. The consumer-side queue barriers are:
+  - **A render pass** waits for earlier compute and copies (resolves, texture loads, guest memory writes) before its
+    vertex and fragment stages, and for earlier passes' fragments before its fragments. So a pass's vertex work
+    overlaps the previous pass's fragments. No pass's vertex stage writes anything.
+  - **The command buffer's compute encoder** (dispatches and copies share one encoder between passes) waits for all
+    earlier stages when it begins.
+  - **Within the compute encoder**, each op waits for the one before it.
+  - **After MetalFX** (its encoders don't wait for ours), a one-op fence encoder goes before and after, so the next
+    encoder of ours waits for everything.
+- With `metal_metal4_narrow_barriers` off, every encoder waits for all stages before it. That is correct whatever
+  the order, and slower.
+- The guest memory buffer keeps its own fences (`memory_fence_`, `memory_read_fence_`), as on Metal 3.
+
+**The submit thread.**
+- Commits, and the queue's event waits and signals, run in order on a serial GCD queue (`metal_metal4_submit_thread`,
+  user-interactive QoS). Recordings come back to the free list from there.
+- The reason: a commit with MetalFX in it runs MetalFX's ML setup (an MPSGraph, every frame) on the committing
+  thread, which was the GPU command thread before.
+- Command buffers ready together go in one `commit:count:` (one feedback handler, one event signal): the frame's
+  last pair and the command buffer split off before a pass with its pass. In a race the frame makes about 2.5
+  commits, 3.5 before batching.
+
+**Pipelines: `MTL4Compiler` and archives** (`metal_pipelines4.h`, `metal_metal4_pipelines`).
+- **Whole pipelines** (the default). Each draw pipeline is built from a full `MTL4RenderPipelineDescriptor`
+  (functions by name, colour formats, write masks and blending). A Metal 4 pipeline has no depth format: the pass
+  gives it.
+- **Flexible pipelines** (`metal_metal4_flexible_pipelines`). One flexible pipeline per shader pair and sample count,
+  with the colour state unspecialised, then specialised for each set of targets (0.02 ms warm, 1 to 3 ms cold, no
+  shader compile; 450 bases for the storage's 521 keys). They cost 2 to 3 ms of command-thread CPU and 0.8 ms of GPU
+  a frame in a race (bench 20261103-213431: 44.2/44.3 FPS against 52.9/48.5 with Metal 3 pipelines), so they are off.
+- **Archives.** Pipelines go into `MTL4Archive` generations beside the pipeline storage
+  (`<title>-<identity>-<n>.mtl4archive`). The identity hashes:
+  - the OS build;
+  - the GPU;
+  - the storage formats and `metal_shader_math`.
+  So after an update the backend rebuilds instead of missing on every lookup.
+- **Compaction and the index.** Each save writes a new generation, and once the run has touched everything, the
+  ones it loaded are removed. A sidecar index (`.mtl4index`) lists what the generations on disk hold, keyed by the
+  guest shaders' hashes and the targets: a run that asks for nothing new writes nothing.
+- **Measured** (whole pipelines, the pipeline storage's 521 keys): cold 6.2 s and a 33.5 MB archive; warm 45 ms,
+  all from the archive (Metal 3 with Apple's shader cache: 47 ms). The same picture.
+- **A Metal bug.** On macOS 27.2, a compiler task (`completionHandler:`) on a compiler with a pipeline data set
+  serializer faults inside Metal on any cold compile (`MTLHashKey::getHashTools`), even when only one task runs.
+  Synchronous calls don't. So with archives on, each build is a synchronous call on a GCD worker, at most two at a
+  time.
+
+**Texture views** (`metal_views4.h`, `metal_texture_view_pool`).
+- The shaders read each texture through a view with the fetch constant's swizzle (and 2D as 2D array). On Metal 4
+  those views are slots of one `MTLTextureViewPool` (16,384 slots), bound by resource ID: no view object, and the
+  residency set and lifetime tracker see only the texture itself.
+- A dropped texture's slots are retired at once (their handles carry a generation, so a stale one is detected) and
+  reused once the GPU has passed every command buffer recorded before the drop.
+- The draw path, the temporal AA's inputs and the HDR scene's inputs bind slots; the swap's source is the one view
+  object a frame (it needs a 2D view of it). A full pool falls back to view objects.
+- Free roam: about 3,800 views live, 30 made a frame (resolves are new textures), none refused, and no swizzle view
+  objects left. Same picture as Metal 3.
+
+**GPU phase times** (`metal_counters4.h`, `metal_gpu_phase_times=N`). Timestamps from an `MTL4CounterHeap` go
+between encoders at the guest's phase markers (`mcla_render_markers_all_phases`), and every N frames the log lists
+the GPU time of each phase. A marker while a render pass is open is written when the pass ends.
+
+**What it changed against Metal 3** (race bench, MetalFX Performance, two runs each, with the submit thread;
+bench 20261103-211832):
+
+| | Metal 3 | Metal 4 |
+|---|---|---|
+| FPS | 52.0 / 50.6 | 49.8 / 51.2 |
+| GPU time a frame | 15.7 / 16.5 ms | 12.5 / 12.4 ms |
+| CPU time a frame (GPU command thread) | 18.1 / 18.7 ms | 18.9 / 18.6 ms |
+
+Bench 20261103-220231 (whole pipelines, a warm archive; a hot Mac, and a VM busy during the second Metal 4 run):
+Metal 3 65.4 / 44.2 FPS, GPU 14.1 / 16.7 ms; Metal 4 62.8 / 52.3 FPS, GPU 10.7 / 11.6 ms; Metal 4 with Metal 3
+pipelines 53.2 / 52.7 FPS.
+
+- The GPU does the same frame in about a fifth less time. Explicit barriers let passes overlap, and nothing is
+  tracked per binding.
+- The command thread costs the same as on Metal 3, and it is the limit in a race. So FPS is within the runs' noise.
+- Before the submit thread, the Metal 4 command thread was slower than Metal 3's: 51.8/50.6 FPS against 56.0/49.2
+  (bench 20261103-205815).
+- Frame generation on Metal 4's MetalFX: 16.3 ms of GPU a frame against 17.0 on Metal 3, with the same pacing.
+
+**Known limits.**
+- Before macOS 26, or on a GPU without the Metal 4 family, it is Metal 3.
+- The presenter stays on its own Metal 3 queue (`CAMetalLayer` drawables). The front buffer's copy waits for the
+  presenter's previous reads (`WaitForMetal3`, a shared event), and the presenter's next commit waits for the draws
+  (`SignalMetal3`). That is two cross-queue hops a frame, and they go away with the queue's drawable signalling
+  (`waitForDrawable`/`signalDrawable`).
+- MetalFX's temporal scaler and frame interpolator are encoded into the draws' own command buffers. On the Metal 3
+  draws they keep a Metal 4 queue of their own (`metal_fx4.h`).
+- Nothing is tracked. A missing barrier shows as stale tiles or flicker, not as an error; the minimap flickered
+  every other frame until texture work went only into the command buffer before its own pass. Metal API validation
+  (`MTL_DEBUG_LAYER=1`) is clean on a drive, and it is part of the regression set. Its Metal 4 layer reports
+  "Previous setDepthClipMode was unused" for every `setDepthClipMode`, even with a draw after it (a standalone test
+  does the same on macOS 27.2): noise, not a bug.
+- Still to come: the drawable signalled on the Metal 4 queue, ray-traced effects (research in
+  [metal4-features.md](metal4-features.md) and BACKLOG item 38).

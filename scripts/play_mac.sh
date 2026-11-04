@@ -38,7 +38,12 @@ fi
 # The SDK's command line parser fails on a repeated option, so the defaults are
 # added only when not given.
 case " $* " in *" --log_level="*) ;; *) set -- --log_level=info "$@" ;; esac
-case " $* " in *" --log_file="*) ;; *) set -- --log_file=run.log "$@" ;; esac
+# The default log starts afresh each run; the last run's is kept as run.previous.log (the SDK appends to its log).
+case " $* " in
+  *" --log_file="*) ;;
+  *) [ -f run.log ] && mv -f run.log run.previous.log
+     set -- --log_file=run.log "$@" ;;
+esac
 if [ -n "$MCLA_LLDB" ]; then
   exec lldb -o run -- ./mcla "$@"
 fi

@@ -86,6 +86,7 @@ constexpr uint32_t kDeviceWriteLimit = 56;
 
 std::atomic<size_t> g_render_thread{0};
 uint32_t g_frame = 0;
+bool g_all_phases = false;  // this frame: every phase's marker (sub_822C0980)
 uint32_t g_markers_dropped = 0;
 uint32_t g_markers_made_room = 0;
 
@@ -151,6 +152,9 @@ void EmitMarker(PPCContext& ctx, uint8_t* base, uint32_t kind, uint32_t value) {
 // The frame's rendering: the thread that calls it is the one that draws.
 extern "C" REX_FUNC(sub_822C0980) {
   g_render_thread.store(ThisThread());
+  // Every phase's marker: asked for, or for Metal's ray-traced shadows (their sun from the cascades' phases, the
+  // game's mask at its resolve). Looked up once a frame (the Metal plugin's setting, by name: none elsewhere).
+  g_all_phases = REXCVAR_GET(mcla_render_markers_all_phases) || rex::cvar::Query<bool>("metal_rt_shadows");
   EmitMarker(ctx, base, kFrameBegin, ++g_frame);
   __imp__sub_822C0980(ctx, base);
   EmitMarker(ctx, base, kFrameEnd, g_frame);
@@ -203,7 +207,7 @@ extern "C" REX_FUNC(sub_822E55D0) {
   } else if (phase == kPhaseUI) {
     EmitMarker(ctx, base, kUIBegin, phase);
   }
-  if (REXCVAR_GET(mcla_render_markers_all_phases)) {
+  if (g_all_phases) {
     EmitMarker(ctx, base, kPhase, phase);
   }
   __imp__sub_822E55D0(ctx, base);

@@ -55,6 +55,34 @@ struct AntiAliasing: Identifiable, Hashable {
     }
 }
 
+/// metal_rt, metal_rt_ao and metal_rt_shadows as one choice (the effects need the geometry; shadows come with AO,
+/// which shares its acceleration structures).
+enum RayTracing: String, CaseIterable, Identifiable {
+    case off, ao, aoShadows
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .ao: return "Ambient occlusion"
+        case .aoShadows: return "Ambient occlusion and sun shadows"
+        }
+    }
+
+    @MainActor static func current(_ l: Launcher) -> RayTracing {
+        guard l.value("metal_rt")?.asBool ?? false else { return .off }
+        let ao = l.value("metal_rt_ao")?.asBool ?? false
+        let shadows = l.value("metal_rt_shadows")?.asBool ?? false
+        return shadows ? .aoShadows : ao ? .ao : .off
+    }
+
+    @MainActor func apply(_ l: Launcher) {
+        l.setMany([("metal_rt", self == .off ? nil : .bool(true)),
+                   ("metal_rt_ao", self == .off ? nil : .bool(true)),
+                   ("metal_rt_shadows", self == .aoShadows ? .bool(true) : nil)])
+    }
+}
+
 // MARK: Graphics
 
 struct GraphicsView: View {
@@ -73,6 +101,13 @@ struct GraphicsView: View {
             suggestionCard
             Card(title: "Renderer") {
                 SettingRow(setting: Catalogue.backend)
+                if metal && ProcessInfo.processInfo.isOperatingSystemAtLeast(
+                    OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)) {
+                    Divider()
+                    SettingRow(setting: Catalogue.metalVersion)
+                    Divider()
+                    rayTracingRow
+                }
                 Divider()
                 antiAliasingRow
                 Divider()
@@ -142,6 +177,28 @@ struct GraphicsView: View {
         if on && macOS26 && metalFXAA {
             Divider()
             SettingRow(setting: Catalogue.fpsFrameGeneration)
+        }
+    }
+
+    /// Metal 4 only (its acceleration structures and ray queries are built on the Metal 4 queue).
+    private var rayTracingRow: some View {
+        let metal4 = launcher.value("metal_metal4")?.asBool ?? true
+        let current = RayTracing.current(launcher)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Ray tracing")
+                Spacer()
+                Picker("", selection: Binding(get: { current }, set: { $0.apply(launcher) })) {
+                    ForEach(RayTracing.allCases) { Text($0.label).tag($0) }
+                }
+                .labelsHidden().frame(maxWidth: 300).disabled(!metal4)
+            }
+            Text("The city's geometry, as the game draws it, kept in Metal 4 ray tracing structures. Ambient occlusion "
+                 + "darkens corners, kerbs and the ground under cars and awnings; sun shadows add by day the small, "
+                 + "far and off-map shadows the game's own shadow maps miss. In a race it costs about 3 ms of GPU time "
+                 + "and 1 to 1.5 ms of the renderer's CPU time a frame (by day the shadows add up to 2 ms of GPU "
+                 + "time). Experimental.\(metal4 ? "" : " Needs Metal 4.")")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 

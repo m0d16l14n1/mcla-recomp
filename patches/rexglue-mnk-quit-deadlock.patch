@@ -1,0 +1,28 @@
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..ca58692 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -402,13 +402,20 @@ void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+   if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
+     return;
+   }
+-  std::lock_guard lock(state_mutex_);
+-  if (!attached_window_) {
++  // The window's app context under the lock, the post after it: posting takes SDL's event watch lock, which the UI
++  // thread holds while it delivers a quit (Cmd+Q) whose window close (OnLostFocus) takes state_mutex_. Holding
++  // both in the other order deadlocked the quit.
++  rex::ui::WindowedAppContext* context = nullptr;
++  {
++    std::lock_guard lock(state_mutex_);
++    if (attached_window_) context = &attached_window_->app_context();
++  }
++  if (!context) {
+     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+     return;
+   }
+   // Deferred, not CallInUIThread: running inline would re-enter state_mutex_.
+-  attached_window_->app_context().CallInUIThreadDeferred([this] {
++  context->CallInUIThreadDeferred([this] {
+     mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+     ApplyMouseCaptureFromUIThread();
+   });

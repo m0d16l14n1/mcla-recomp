@@ -99,6 +99,8 @@ git apply ../../patches/rexglue-ppc-barriers-arm64.patch
 git apply ../../patches/rexglue-fence-hook.patch
 git apply ../../patches/rexglue-metal-backend.patch
 git apply ../../patches/rexglue-settings-overlay-live-only.patch
+git apply ../../patches/rexglue-upstream-posix-fixes.patch
+git apply ../../patches/rexglue-mnk-quit-deadlock.patch
 ```
 
 The first was several files at first; they are combined now because several touch the same build files and would not apply independently. The second goes on top of the first (both change `src/graphics/vulkan/command_processor.cpp`). The build scripts apply all of them, and add the second and the ones after the FFmpeg patch to an SDK checkout that was patched before they existed. Those later patches go on in the order listed, as several change neighbouring lines.
@@ -2212,3 +2214,13 @@ sleep in `XMPGetPlaybackController`), #479 (symlinked folders in the game's fold
 (the XAM enumerator was released wrongly, `NO_MORE_FILES` left the item count unwritten, the task thread handle
 leaked). Drop each part when its pull request is merged and the SDK is updated. The review of the other open pull
 requests is in `docs/BACKLOG.md` (#31).
+
+
+## rexglue-mnk-quit-deadlock.patch (macOS)
+
+Cmd+Q froze the game for good when mouse-and-keyboard mode (`mnk_mode`) was on. The guest's input poll
+(`XamInputGetState` into `MnkInputDriver::GetDeviceState`) queued a mouse-capture update while holding the driver's
+`state_mutex_`, and the post (`CallInUIThreadDeferred`, so `SDL_PushEvent`) takes SDL's event watch lock. The UI
+thread delivers the quit under that same watch lock, and the window close it starts calls `OnLostFocus`, which takes
+`state_mutex_`: the two threads waited on each other. The driver now reads the window's app context under the lock and
+posts after letting it go. Worth sending upstream.
