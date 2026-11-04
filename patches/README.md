@@ -101,6 +101,7 @@ git apply ../../patches/rexglue-metal-backend.patch
 git apply ../../patches/rexglue-settings-overlay-live-only.patch
 git apply ../../patches/rexglue-upstream-posix-fixes.patch
 git apply ../../patches/rexglue-mnk-quit-deadlock.patch
+git apply ../../patches/rexglue-wait-wakeups.patch
 ```
 
 The first was several files at first; they are combined now because several touch the same build files and would not apply independently. The second goes on top of the first (both change `src/graphics/vulkan/command_processor.cpp`). The build scripts apply all of them, and add the second and the ones after the FFmpeg patch to an SDK checkout that was patched before they existed. Those later patches go on in the order listed, as several change neighbouring lines.
@@ -2224,3 +2225,18 @@ Cmd+Q froze the game for good when mouse-and-keyboard mode (`mnk_mode`) was on. 
 thread delivers the quit under that same watch lock, and the window close it starts calls `OnLostFocus`, which takes
 `state_mutex_`: the two threads waited on each other. The driver now reads the window's app context under the lock and
 posts after letting it go. Worth sending upstream.
+
+## rexglue-wait-wakeups.patch (macOS)
+
+Goes on after `rexglue-upstream-posix-fixes.patch` (2026-11-04). It ports #501: a multi-handle wait (the audio worker
+waits on its client handles this way) sleeps on one condition variable until some object changes state, instead of
+waking every 1 ms. The remaining time stays exact, as `rexglue-linux-wait-sleep.patch` made it. It also corrects two
+problems in the #531 code taken in `rexglue-upstream-posix-fixes.patch`:
+- `SignalAndWait` signalled the other object while holding the waited object's lock, so `SignalAndWait(A, B)` and
+  `SignalAndWait(B, A)` on two threads could deadlock. The waiter now takes its ticket, then signals with its lock
+  released. The release is still reserved for it, which is the guarantee #531 is after.
+- A reserved auto-reset release that folded back into a plain signal woke nobody, so a waiter that had registered
+  after the reservation slept on until its timeout, or for good.
+
+Tests: `tests/unit/core/wait_multiple_test.cpp` (from #501) and `tests/unit/core/event_handoff_test.cpp`. The same
+event changes are in LibertyRecomp's `threading_mac.cpp`. Worth sending upstream as review comments on #531.
